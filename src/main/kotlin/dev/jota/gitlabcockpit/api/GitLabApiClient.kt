@@ -42,7 +42,7 @@ data class GitLabProject(
     @SerialName("web_url") val webUrl: String,
 )
 
-/** A merge request from `/projects/:id/merge_requests`. */
+/** A merge request from `/projects/:id/merge_requests` (list) or `/merge_requests/:iid` (detail). */
 @Serializable
 data class GitLabMergeRequest(
     val iid: Long,
@@ -57,6 +57,22 @@ data class GitLabMergeRequest(
     val author: GitLabUser,
     val reviewers: List<GitLabUser> = emptyList(),
     val assignees: List<GitLabUser> = emptyList(),
+    /** The raw markdown body. Present on the list endpoint too, but may be null/absent. */
+    val description: String? = null,
+)
+
+/**
+ * Body for `PUT /projects/:id/merge_requests/:iid`. Every field is optional: only the non-null
+ * ones are sent (see [GitLabApiClient.updateJson], configured with `explicitNulls = false`), so a
+ * partial update touches only the provided attributes. An empty list is meaningful — it clears the
+ * reviewers or assignees.
+ */
+@Serializable
+data class MergeRequestUpdate(
+    val title: String? = null,
+    val description: String? = null,
+    @SerialName("reviewer_ids") val reviewerIds: List<Long>? = null,
+    @SerialName("assignee_ids") val assigneeIds: List<Long>? = null,
 )
 
 /** Approval state of a merge request from `/merge_requests/:iid/approvals`. */
@@ -109,6 +125,16 @@ class GitLabApiClient(
 
     private val json = Json { ignoreUnknownKeys = true }
 
+    /**
+     * Encoder for request bodies. `encodeDefaults = false` + `explicitNulls = false` mean null
+     * fields (which are also the defaults on [MergeRequestUpdate]) are omitted from the JSON, while
+     * a non-null empty list is still serialized as `[]`.
+     */
+    private val updateJson = Json {
+        encodeDefaults = false
+        explicitNulls = false
+    }
+
     private val httpClient: HttpClient = HttpClient.newBuilder()
         .connectTimeout(CONNECT_TIMEOUT)
         .build()
@@ -155,10 +181,45 @@ class GitLabApiClient(
             GitLabApprovals.serializer(),
         )
 
+    /** Calls `GET /projects/:id/merge_requests/:iid` — the fresh detail of a single MR. */
+    suspend fun getMergeRequest(projectId: Long, mrIid: Long): GitLabResult<GitLabMergeRequest> =
+        get(
+            "/projects/$projectId/merge_requests/$mrIid",
+            emptyList(),
+            GitLabMergeRequest.serializer(),
+        )
+
     /**
-     * Shared GET implementation. Builds the request, sends it off the EDT on [Dispatchers.IO]
-     * via [runInterruptible], and decodes the body with [deserializer]. Any transport or decode
-     * failure is wrapped in [GitLabResult.NetworkError]; non-2xx yields [GitLabResult.HttpError].
+     * Calls `GET /projects/:id/members/all` (inherited + direct members). Extra fields such as
+     * `access_level` are ignored by the model.
+     */
+    suspend fun getProjectMembers(projectId: Long): GitLabResult<List<GitLabUser>> =
+        get(
+            "/projects/$projectId/members/all",
+            listOf("per_page" to "100"),
+            ListSerializer(GitLabUser.serializer()),
+        )
+
+    /**
+     * Calls `PUT /projects/:id/merge_requests/:iid` with only the non-null attributes of [update].
+     * The updated MR is returned.
+     */
+    suspend fun updateMergeRequest(
+        projectId: Long,
+        mrIid: Long,
+        update: MergeRequestUpdate,
+    ): GitLabResult<GitLabMergeRequest> {
+        val body = updateJson.encodeToString(MergeRequestUpdate.serializer(), update)
+        return put(
+            "/projects/$projectId/merge_requests/$mrIid",
+            body,
+            GitLabMergeRequest.serializer(),
+        )
+    }
+
+    /**
+     * Builds a GET request and delegates to [send]. Any failure while assembling the request is
+     * wrapped in [GitLabResult.NetworkError].
      */
     private suspend fun <T> get(
         path: String,
@@ -177,21 +238,56 @@ class GitLabApiClient(
         } catch (e: Exception) {
             return GitLabResult.NetworkError(e)
         }
+        return send(request, deserializer)
+    }
 
-        return try {
-            val response = runInterruptible(Dispatchers.IO) {
-                httpClient.send(request, HttpResponse.BodyHandlers.ofString())
-            }
-            if (response.statusCode() in 200..299) {
-                GitLabResult.Success(json.decodeFromString(deserializer, response.body()))
-            } else {
-                GitLabResult.HttpError(response.statusCode(), response.body())
-            }
+    /**
+     * Builds a PUT request with a JSON [body] and delegates to [send]. Sends `Content-Type:
+     * application/json`. Any failure while assembling the request is wrapped in
+     * [GitLabResult.NetworkError].
+     */
+    private suspend fun <T> put(
+        path: String,
+        body: String,
+        deserializer: DeserializationStrategy<T>,
+    ): GitLabResult<T> {
+        val request = try {
+            HttpRequest.newBuilder()
+                .uri(URI.create(apiBase + path))
+                .timeout(REQUEST_TIMEOUT)
+                .header("PRIVATE-TOKEN", tokenProvider().orEmpty())
+                .header("Content-Type", "application/json")
+                .PUT(HttpRequest.BodyPublishers.ofString(body, StandardCharsets.UTF_8))
+                .build()
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
-            GitLabResult.NetworkError(e)
+            return GitLabResult.NetworkError(e)
         }
+        return send(request, deserializer)
+    }
+
+    /**
+     * Shared send/decode step. Sends [request] off the EDT on [Dispatchers.IO] via
+     * [runInterruptible] and decodes the body with [deserializer]. Any transport or decode failure
+     * is wrapped in [GitLabResult.NetworkError]; non-2xx yields [GitLabResult.HttpError].
+     */
+    private suspend fun <T> send(
+        request: HttpRequest,
+        deserializer: DeserializationStrategy<T>,
+    ): GitLabResult<T> = try {
+        val response = runInterruptible(Dispatchers.IO) {
+            httpClient.send(request, HttpResponse.BodyHandlers.ofString())
+        }
+        if (response.statusCode() in 200..299) {
+            GitLabResult.Success(json.decodeFromString(deserializer, response.body()))
+        } else {
+            GitLabResult.HttpError(response.statusCode(), response.body())
+        }
+    } catch (e: CancellationException) {
+        throw e
+    } catch (e: Exception) {
+        GitLabResult.NetworkError(e)
     }
 
     private fun encodeQuery(query: List<Pair<String, String>>): String {

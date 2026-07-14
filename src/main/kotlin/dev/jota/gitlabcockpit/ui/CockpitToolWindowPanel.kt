@@ -10,6 +10,7 @@ import com.intellij.openapi.wm.ToolWindow
 import com.intellij.ui.CollectionListModel
 import com.intellij.ui.ColoredListCellRenderer
 import com.intellij.ui.DoubleClickListener
+import com.intellij.ui.OnePixelSplitter
 import com.intellij.ui.SimpleListCellRenderer
 import com.intellij.ui.SimpleTextAttributes
 import com.intellij.ui.components.JBLabel
@@ -79,6 +80,16 @@ class CockpitToolWindowPanel(
         cellRenderer = MrCellRenderer()
     }
 
+    private val detailPanel = MrDetailPanel(project, service, onListReloadRequested = { reloadSilently() })
+
+    private val splitter = OnePixelSplitter(true, SPLITTER_PROPORTION_KEY, 0.45f).apply {
+        firstComponent = JBScrollPane(mrList)
+        secondComponent = detailPanel
+    }
+
+    /** Guards the selection listener while the list is repopulated and its selection restored. */
+    private var suppressSelectionEvents = false
+
     private var loadJob: Job? = null
 
     private val autoRefreshJob: Job = service.coroutineScope.launch {
@@ -94,7 +105,12 @@ class CockpitToolWindowPanel(
 
     init {
         add(buildToolbar(), BorderLayout.NORTH)
-        add(JBScrollPane(mrList), BorderLayout.CENTER)
+        add(splitter, BorderLayout.CENTER)
+
+        mrList.addListSelectionListener { event ->
+            if (suppressSelectionEvents || event.valueIsAdjusting) return@addListSelectionListener
+            reconcileDetailWithSelection()
+        }
 
         roleCombo.addActionListener {
             userField.isVisible = roleCombo.selectedItem == RoleFilter.BY_USER
@@ -159,6 +175,29 @@ class CockpitToolWindowPanel(
         }
     }
 
+    /**
+     * Reloads the list without the Loading placeholder, preserving the current selection. Used
+     * after an edit so the list picks up the change while the detail stays put. Runs off the EDT.
+     */
+    private fun reloadSilently() {
+        val selection = currentSelection()
+        loadJob?.cancel()
+        loadJob = service.coroutineScope.launch {
+            val state = service.loadMergeRequests(selection)
+            withContext(Dispatchers.EDT) { render(state) }
+        }
+    }
+
+    /** EDT. Loads/clears the detail to match the current list selection. */
+    private fun reconcileDetailWithSelection() {
+        val selected = mrList.selectedValue
+        when {
+            selected == null -> detailPanel.showPlaceholder()
+            selected.iid != detailPanel.currentIid -> detailPanel.loadDetail(selected.iid)
+            // Same MR already shown → leave the detail untouched.
+        }
+    }
+
     /** Must be called on the EDT. */
     private fun render(state: CockpitState) {
         when (state) {
@@ -171,8 +210,14 @@ class CockpitToolWindowPanel(
             is CockpitState.Error ->
                 showMessage(state.message)
             is CockpitState.Ready -> {
+                val previousIid = mrList.selectedValue?.iid
                 mrList.emptyText.text = CockpitBundle.message("toolwindow.empty.noMrs")
+                suppressSelectionEvents = true
                 listModel.replaceAll(state.mrs)
+                val restoreIndex = previousIid?.let { iid -> state.mrs.indexOfFirst { it.iid == iid } } ?: -1
+                if (restoreIndex >= 0) mrList.selectedIndex = restoreIndex
+                suppressSelectionEvents = false
+                reconcileDetailWithSelection()
             }
         }
     }
@@ -227,6 +272,7 @@ class CockpitToolWindowPanel(
 
     companion object {
         private const val AUTO_REFRESH_MS = 60_000L
+        private const val SPLITTER_PROPORTION_KEY = "dev.jota.gitlabcockpit.detail.splitter"
 
         private fun roleLabel(role: RoleFilter): String = when (role) {
             RoleFilter.ALL -> CockpitBundle.message("toolwindow.filter.role.all")

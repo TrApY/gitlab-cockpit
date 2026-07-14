@@ -21,6 +21,8 @@ dependencies {
     // HTTP: java.net.http.HttpClient from the JDK — no extra HTTP dependency.
     // Coroutines are provided by the IntelliJ Platform classpath, so they are not declared here.
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.8.1")
+    // Markdown → HTML rendering for the MR description (pure JetBrains parser, no Swing).
+    implementation("org.jetbrains:markdown:0.7.3")
 
     testImplementation("junit:junit:4.13.2")
 

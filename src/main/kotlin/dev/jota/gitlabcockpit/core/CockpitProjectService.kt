@@ -11,6 +11,7 @@ import dev.jota.gitlabcockpit.api.GitLabProject
 import dev.jota.gitlabcockpit.api.GitLabResult
 import dev.jota.gitlabcockpit.api.GitLabUser
 import dev.jota.gitlabcockpit.api.MergeRequestQuery
+import dev.jota.gitlabcockpit.api.MergeRequestUpdate
 import dev.jota.gitlabcockpit.settings.GitLabCockpitSettings
 import dev.jota.gitlabcockpit.settings.TokenStore
 import git4idea.repo.GitRepositoryManager
@@ -62,6 +63,10 @@ class CockpitProjectService(
     @Volatile
     private var cachedUser: GitLabUser? = null
 
+    /** Project members, loaded lazily by [getMembers] and dropped on [refresh]. */
+    @Volatile
+    private var cachedMembers: List<GitLabUser>? = null
+
     /** Keyed by MR iid; invalidated per-MR when its `updated_at` changes. */
     private val approvalsCache = ConcurrentHashMap<Long, CachedApprovals>()
 
@@ -69,26 +74,17 @@ class CockpitProjectService(
     fun refresh() {
         cachedProject = null
         cachedUser = null
+        cachedMembers = null
         approvalsCache.clear()
     }
 
     /** Loads merge requests for [selection], resolving project/user/remote as needed. */
     suspend fun loadMergeRequests(selection: MrFilterSelection): CockpitState {
-        val instance = GitLabCockpitSettings.getInstance().instances.firstOrNull()
-        val baseUrl = instance?.baseUrl?.trim().orEmpty()
-        if (baseUrl.isEmpty()) return CockpitState.NotConfigured
-
-        val instanceHost = GitLabProjectResolver.hostOf(baseUrl) ?: return CockpitState.NotConfigured
-        val coords = findMatchingRemote(instanceHost) ?: return CockpitState.NoGitLabRemote
-
-        // PasswordSafe access happens here (off the EDT) — never on the UI thread.
-        val token = TokenStore.get(baseUrl)
-        val client = GitLabApiClient(baseUrl) { token }
-
-        val glProject = cachedProject ?: when (val r = client.getProjectByPath(coords.pathWithNamespace)) {
-            is GitLabResult.Success -> r.data.also { cachedProject = it }
-            is GitLabResult.HttpError -> return httpError(r)
-            is GitLabResult.NetworkError -> return networkError(r)
+        val (client, glProject) = when (val resolution = resolveClientAndProject()) {
+            is ProjectResolution.Ok -> resolution.client to resolution.glProject
+            ProjectResolution.NotConfigured -> return CockpitState.NotConfigured
+            ProjectResolution.NoRemote -> return CockpitState.NoGitLabRemote
+            is ProjectResolution.Failed -> return toErrorState(resolution.error)
         }
 
         val currentUser = cachedUser ?: when (val r = client.getCurrentUser()) {
@@ -112,6 +108,80 @@ class CockpitProjectService(
         }
 
         return CockpitState.Ready(finalMrs, currentUser)
+    }
+
+    /** Fetches the fresh detail of a single MR. Used by the detail panel on selection. */
+    suspend fun getMrDetail(iid: Long): GitLabResult<GitLabMergeRequest> =
+        withClientAndProject { client, glProject -> client.getMergeRequest(glProject.id, iid) }
+
+    /**
+     * Returns the project's members, cached in memory (invalidated by [refresh]). Only the first
+     * successful load hits the network; subsequent calls reuse the cache.
+     */
+    suspend fun getMembers(): GitLabResult<List<GitLabUser>> {
+        cachedMembers?.let { return GitLabResult.Success(it) }
+        return withClientAndProject { client, glProject ->
+            client.getProjectMembers(glProject.id).also {
+                if (it is GitLabResult.Success) cachedMembers = it.data
+            }
+        }
+    }
+
+    /** Applies a partial update to an MR and returns the updated MR. */
+    suspend fun updateMr(iid: Long, update: MergeRequestUpdate): GitLabResult<GitLabMergeRequest> =
+        withClientAndProject { client, glProject -> client.updateMergeRequest(glProject.id, iid, update) }
+
+    /**
+     * Resolves the client + project once (reusing [cachedProject]) and runs [block] against them.
+     * When the instance/remote/project cannot be resolved the failure is surfaced as a
+     * [GitLabResult] so callers get a uniform error to display.
+     */
+    private suspend fun <T> withClientAndProject(
+        block: suspend (GitLabApiClient, GitLabProject) -> GitLabResult<T>,
+    ): GitLabResult<T> = when (val resolution = resolveClientAndProject()) {
+        is ProjectResolution.Ok -> block(resolution.client, resolution.glProject)
+        ProjectResolution.NotConfigured ->
+            GitLabResult.NetworkError(IllegalStateException("No GitLab instance configured"))
+        ProjectResolution.NoRemote ->
+            GitLabResult.NetworkError(IllegalStateException("No matching git remote for the configured instance"))
+        is ProjectResolution.Failed -> resolution.error
+    }
+
+    /**
+     * Shared resolution of (client, project) used by both the MR list load and the detail/edit
+     * paths. PasswordSafe is read here — off the EDT — never on the UI thread.
+     */
+    private suspend fun resolveClientAndProject(): ProjectResolution {
+        val instance = GitLabCockpitSettings.getInstance().instances.firstOrNull()
+        val baseUrl = instance?.baseUrl?.trim().orEmpty()
+        if (baseUrl.isEmpty()) return ProjectResolution.NotConfigured
+
+        val instanceHost = GitLabProjectResolver.hostOf(baseUrl) ?: return ProjectResolution.NotConfigured
+        val coords = findMatchingRemote(instanceHost) ?: return ProjectResolution.NoRemote
+
+        val token = TokenStore.get(baseUrl)
+        val client = GitLabApiClient(baseUrl) { token }
+
+        val glProject = cachedProject ?: when (val r = client.getProjectByPath(coords.pathWithNamespace)) {
+            is GitLabResult.Success -> r.data.also { cachedProject = it }
+            is GitLabResult.HttpError -> return ProjectResolution.Failed(r)
+            is GitLabResult.NetworkError -> return ProjectResolution.Failed(r)
+        }
+        return ProjectResolution.Ok(client, glProject)
+    }
+
+    private fun toErrorState(result: GitLabResult<Nothing>): CockpitState.Error = when (result) {
+        is GitLabResult.HttpError -> httpError(result)
+        is GitLabResult.NetworkError -> networkError(result)
+        is GitLabResult.Success -> throw IllegalStateException("Success is not an error")
+    }
+
+    /** Outcome of resolving the configured instance to a live client + project. */
+    private sealed interface ProjectResolution {
+        data class Ok(val client: GitLabApiClient, val glProject: GitLabProject) : ProjectResolution
+        object NotConfigured : ProjectResolution
+        object NoRemote : ProjectResolution
+        data class Failed(val error: GitLabResult<Nothing>) : ProjectResolution
     }
 
     /**
