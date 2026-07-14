@@ -59,6 +59,37 @@ data class GitLabMergeRequest(
     val assignees: List<GitLabUser> = emptyList(),
     /** The raw markdown body. Present on the list endpoint too, but may be null/absent. */
     val description: String? = null,
+    /**
+     * The diff SHAs the detail endpoint (`/merge_requests/:iid`) returns; the *list* endpoint does
+     * not, so this is nullable. Needed to fetch base/head file contents for the diff viewer.
+     */
+    @SerialName("diff_refs") val diffRefs: DiffRefs? = null,
+)
+
+/**
+ * The `diff_refs` block of a merge request: the three SHAs a diff is anchored to. [baseSha] and
+ * [headSha] are the two sides the file diff compares; [startSha] is the merge base (needed later for
+ * inline discussion positions in F4). Unknown fields are ignored by the configured [Json].
+ */
+@Serializable
+data class DiffRefs(
+    @SerialName("base_sha") val baseSha: String,
+    @SerialName("head_sha") val headSha: String,
+    @SerialName("start_sha") val startSha: String,
+)
+
+/**
+ * A single changed file from `/merge_requests/:iid/diffs`. [oldPath]/[newPath] differ for renames;
+ * the boolean flags classify the change (see [dev.jota.gitlabcockpit.core.changeTypeOf]). Unknown
+ * fields (the textual `diff`, mode bits…) are ignored by the configured [Json].
+ */
+@Serializable
+data class GitLabDiffFile(
+    @SerialName("old_path") val oldPath: String,
+    @SerialName("new_path") val newPath: String,
+    @SerialName("new_file") val newFile: Boolean = false,
+    @SerialName("renamed_file") val renamedFile: Boolean = false,
+    @SerialName("deleted_file") val deletedFile: Boolean = false,
 )
 
 /**
@@ -138,6 +169,47 @@ data class GitLabNote(
     val system: Boolean = false,
     val author: GitLabUser,
     @SerialName("created_at") val createdAt: String,
+)
+
+/**
+ * A discussion thread on a merge request from `/merge_requests/:iid/discussions`. A discussion is a
+ * group of [notes]; diff comments carry a [GitLabDiscussionNote.position], general comments do not.
+ * Unknown fields are ignored by the configured [Json].
+ */
+@Serializable
+data class GitLabDiscussion(
+    val id: String,
+    val notes: List<GitLabDiscussionNote> = emptyList(),
+)
+
+/**
+ * One note inside a [GitLabDiscussion]. [system] marks GitLab's auto-generated notes (dropped from
+ * the UI); [position] is present only for notes anchored to a diff line. [resolvable]/[resolved]
+ * reflect the thread's resolution state. Unknown fields are ignored by the configured [Json].
+ */
+@Serializable
+data class GitLabDiscussionNote(
+    val id: Long,
+    val body: String,
+    val system: Boolean = false,
+    val author: GitLabUser,
+    @SerialName("created_at") val createdAt: String,
+    val resolvable: Boolean = false,
+    val resolved: Boolean = false,
+    val position: NotePosition? = null,
+)
+
+/**
+ * The diff anchor of a positioned discussion note. Either a new-side line ([newLine] on [newPath])
+ * or an old-side line ([oldLine] on [oldPath]) is set. Unknown position fields (the SHAs, line
+ * codes…) are ignored by the configured [Json].
+ */
+@Serializable
+data class NotePosition(
+    @SerialName("new_path") val newPath: String? = null,
+    @SerialName("old_path") val oldPath: String? = null,
+    @SerialName("new_line") val newLine: Int? = null,
+    @SerialName("old_line") val oldLine: Int? = null,
 )
 
 /** Request body for `POST /merge_requests/:iid/notes`: `{ "body": "…" }`. */
@@ -312,6 +384,65 @@ class GitLabApiClient(
      */
     suspend fun unapproveMr(projectId: Long, mrIid: Long): GitLabResult<Unit> =
         post("/projects/$projectId/merge_requests/$mrIid/unapprove", null, null)
+
+    // --- Changed files & diff (F3) ------------------------------------------------------------
+
+    /** Calls `GET /projects/:id/merge_requests/:iid/diffs?per_page=100` — the MR's changed files. */
+    suspend fun getMrDiffs(projectId: Long, mrIid: Long): GitLabResult<List<GitLabDiffFile>> =
+        get(
+            "/projects/$projectId/merge_requests/$mrIid/diffs",
+            listOf("per_page" to "100"),
+            ListSerializer(GitLabDiffFile.serializer()),
+        )
+
+    /**
+     * Calls `GET /projects/:id/repository/files/:path/raw?ref=:ref` for the raw contents of a file at
+     * a given [ref] (a branch, tag or SHA). [path] is encoded as a single path segment (so its `/`
+     * separators become `%2F`, as GitLab requires) via [URLEncoder]. The response is plain text, not
+     * JSON: `200` yields the body verbatim; any non-2xx becomes [GitLabResult.HttpError] (a `404` is
+     * expected for a side that does not exist, e.g. the old side of a new file).
+     */
+    suspend fun getRawFile(projectId: Long, path: String, ref: String): GitLabResult<String> {
+        val encodedPath = URLEncoder.encode(path, StandardCharsets.UTF_8)
+        val encodedRef = URLEncoder.encode(ref, StandardCharsets.UTF_8)
+        val fullPath = "/projects/$projectId/repository/files/$encodedPath/raw?ref=$encodedRef"
+        return when (val raw = getRaw(fullPath, emptyList())) {
+            is GitLabResult.Success ->
+                if (raw.data.status in 200..299) {
+                    GitLabResult.Success(raw.data.body)
+                } else {
+                    GitLabResult.HttpError(raw.data.status, raw.data.body)
+                }
+            is GitLabResult.HttpError -> raw
+            is GitLabResult.NetworkError -> raw
+        }
+    }
+
+    /** Calls `GET /projects/:id/merge_requests/:iid/discussions?per_page=100` — the MR's threads. */
+    suspend fun getMrDiscussions(projectId: Long, mrIid: Long): GitLabResult<List<GitLabDiscussion>> =
+        get(
+            "/projects/$projectId/merge_requests/$mrIid/discussions",
+            listOf("per_page" to "100"),
+            ListSerializer(GitLabDiscussion.serializer()),
+        )
+
+    /**
+     * Calls `POST /projects/:id/merge_requests/:iid/discussions/:discussion_id/notes` with
+     * `{ "body": … }` to reply to an existing thread; returns the created note.
+     */
+    suspend fun addDiscussionNote(
+        projectId: Long,
+        mrIid: Long,
+        discussionId: String,
+        body: String,
+    ): GitLabResult<GitLabDiscussionNote> {
+        val payload = updateJson.encodeToString(NoteCreateBody.serializer(), NoteCreateBody(body))
+        return post(
+            "/projects/$projectId/merge_requests/$mrIid/discussions/$discussionId/notes",
+            payload,
+            GitLabDiscussionNote.serializer(),
+        )
+    }
 
     /** Calls `GET /projects/:id/merge_requests/:iid/pipelines` (GitLab returns them newest-first). */
     suspend fun getMrPipelines(projectId: Long, mrIid: Long): GitLabResult<List<GitLabPipeline>> =

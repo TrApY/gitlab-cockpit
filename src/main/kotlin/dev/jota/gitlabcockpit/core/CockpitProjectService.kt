@@ -6,6 +6,9 @@ import com.intellij.openapi.project.Project
 import dev.jota.gitlabcockpit.CockpitBundle
 import dev.jota.gitlabcockpit.api.GitLabApiClient
 import dev.jota.gitlabcockpit.api.GitLabApprovals
+import dev.jota.gitlabcockpit.api.GitLabDiffFile
+import dev.jota.gitlabcockpit.api.GitLabDiscussion
+import dev.jota.gitlabcockpit.api.GitLabDiscussionNote
 import dev.jota.gitlabcockpit.api.GitLabJob
 import dev.jota.gitlabcockpit.api.GitLabMergeRequest
 import dev.jota.gitlabcockpit.api.GitLabNote
@@ -192,6 +195,28 @@ class CockpitProjectService(
      */
     suspend fun getApprovalsFor(iid: Long): GitLabResult<GitLabApprovals> =
         withClientAndProject { client, glProject -> client.getApprovals(glProject.id, iid) }
+
+    // --- Changed files & diff (F3) ------------------------------------------------------------
+
+    /** The MR's changed files, for the file tree and the editor diff. */
+    suspend fun getMrDiffs(iid: Long): GitLabResult<List<GitLabDiffFile>> =
+        withClientAndProject { client, glProject -> client.getMrDiffs(glProject.id, iid) }
+
+    /** Raw contents of [path] at [ref] (a SHA from the MR's `diff_refs`), for the diff sides. */
+    suspend fun getRawFile(path: String, ref: String): GitLabResult<String> =
+        withClientAndProject { client, glProject -> client.getRawFile(glProject.id, path, ref) }
+
+    /** The MR's discussion threads (diff comments + general comments), for the comments panel. */
+    suspend fun getMrDiscussions(iid: Long): GitLabResult<List<GitLabDiscussion>> =
+        withClientAndProject { client, glProject -> client.getMrDiscussions(glProject.id, iid) }
+
+    /** Replies to an existing discussion thread and returns the created note. */
+    suspend fun replyToDiscussion(
+        iid: Long,
+        discussionId: String,
+        body: String,
+    ): GitLabResult<GitLabDiscussionNote> =
+        withClientAndProject { client, glProject -> client.addDiscussionNote(glProject.id, iid, discussionId, body) }
 
     // --- Pipelines (F2a) ----------------------------------------------------------------------
 

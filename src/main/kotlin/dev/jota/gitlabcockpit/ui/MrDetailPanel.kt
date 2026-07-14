@@ -98,6 +98,8 @@ class MrDetailPanel(
 
     private val pipelinesPanel = PipelinesPanel(project, service)
 
+    private val changesPanel = ChangesPanel(project, service) { count -> setChangesTabTitle(count) }
+
     init {
         overviewPanel.add(headerContainer, BorderLayout.NORTH)
         overviewPanel.add(descriptionScroll, BorderLayout.CENTER)
@@ -108,6 +110,7 @@ class MrDetailPanel(
         tabbedPane.addTab(CockpitBundle.message("detail.tab.overview"), overviewPanel)
         tabbedPane.addTab(CockpitBundle.message("detail.tab.comments"), commentsPanel)
         tabbedPane.addTab(CockpitBundle.message("pipelines.tab"), pipelinesPanel)
+        tabbedPane.addTab(CockpitBundle.message("changes.tab"), changesPanel)
         tabbedPane.addChangeListener {
             when (tabbedPane.selectedIndex) {
                 COMMENTS_TAB_INDEX -> {
@@ -115,6 +118,7 @@ class MrDetailPanel(
                     if (iid != null && notesLoadedForIid != iid) loadNotes(iid)
                 }
                 PIPELINES_TAB_INDEX -> pipelinesPanel.onTabSelected()
+                CHANGES_TAB_INDEX -> changesPanel.onTabSelected()
             }
         }
         commentButton.addActionListener { onSubmitComment() }
@@ -126,6 +130,7 @@ class MrDetailPanel(
     fun showPlaceholder() {
         currentIid = null
         pipelinesPanel.clear()
+        changesPanel.clear()
         setSingleMessage(CockpitBundle.message("detail.placeholder"))
     }
 
@@ -164,6 +169,9 @@ class MrDetailPanel(
         // Rebind the Pipelines tab; it reloads lazily when shown (or now, if already selected).
         pipelinesPanel.setMr(mr.iid, mr.sourceBranch)
 
+        // Rebind the Changes tab; it reloads lazily when shown (or now, if already selected).
+        changesPanel.setMr(mr.iid, mr.diffRefs)
+
         if (tabbedPane.parent !== this) {
             removeAll()
             add(tabbedPane, BorderLayout.CENTER)
@@ -174,6 +182,7 @@ class MrDetailPanel(
         loadApprovals(mr.iid)
         if (tabbedPane.selectedIndex == COMMENTS_TAB_INDEX) loadNotes(mr.iid)
         if (tabbedPane.selectedIndex == PIPELINES_TAB_INDEX) pipelinesPanel.onTabSelected()
+        if (tabbedPane.selectedIndex == CHANGES_TAB_INDEX) changesPanel.onTabSelected()
     }
 
     private fun setDescription(mr: GitLabMergeRequest) {
@@ -395,6 +404,21 @@ class MrDetailPanel(
         tabbedPane.setTitleAt(COMMENTS_TAB_INDEX, title)
     }
 
+    /**
+     * Updates the Changes tab title with the loaded file count (null → the plain "Changes"). Guarded
+     * against being called before the tab is added (the [ChangesPanel] callback can fire during its
+     * own construction, which happens before [tabbedPane] is populated).
+     */
+    private fun setChangesTabTitle(count: Int?) {
+        if (tabbedPane.tabCount <= CHANGES_TAB_INDEX) return
+        val title = if (count == null) {
+            CockpitBundle.message("changes.tab")
+        } else {
+            CockpitBundle.message("changes.tabCount", count)
+        }
+        tabbedPane.setTitleAt(CHANGES_TAB_INDEX, title)
+    }
+
     // --- Edit actions -------------------------------------------------------------------------
 
     /** No network before opening: title/description are already in [mr]. */
@@ -567,6 +591,7 @@ class MrDetailPanel(
     companion object {
         private const val COMMENTS_TAB_INDEX = 1
         private const val PIPELINES_TAB_INDEX = 2
+        private const val CHANGES_TAB_INDEX = 3
 
         /** For header rows: prefer the display name, fall back to the username. */
         private fun displayName(user: GitLabUser): String = user.name.ifBlank { user.username }
