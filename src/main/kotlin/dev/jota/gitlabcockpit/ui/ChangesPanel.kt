@@ -61,6 +61,7 @@ import dev.jota.gitlabcockpit.core.buildLineMap
 import dev.jota.gitlabcockpit.core.changeTypeOf
 import dev.jota.gitlabcockpit.core.buildFileTree
 import dev.jota.gitlabcockpit.core.discussionsByFile
+import dev.jota.gitlabcockpit.ui.diff.CockpitDiffContext
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.async
@@ -464,6 +465,11 @@ class ChangesPanel(
      * "Comment on line…" context action ([DiffUserDataKeys.CONTEXT_ACTIONS]) is attached so the user
      * can start a review thread from the caret line without leaving the diff. The two editors show the
      * whole base/head file, so an editor line number equals that side's GitLab line number.
+     *
+     * The request also carries a [CockpitDiffContext] (F4c) with the file's currently loaded
+     * discussions, so [dev.jota.gitlabcockpit.ui.diff.CockpitDiffExtension] can render the review
+     * threads inline in the diff editors. Threads created via "Comment on line…" show up the next
+     * time the diff is opened (the discussions are reloaded after posting).
      */
     private fun showDiff(iid: Long, file: GitLabDiffFile, refs: DiffRefs, oldText: String, newText: String) {
         val displayPath = if (file.deletedFile) file.oldPath else file.newPath
@@ -486,6 +492,12 @@ class ChangesPanel(
             override fun actionPerformed(e: AnActionEvent) = onCommentFromDiff(e, file, refs)
         }
         request.putUserData(DiffUserDataKeys.CONTEXT_ACTIONS, listOf<AnAction>(commentAction))
+        // The discussions map keys by the position's new_path (falling back to old_path), so both
+        // paths are probed — a rename/delete may have been keyed under either one.
+        val fileDiscussions =
+            (discussionsByFilePath[file.newPath].orEmpty() + discussionsByFilePath[file.oldPath].orEmpty())
+                .distinctBy { it.id }
+        request.putUserData(CockpitDiffContext.KEY, CockpitDiffContext(iid, file, refs, fileDiscussions))
         DiffManager.getInstance().showDiff(project, request)
     }
 

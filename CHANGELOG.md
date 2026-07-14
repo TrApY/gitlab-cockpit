@@ -4,6 +4,12 @@
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-07-15
+
+### Added
+
+- Review threads rendered inline inside the diff editor (embedded components below their anchored line, correct side), with expand/collapse, reply and resolve/unresolve without leaving the diff
+
 ## [0.3.0] - 2026-07-15
 
 ### Added

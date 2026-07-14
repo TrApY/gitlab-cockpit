@@ -26,5 +26,7 @@
         <notificationGroup
             id="Cockpit for GitLab"
             displayType="BALLOON"/>
+        <diff.DiffExtension
+            implementation="dev.jota.gitlabcockpit.ui.diff.CockpitDiffExtension"/>
     </extensions>
 </idea-plugin>
