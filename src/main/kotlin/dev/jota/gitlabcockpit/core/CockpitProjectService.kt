@@ -10,6 +10,7 @@ import dev.jota.gitlabcockpit.api.GitLabApprovals
 import dev.jota.gitlabcockpit.api.GitLabDiffFile
 import dev.jota.gitlabcockpit.api.GitLabDiscussion
 import dev.jota.gitlabcockpit.api.GitLabDiscussionNote
+import dev.jota.gitlabcockpit.api.GitLabDraftNote
 import dev.jota.gitlabcockpit.api.GitLabJob
 import dev.jota.gitlabcockpit.api.GitLabMergeRequest
 import dev.jota.gitlabcockpit.api.GitLabNote
@@ -245,6 +246,61 @@ class CockpitProjectService(
             )
             client.createDiffDiscussion(glProject.id, iid, body, position)
         }
+
+    // --- Draft notes, review submission & resolution (F4b) ------------------------------------
+
+    /** The MR's pending draft notes (the current user's unpublished review comments). */
+    suspend fun getDraftNotes(iid: Long): GitLabResult<List<GitLabDraftNote>> =
+        withClientAndProject { client, glProject -> client.getDraftNotes(glProject.id, iid) }
+
+    /** Adds a draft note; a null [position] posts a general draft, otherwise a diff-anchored one. */
+    suspend fun createDraftNote(
+        iid: Long,
+        note: String,
+        position: PositionPayload? = null,
+    ): GitLabResult<GitLabDraftNote> =
+        withClientAndProject { client, glProject -> client.createDraftNote(glProject.id, iid, note, position) }
+
+    /**
+     * Opens a diff-anchored draft on [file] at [pos] — the draft analogue of [createDiffThread].
+     * Builds the [PositionPayload] from the MR's [refs] (its `diff_refs` SHAs), always sending both
+     * `old_path` and `new_path` from [file] with the old/new line from [pos]. Returns the created draft.
+     */
+    suspend fun createDraftThread(
+        iid: Long,
+        file: GitLabDiffFile,
+        refs: DiffRefs,
+        pos: LinePosition,
+        note: String,
+    ): GitLabResult<GitLabDraftNote> =
+        withClientAndProject { client, glProject ->
+            val position = PositionPayload(
+                baseSha = refs.baseSha,
+                startSha = refs.startSha,
+                headSha = refs.headSha,
+                oldPath = file.oldPath,
+                newPath = file.newPath,
+                oldLine = pos.oldLine,
+                newLine = pos.newLine,
+            )
+            client.createDraftNote(glProject.id, iid, note, position)
+        }
+
+    /** Discards a single pending draft note. */
+    suspend fun deleteDraftNote(iid: Long, draftId: Long): GitLabResult<Unit> =
+        withClientAndProject { client, glProject -> client.deleteDraftNote(glProject.id, iid, draftId) }
+
+    /** Publishes every pending draft as the review submission (bulk publish). */
+    suspend fun publishDrafts(iid: Long): GitLabResult<Unit> =
+        withClientAndProject { client, glProject -> client.publishAllDraftNotes(glProject.id, iid) }
+
+    /** Resolves ([resolved] true) or reopens ([resolved] false) a discussion thread. */
+    suspend fun setDiscussionResolved(
+        iid: Long,
+        discussionId: String,
+        resolved: Boolean,
+    ): GitLabResult<Unit> =
+        withClientAndProject { client, glProject -> client.resolveDiscussion(glProject.id, iid, discussionId, resolved) }
 
     // --- Pipelines (F2a) ----------------------------------------------------------------------
 

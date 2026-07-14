@@ -4,6 +4,15 @@
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-07-15
+
+### Added
+
+- Changes tab: changed-files tree with per-file comment counters, editor diff (base/head, no checkout needed) and per-file review discussions with reply
+- Create positioned review threads: "New thread" dialog (commentable lines only) and "Comment on line…" action inside the diff viewer (exact side + line)
+- Draft notes: save comments as drafts, pending-review section, delete drafts, "Submit review" (bulk publish) with IDE notification
+- Resolve / unresolve review discussions
+
 ## [0.2.0] - 2026-07-14
 
 ### Added

@@ -8,6 +8,8 @@ import com.intellij.diff.tools.util.side.TwosideTextDiffViewer
 import com.intellij.diff.util.DiffUserDataKeys
 import com.intellij.diff.util.Side
 import com.intellij.icons.AllIcons
+import com.intellij.notification.NotificationGroupManager
+import com.intellij.notification.NotificationType
 import com.intellij.openapi.actionSystem.ActionUpdateThread
 import com.intellij.openapi.actionSystem.AnAction
 import com.intellij.openapi.actionSystem.AnActionEvent
@@ -28,10 +30,13 @@ import com.intellij.ui.JBColor
 import com.intellij.ui.OnePixelSplitter
 import com.intellij.ui.SimpleListCellRenderer
 import com.intellij.ui.SimpleTextAttributes
+import com.intellij.ui.components.ActionLink
+import com.intellij.ui.components.JBCheckBox
 import com.intellij.ui.components.JBLabel
 import com.intellij.ui.components.JBList
 import com.intellij.ui.components.JBScrollPane
 import com.intellij.ui.components.JBTextArea
+import com.intellij.ui.components.panels.VerticalLayout
 import com.intellij.ui.treeStructure.Tree
 import com.intellij.util.ui.FormBuilder
 import com.intellij.util.ui.JBUI
@@ -42,9 +47,11 @@ import dev.jota.gitlabcockpit.api.DiffRefs
 import dev.jota.gitlabcockpit.api.GitLabDiffFile
 import dev.jota.gitlabcockpit.api.GitLabDiscussion
 import dev.jota.gitlabcockpit.api.GitLabDiscussionNote
+import dev.jota.gitlabcockpit.api.GitLabDraftNote
 import dev.jota.gitlabcockpit.api.GitLabResult
 import dev.jota.gitlabcockpit.api.GitLabUser
 import dev.jota.gitlabcockpit.api.NotePosition
+import dev.jota.gitlabcockpit.core.COCKPIT_NOTIFICATION_GROUP
 import dev.jota.gitlabcockpit.core.ChangeType
 import dev.jota.gitlabcockpit.core.CockpitProjectService
 import dev.jota.gitlabcockpit.core.DiffLineMap
@@ -62,6 +69,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.awt.BorderLayout
 import java.awt.FlowLayout
+import java.awt.Font
 import java.awt.event.MouseEvent
 import javax.swing.Icon
 import javax.swing.JButton
@@ -88,13 +96,19 @@ import javax.swing.tree.TreeSelectionModel
  * coroutine scope (never the EDT); results are marshaled with [Dispatchers.EDT] and dropped when
  * stale (re-checking [currentIid]).
  *
+ * The bottom half also hosts the F4b "Pending review" section (the MR's unpublished draft notes,
+ * with per-row delete plus Submit review / Refresh) and a per-thread Resolve/Unresolve action.
+ *
  * @param onFileCountChanged reports the loaded file count (or null while unknown) so the parent can
  * put it in the tab title.
+ * @param onReviewSubmitted called after a successful "Submit review" (bulk publish) so the parent can
+ * refresh its Comments tab (published drafts become regular notes; the draft banner clears).
  */
 class ChangesPanel(
     private val project: Project,
     private val service: CockpitProjectService,
     private val onFileCountChanged: (Int?) -> Unit,
+    private val onReviewSubmitted: () -> Unit,
 ) : JPanel(BorderLayout()) {
 
     /** iid of the MR currently displayed; null when cleared. */
@@ -116,11 +130,18 @@ class ChangesPanel(
     /** The changed file currently selected in the tree; enables "New thread". Null when none. */
     private var selectedFile: GitLabDiffFile? = null
 
+    /** The MR's pending draft notes, loaded alongside the discussions; drives the "Pending review" section. */
+    private var currentDrafts: List<GitLabDraftNote> = emptyList()
+
     private var loadJob: Job? = null
     private var discussionsJob: Job? = null
     private var diffJob: Job? = null
     private var replyJob: Job? = null
     private var newThreadJob: Job? = null
+    private var draftsJob: Job? = null
+    private var publishJob: Job? = null
+    private var deleteJob: Job? = null
+    private var resolveJob: Job? = null
 
     private val rootNode = DefaultMutableTreeNode()
     private val treeModel = DefaultTreeModel(rootNode)
@@ -150,10 +171,26 @@ class ChangesPanel(
         addActionListener { onNewThread() }
     }
 
+    /** Resolve/Unresolve action for the selected thread; hidden unless that thread is resolvable. */
+    private val resolveButton = JButton().apply {
+        isVisible = false
+        addActionListener { onToggleResolve() }
+    }
+
+    // --- Pending review (F4b) -----------------------------------------------------------------
+
+    /** One row per draft, rebuilt on every drafts (re)load. */
+    private val draftsRowsPanel = JPanel(VerticalLayout(JBUI.scale(2)))
+    private val submitButton = JButton().apply { addActionListener { onSubmitReview() } }
+    private val refreshButton = JButton(CockpitBundle.message("changes.pending.refresh")).apply {
+        addActionListener { currentIid?.let { reloadDrafts(it) } }
+    }
+    private val pendingReviewPanel = JPanel(BorderLayout())
+
     init {
         val splitter = OnePixelSplitter(true, 0.6f).apply {
             firstComponent = JBScrollPane(tree)
-            secondComponent = buildCommentsPanel()
+            secondComponent = buildBottomPanel()
         }
         add(splitter, BorderLayout.CENTER)
 
@@ -179,6 +216,7 @@ class ChangesPanel(
             if (!event.valueIsAdjusting) {
                 val discussion = discussionList.selectedValue
                 replyButton.isEnabled = discussion != null
+                updateResolveButton(discussion)
                 renderDiscussion(discussion)
             }
         }
@@ -213,10 +251,42 @@ class ChangesPanel(
         val panel = JPanel(BorderLayout(0, JBUI.scale(4)))
         panel.border = JBUI.Borders.empty(6, 8)
         panel.add(JBScrollPane(replyArea), BorderLayout.CENTER)
-        val buttons = JPanel(FlowLayout(FlowLayout.RIGHT, 0, 0)).apply { isOpaque = false }
+        val buttons = JPanel(FlowLayout(FlowLayout.RIGHT, JBUI.scale(4), 0)).apply { isOpaque = false }
+        buttons.add(resolveButton)
         buttons.add(replyButton)
         panel.add(buttons, BorderLayout.SOUTH)
         return panel
+    }
+
+    /**
+     * The Changes tab's bottom half: the "Pending review" section (F4b, hidden unless there are
+     * drafts) stacked above the file's discussions.
+     */
+    private fun buildBottomPanel(): JComponent {
+        val panel = JPanel(BorderLayout())
+        panel.add(buildPendingReviewPanel(), BorderLayout.NORTH)
+        panel.add(buildCommentsPanel(), BorderLayout.CENTER)
+        return panel
+    }
+
+    /** Builds the (initially hidden) "Pending review" section: draft rows + Submit review / Refresh. */
+    private fun buildPendingReviewPanel(): JComponent {
+        pendingReviewPanel.border = JBUI.Borders.empty(4, 8)
+        val header = JPanel(BorderLayout())
+        header.isOpaque = false
+        header.add(
+            JBLabel(CockpitBundle.message("changes.pending.title")).apply { font = font.deriveFont(Font.BOLD) },
+            BorderLayout.WEST,
+        )
+        val buttons = JPanel(FlowLayout(FlowLayout.RIGHT, JBUI.scale(4), 0)).apply { isOpaque = false }
+        buttons.add(submitButton)
+        buttons.add(refreshButton)
+        header.add(buttons, BorderLayout.EAST)
+        pendingReviewPanel.add(header, BorderLayout.NORTH)
+        val scroll = JBScrollPane(draftsRowsPanel).apply { preferredSize = JBUI.size(240, 110) }
+        pendingReviewPanel.add(scroll, BorderLayout.CENTER)
+        pendingReviewPanel.isVisible = false
+        return pendingReviewPanel
     }
 
     // --- Lifecycle called by MrDetailPanel ----------------------------------------------------
@@ -255,6 +325,10 @@ class ChangesPanel(
         diffJob?.cancel()
         replyJob?.cancel()
         newThreadJob?.cancel()
+        draftsJob?.cancel()
+        publishJob?.cancel()
+        deleteJob?.cancel()
+        resolveJob?.cancel()
     }
 
     private fun clearContent() {
@@ -268,7 +342,11 @@ class ChangesPanel(
         discussionPane.text = CockpitHtml.wrapHtml("")
         replyArea.text = ""
         replyButton.isEnabled = false
+        resolveButton.isVisible = false
         commentsTitle.text = CockpitBundle.message("changes.comments.title")
+        currentDrafts = emptyList()
+        draftsRowsPanel.removeAll()
+        pendingReviewPanel.isVisible = false
     }
 
     // --- Loading ------------------------------------------------------------------------------
@@ -281,13 +359,16 @@ class ChangesPanel(
         tree.emptyText.text = CockpitBundle.message("changes.loading")
         loadJob?.cancel()
         loadJob = service.coroutineScope.launch {
-            val (diffsResult, discussionsResult) = coroutineScope {
+            val (diffsResult, discussionsResult, draftsResult) = coroutineScope {
                 val diffs = async { service.getMrDiffs(iid) }
                 val discussions = async { service.getMrDiscussions(iid) }
-                diffs.await() to discussions.await()
+                val drafts = async { service.getDraftNotes(iid) }
+                Triple(diffs.await(), discussions.await(), drafts.await())
             }
             withContext(Dispatchers.EDT) {
                 if (currentIid != iid) return@withContext
+                // Drafts are non-fatal too: an error just hides the "Pending review" section.
+                renderDrafts((draftsResult as? GitLabResult.Success)?.data ?: emptyList())
                 when (diffsResult) {
                     is GitLabResult.Success -> {
                         // Discussions are non-fatal: an error just means "no comments shown".
@@ -421,6 +502,7 @@ class ChangesPanel(
                 "<p><i>" + CockpitHtml.escapeHtml(CockpitBundle.message("changes.comments.empty")) + "</i></p>",
             )
             replyButton.isEnabled = false
+            updateResolveButton(null)
         } else {
             discussionList.selectedIndex = 0
         }
@@ -562,7 +644,11 @@ class ChangesPanel(
         val pos = dialog.selectedPosition() ?: return
         val body = dialog.body()
         if (body.isBlank()) return
-        submitNewThread(iid, file, refs, pos, body)
+        if (dialog.saveAsDraft()) {
+            submitNewDraftThread(iid, file, refs, pos, body)
+        } else {
+            submitNewThread(iid, file, refs, pos, body)
+        }
     }
 
     /** Posts a new diff thread off the EDT, then reloads discussions and re-selects the new thread. */
@@ -581,6 +667,193 @@ class ChangesPanel(
                     )
                 }
             }
+        }
+    }
+
+    /**
+     * Posts a new *draft* diff thread off the EDT, then reloads the "Pending review" section. A draft
+     * is not a published discussion, so the discussions tree is left untouched.
+     */
+    private fun submitNewDraftThread(iid: Long, file: GitLabDiffFile, refs: DiffRefs, pos: LinePosition, body: String) {
+        newThreadJob?.cancel()
+        newThreadJob = service.coroutineScope.launch {
+            val result = service.createDraftThread(iid, file, refs, pos, body)
+            withContext(Dispatchers.EDT) {
+                if (currentIid != iid) return@withContext
+                when (result) {
+                    is GitLabResult.Success -> reloadDrafts(iid)
+                    else -> Messages.showErrorDialog(
+                        project,
+                        CockpitBundle.message("changes.error.drafts", describe(result)),
+                        CockpitBundle.message("detail.error.title"),
+                    )
+                }
+            }
+        }
+    }
+
+    // --- Pending review & resolution (F4b) ----------------------------------------------------
+
+    /** EDT. Rebuilds the "Pending review" section from [drafts]; hides it when there are none. */
+    private fun renderDrafts(drafts: List<GitLabDraftNote>) {
+        currentDrafts = drafts
+        draftsRowsPanel.removeAll()
+        if (drafts.isEmpty()) {
+            draftsRowsPanel.add(
+                JBLabel(CockpitBundle.message("changes.pending.empty")).apply {
+                    foreground = UIUtil.getInactiveTextColor()
+                },
+            )
+        } else {
+            for (draft in drafts) draftsRowsPanel.add(buildDraftRow(draft))
+        }
+        submitButton.text = CockpitBundle.message("changes.pending.submit", drafts.size)
+        submitButton.isEnabled = drafts.isNotEmpty()
+        pendingReviewPanel.isVisible = drafts.isNotEmpty()
+        draftsRowsPanel.revalidate()
+        draftsRowsPanel.repaint()
+        revalidate()
+        repaint()
+    }
+
+    /** One "Pending review" row: the draft's text (+ line) on the left, a Delete link on the right. */
+    private fun buildDraftRow(draft: GitLabDraftNote): JComponent {
+        val row = JPanel(BorderLayout(JBUI.scale(6), 0)).apply { isOpaque = false }
+        row.add(JBLabel(draftLabelText(draft)), BorderLayout.CENTER)
+        val delete = ActionLink(CockpitBundle.message("changes.pending.delete")) { onDeleteDraft(draft.id) }
+        val east = JPanel(FlowLayout(FlowLayout.RIGHT, 0, 0)).apply { isOpaque = false }
+        east.add(delete)
+        row.add(east, BorderLayout.EAST)
+        return row
+    }
+
+    /** Deletes a single draft off the EDT, then reloads the "Pending review" section. */
+    private fun onDeleteDraft(draftId: Long) {
+        val iid = currentIid ?: return
+        deleteJob?.cancel()
+        deleteJob = service.coroutineScope.launch {
+            val result = service.deleteDraftNote(iid, draftId)
+            withContext(Dispatchers.EDT) {
+                if (currentIid != iid) return@withContext
+                when (result) {
+                    is GitLabResult.Success -> reloadDrafts(iid)
+                    else -> Messages.showErrorDialog(
+                        project,
+                        CockpitBundle.message("changes.error.drafts", describe(result)),
+                        CockpitBundle.message("detail.error.title"),
+                    )
+                }
+            }
+        }
+    }
+
+    /** Re-fetches the MR's draft notes and re-renders the "Pending review" section. */
+    private fun reloadDrafts(iid: Long) {
+        draftsJob?.cancel()
+        draftsJob = service.coroutineScope.launch {
+            val result = service.getDraftNotes(iid)
+            withContext(Dispatchers.EDT) {
+                if (currentIid != iid) return@withContext
+                renderDrafts((result as? GitLabResult.Success)?.data ?: emptyList())
+            }
+        }
+    }
+
+    /**
+     * "Submit review": publishes every pending draft off the EDT. On success it reloads the drafts and
+     * the discussions (published drafts become threads), notifies the parent to refresh its Comments
+     * tab, and fires a balloon notification.
+     */
+    private fun onSubmitReview() {
+        val iid = currentIid ?: return
+        val count = currentDrafts.size
+        if (count == 0) return
+        submitButton.isEnabled = false
+        publishJob?.cancel()
+        publishJob = service.coroutineScope.launch {
+            val result = service.publishDrafts(iid)
+            withContext(Dispatchers.EDT) {
+                if (currentIid != iid) return@withContext
+                when (result) {
+                    is GitLabResult.Success -> {
+                        notifyReviewSubmitted(count)
+                        reloadDrafts(iid)
+                        reloadDiscussions(iid, selectedFilePath, null)
+                        onReviewSubmitted()
+                    }
+                    else -> {
+                        submitButton.isEnabled = true
+                        Messages.showErrorDialog(
+                            project,
+                            CockpitBundle.message("changes.error.publish", describe(result)),
+                            CockpitBundle.message("detail.error.title"),
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    /** Fires the "Review submitted" balloon on the existing Cockpit notification group. */
+    private fun notifyReviewSubmitted(count: Int) {
+        NotificationGroupManager.getInstance()
+            .getNotificationGroup(COCKPIT_NOTIFICATION_GROUP)
+            .createNotification(
+                CockpitBundle.message("notification.review.submitted", count),
+                NotificationType.INFORMATION,
+            )
+            .notify(project)
+    }
+
+    /** EDT. Shows a Resolve/Unresolve action for [discussion] when its thread is resolvable. */
+    private fun updateResolveButton(discussion: GitLabDiscussion?) {
+        val firstNote = discussion?.notes?.firstOrNull { !it.system }
+        val resolvable = firstNote?.resolvable == true
+        resolveButton.isVisible = resolvable
+        resolveButton.isEnabled = resolvable
+        if (resolvable) {
+            resolveButton.text = CockpitBundle.message(
+                if (firstNote!!.resolved) "changes.discussion.unresolve" else "changes.discussion.resolve",
+            )
+        }
+    }
+
+    /** Toggles the selected thread's resolution off the EDT, then reloads the discussions. */
+    private fun onToggleResolve() {
+        val iid = currentIid ?: return
+        val discussion = discussionList.selectedValue ?: return
+        val firstNote = discussion.notes.firstOrNull { !it.system } ?: return
+        if (!firstNote.resolvable) return
+        val newResolved = !firstNote.resolved
+        resolveButton.isEnabled = false
+        resolveJob?.cancel()
+        resolveJob = service.coroutineScope.launch {
+            val result = service.setDiscussionResolved(iid, discussion.id, newResolved)
+            withContext(Dispatchers.EDT) {
+                if (currentIid != iid) return@withContext
+                when (result) {
+                    is GitLabResult.Success -> reloadDiscussions(iid, selectedFilePath, discussion.id)
+                    else -> {
+                        resolveButton.isEnabled = true
+                        Messages.showErrorDialog(
+                            project,
+                            CockpitBundle.message("changes.error.resolve", describe(result)),
+                            CockpitBundle.message("detail.error.title"),
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    /** `<first line, ≤80 chars>` plus ` · L<n>` when the draft is anchored to a diff line. */
+    private fun draftLabelText(draft: GitLabDraftNote): String {
+        val text = draft.note.lineSequence().firstOrNull()?.trim().orEmpty().take(80)
+        val line = draft.position?.let { it.newLine ?: it.oldLine }
+        return if (line != null) {
+            text + " · " + CockpitBundle.message("changes.comments.line", line)
+        } else {
+            text
         }
     }
 
@@ -658,6 +931,8 @@ class ChangesPanel(
             wrapStyleWord = true
         }
 
+        private val draftCheckBox = JBCheckBox(CockpitBundle.message("dialog.newThread.draft"))
+
         private val noticeLabel = JBLabel(CockpitBundle.message("dialog.newThread.noDiff")).apply {
             foreground = JBColor.RED
             isVisible = !hasCommentableLines
@@ -693,8 +968,9 @@ class ChangesPanel(
                     CockpitBundle.message("dialog.newThread.body"),
                     JBScrollPane(bodyArea),
                 )
+                .addComponent(draftCheckBox)
             if (!hasCommentableLines) builder.addComponent(noticeLabel)
-            return builder.panel.apply { preferredSize = JBUI.size(520, 340) }
+            return builder.panel.apply { preferredSize = JBUI.size(520, 360) }
         }
 
         override fun doValidate(): ValidationInfo? = when {
@@ -719,6 +995,9 @@ class ChangesPanel(
         }
 
         fun body(): String = bodyArea.text.trim()
+
+        /** Whether the user chose to save the comment as a draft instead of publishing it now. */
+        fun saveAsDraft(): Boolean = draftCheckBox.isSelected
     }
 
     companion object {

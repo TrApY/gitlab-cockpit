@@ -30,6 +30,8 @@ import dev.jota.gitlabcockpit.api.MergeRequestUpdate
 import dev.jota.gitlabcockpit.core.CockpitProjectService
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.awt.BorderLayout
@@ -92,18 +94,31 @@ class MrDetailPanel(
         emptyText.text = CockpitBundle.message("detail.comment.placeholder")
     }
     private val commentButton = JButton(CockpitBundle.message("detail.comment.button"))
+
+    /** Banner shown atop the Comments tab when the MR has pending draft notes; hidden otherwise. */
+    private val draftBanner = JBLabel().apply {
+        icon = AllIcons.General.Balloon
+        border = JBUI.Borders.empty(4, 8)
+        isVisible = false
+    }
     private val commentsPanel = JPanel(BorderLayout())
 
     private val tabbedPane = JBTabbedPane()
 
     private val pipelinesPanel = PipelinesPanel(project, service)
 
-    private val changesPanel = ChangesPanel(project, service) { count -> setChangesTabTitle(count) }
+    private val changesPanel = ChangesPanel(
+        project,
+        service,
+        onFileCountChanged = { count -> setChangesTabTitle(count) },
+        onReviewSubmitted = { onReviewSubmitted() },
+    )
 
     init {
         overviewPanel.add(headerContainer, BorderLayout.NORTH)
         overviewPanel.add(descriptionScroll, BorderLayout.CENTER)
 
+        commentsPanel.add(draftBanner, BorderLayout.NORTH)
         commentsPanel.add(notesScroll, BorderLayout.CENTER)
         commentsPanel.add(buildCommentInput(), BorderLayout.SOUTH)
 
@@ -164,6 +179,7 @@ class MrDetailPanel(
         notesJob?.cancel()
         notesLoadedForIid = null
         notesPane.text = CockpitHtml.wrapHtml("")
+        draftBanner.isVisible = false
         setCommentsTabTitle(null)
 
         // Rebind the Pipelines tab; it reloads lazily when shown (or now, if already selected).
@@ -320,7 +336,11 @@ class MrDetailPanel(
         return panel
     }
 
-    /** Fetches the MR's notes in the background and renders them (guarded by [currentIid]). */
+    /**
+     * Fetches the MR's notes in the background and renders them (guarded by [currentIid]). The pending
+     * draft count is loaded in the same cycle (in parallel, non-blocking and non-fatal) to drive the
+     * "pending draft notes" banner.
+     */
     private fun loadNotes(iid: Long) {
         notesLoadedForIid = iid
         notesPane.text = CockpitHtml.wrapHtml(
@@ -329,16 +349,21 @@ class MrDetailPanel(
         setCommentsTabTitle(null)
         notesJob?.cancel()
         notesJob = service.coroutineScope.launch {
-            val result = service.getNotes(iid)
+            val (notesResult, draftsResult) = coroutineScope {
+                val notes = async { service.getNotes(iid) }
+                val drafts = async { service.getDraftNotes(iid) }
+                notes.await() to drafts.await()
+            }
             withContext(Dispatchers.EDT) {
                 if (currentIid != iid) return@withContext
-                when (result) {
-                    is GitLabResult.Success -> renderNotes(result.data)
+                renderDraftBanner((draftsResult as? GitLabResult.Success)?.data?.size ?: 0)
+                when (notesResult) {
+                    is GitLabResult.Success -> renderNotes(notesResult.data)
                     else -> {
                         notesLoadedForIid = null
                         notesPane.text = CockpitHtml.wrapHtml(
                             "<p><i>" +
-                                CockpitHtml.escapeHtml(CockpitBundle.message("detail.error.notes", describe(result))) +
+                                CockpitHtml.escapeHtml(CockpitBundle.message("detail.error.notes", describe(notesResult))) +
                                 "</i></p>",
                         )
                         setCommentsTabTitle(null)
@@ -346,6 +371,28 @@ class MrDetailPanel(
                 }
             }
         }
+    }
+
+    /** EDT. Shows or hides the pending-drafts banner based on [count]. */
+    private fun renderDraftBanner(count: Int) {
+        if (count > 0) {
+            draftBanner.text = CockpitBundle.message("comments.draftBanner", count)
+            draftBanner.isVisible = true
+        } else {
+            draftBanner.isVisible = false
+        }
+    }
+
+    /**
+     * Called by the Changes tab after a successful "Submit review": the published drafts are now
+     * regular notes and the banner is stale. Clears the banner and invalidates the notes so the
+     * Comments tab re-fetches (immediately if it is the visible tab, otherwise lazily on next show).
+     */
+    private fun onReviewSubmitted() {
+        draftBanner.isVisible = false
+        val iid = currentIid ?: return
+        notesLoadedForIid = null
+        if (tabbedPane.selectedIndex == COMMENTS_TAB_INDEX) loadNotes(iid)
     }
 
     /** EDT. Renders the human notes as one themed HTML document and updates the tab counter. */

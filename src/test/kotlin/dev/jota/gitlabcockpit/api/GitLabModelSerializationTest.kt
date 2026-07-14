@@ -3,6 +3,7 @@ package dev.jota.gitlabcockpit.api
 import kotlinx.serialization.json.Json
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -148,5 +149,45 @@ class GitLabModelSerializationTest {
         )
 
         assertTrue(note.system)
+    }
+
+    @Test
+    fun `draft note keeps id note and position and ignores unknown fields`() {
+        val draft = json.decodeFromString<GitLabDraftNote>(
+            """
+            {
+              "id": 77,
+              "note": "Please rename this",
+              "merge_request_id": 5,
+              "author_id": 9,
+              "resolve_discussion": false,
+              "line_code": "abc_1_2",
+              "position": {
+                "base_sha": "b",
+                "head_sha": "h",
+                "start_sha": "s",
+                "old_path": "src/App.kt",
+                "new_path": "src/App.kt",
+                "new_line": 12
+              }
+            }
+            """.trimIndent(),
+        )
+
+        assertEquals(77L, draft.id)
+        assertEquals("Please rename this", draft.note)
+        assertEquals("src/App.kt", draft.position?.newPath)
+        assertEquals(12, draft.position?.newLine)
+    }
+
+    @Test
+    fun `draft note defaults position to null when absent`() {
+        val draft = json.decodeFromString<GitLabDraftNote>(
+            """{"id": 78, "note": "General draft", "merge_request_id": 5, "author_id": 9}""",
+        )
+
+        assertEquals(78L, draft.id)
+        assertEquals("General draft", draft.note)
+        assertNull(draft.position)
     }
 }

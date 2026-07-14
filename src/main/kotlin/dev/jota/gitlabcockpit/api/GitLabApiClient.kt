@@ -217,6 +217,18 @@ data class NotePosition(
 )
 
 /**
+ * A draft note from `/merge_requests/:iid/draft_notes` (a personal, unpublished review comment). Only
+ * [id], [note] (its body) and the optional diff [position] are modeled; the rest of GitLab's payload
+ * (`merge_request_id`, `author_id`, `resolve_discussion`…) is ignored by the configured [Json].
+ */
+@Serializable
+data class GitLabDraftNote(
+    val id: Long,
+    val note: String,
+    val position: NotePosition? = null,
+)
+
+/**
  * Request-side diff position for [GitLabApiClient.createDiffDiscussion]. Serialized with
  * [GitLabApiClient.discussionJson], which omits null fields but always emits [positionType]. The
  * three SHAs come from the MR's `diff_refs`; [oldPath] and [newPath] are always both sent, while
@@ -248,6 +260,21 @@ private data class DiffDiscussionCreateBody(
 /** Request body for `POST /projects/:id/pipeline`: `{ "ref": "…" }`. */
 @Serializable
 private data class PipelineCreateBody(val ref: String)
+
+/**
+ * Request body for `POST /merge_requests/:iid/draft_notes`: `{ "note": …, "position": {…}? }`. The
+ * [position] is omitted for an unpositioned (general) draft; it is encoded by
+ * [GitLabApiClient.discussionJson], which drops the null and always emits `position_type`.
+ */
+@Serializable
+private data class DraftNoteCreateBody(
+    val note: String,
+    val position: PositionPayload? = null,
+)
+
+/** Request body for `PUT /merge_requests/:iid/discussions/:id`: `{ "resolved": true|false }`. */
+@Serializable
+private data class DiscussionResolveBody(val resolved: Boolean)
 
 /**
  * Server-side query for [GitLabApiClient.getMergeRequests]. `state` is one of
@@ -507,6 +534,69 @@ class GitLabApiClient(
         )
     }
 
+    // --- Draft notes & review submission (F4b) ------------------------------------------------
+
+    /** Calls `GET /projects/:id/merge_requests/:iid/draft_notes?per_page=100` — the user's drafts. */
+    suspend fun getDraftNotes(projectId: Long, mrIid: Long): GitLabResult<List<GitLabDraftNote>> =
+        get(
+            "/projects/$projectId/merge_requests/$mrIid/draft_notes",
+            listOf("per_page" to "100"),
+            ListSerializer(GitLabDraftNote.serializer()),
+        )
+
+    /**
+     * Calls `POST /projects/:id/merge_requests/:iid/draft_notes` with `{ "note": …, "position": {…}? }`
+     * to add a personal (unpublished) review comment. A null [position] posts a general draft (the
+     * field is omitted); a non-null one anchors the draft to a diff line, encoded exactly like
+     * [createDiffDiscussion]'s position. Returns the created [GitLabDraftNote].
+     */
+    suspend fun createDraftNote(
+        projectId: Long,
+        mrIid: Long,
+        note: String,
+        position: PositionPayload? = null,
+    ): GitLabResult<GitLabDraftNote> {
+        val payload = discussionJson.encodeToString(
+            DraftNoteCreateBody.serializer(),
+            DraftNoteCreateBody(note, position),
+        )
+        return post(
+            "/projects/$projectId/merge_requests/$mrIid/draft_notes",
+            payload,
+            GitLabDraftNote.serializer(),
+        )
+    }
+
+    /**
+     * Calls `DELETE /projects/:id/merge_requests/:iid/draft_notes/:draft_note_id` to discard a draft.
+     * GitLab answers `204` with no body, so nothing is decoded.
+     */
+    suspend fun deleteDraftNote(projectId: Long, mrIid: Long, draftNoteId: Long): GitLabResult<Unit> =
+        delete("/projects/$projectId/merge_requests/$mrIid/draft_notes/$draftNoteId")
+
+    /**
+     * Calls `POST /projects/:id/merge_requests/:iid/draft_notes/bulk_publish` to publish every draft
+     * as the review submission. GitLab answers `204` with no body, so nothing is decoded.
+     */
+    suspend fun publishAllDraftNotes(projectId: Long, mrIid: Long): GitLabResult<Unit> =
+        post("/projects/$projectId/merge_requests/$mrIid/draft_notes/bulk_publish", null, null)
+
+    /**
+     * Calls `PUT /projects/:id/merge_requests/:iid/discussions/:discussion_id` with
+     * `{ "resolved": true|false }` to resolve or reopen a thread. GitLab answers `200` with the
+     * updated discussion JSON, which is intentionally ignored (null deserializer) — success is all the
+     * caller needs.
+     */
+    suspend fun resolveDiscussion(
+        projectId: Long,
+        mrIid: Long,
+        discussionId: String,
+        resolved: Boolean,
+    ): GitLabResult<Unit> {
+        val payload = updateJson.encodeToString(DiscussionResolveBody.serializer(), DiscussionResolveBody(resolved))
+        return put("/projects/$projectId/merge_requests/$mrIid/discussions/$discussionId", payload, null)
+    }
+
     /** Calls `GET /projects/:id/merge_requests/:iid/pipelines` (GitLab returns them newest-first). */
     suspend fun getMrPipelines(projectId: Long, mrIid: Long): GitLabResult<List<GitLabPipeline>> =
         get(
@@ -660,14 +750,15 @@ class GitLabApiClient(
     }
 
     /**
-     * Builds a PUT request with a JSON [body] and delegates to [send]. Sends `Content-Type:
-     * application/json`. Any failure while assembling the request is wrapped in
-     * [GitLabResult.NetworkError].
+     * Builds a PUT request with a JSON [body] and delegates to [sendOptional]. Sends `Content-Type:
+     * application/json`. A null [deserializer] means "don't decode the response" — the outcome is
+     * [Unit] on success (used by [resolveDiscussion], which ignores the returned discussion). Any
+     * failure while assembling the request is wrapped in [GitLabResult.NetworkError].
      */
     private suspend fun <T> put(
         path: String,
         body: String,
-        deserializer: DeserializationStrategy<T>,
+        deserializer: DeserializationStrategy<T>?,
     ): GitLabResult<T> {
         val request = try {
             HttpRequest.newBuilder()
@@ -682,7 +773,28 @@ class GitLabApiClient(
         } catch (e: Exception) {
             return GitLabResult.NetworkError(e)
         }
-        return send(request, deserializer)
+        return sendOptional(request, deserializer)
+    }
+
+    /**
+     * Builds a bodyless DELETE request and delegates to [sendOptional] with a null deserializer, so a
+     * `204` (or any 2xx) yields `Success(Unit)`. Any failure while assembling the request is wrapped
+     * in [GitLabResult.NetworkError].
+     */
+    private suspend fun delete(path: String): GitLabResult<Unit> {
+        val request = try {
+            HttpRequest.newBuilder()
+                .uri(URI.create(apiBase + path))
+                .timeout(REQUEST_TIMEOUT)
+                .header("PRIVATE-TOKEN", tokenProvider().orEmpty())
+                .DELETE()
+                .build()
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            return GitLabResult.NetworkError(e)
+        }
+        return sendOptional(request, null)
     }
 
     /**
