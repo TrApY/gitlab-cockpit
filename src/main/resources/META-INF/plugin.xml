@@ -1,0 +1,18 @@
+<!-- Plugin Configuration File. Read more: https://plugins.jetbrains.com/docs/intellij/plugin-configuration-file.html -->
+<idea-plugin>
+    <id>dev.jota.gitlabcockpit</id>
+    <name>Cockpit for GitLab</name>
+    <vendor email="j.t.m.s.89@gmail.com" url="https://github.com/TrApY">JoTa</vendor>
+    <description><![CDATA[
+        <p>Manage GitLab merge requests without leaving your IDE: edit reviewers and assignees, comment, review diffs, and control the merge request's pipelines — view live logs, retry or cancel jobs.</p>
+    ]]></description>
+
+    <depends>com.intellij.modules.platform</depends>
+
+    <resource-bundle>messages.MyBundle</resource-bundle>
+
+    <extensions defaultExtensionNs="com.intellij">
+        <toolWindow factoryClass="dev.jota.gitlabcockpit.toolWindow.MyToolWindowFactory" id="MyToolWindow"/>
+        <postStartupActivity implementation="dev.jota.gitlabcockpit.startup.MyProjectActivity" />
+    </extensions>
+</idea-plugin>
