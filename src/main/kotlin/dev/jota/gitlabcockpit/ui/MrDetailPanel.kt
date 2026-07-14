@@ -96,6 +96,8 @@ class MrDetailPanel(
 
     private val tabbedPane = JBTabbedPane()
 
+    private val pipelinesPanel = PipelinesPanel(project, service)
+
     init {
         overviewPanel.add(headerContainer, BorderLayout.NORTH)
         overviewPanel.add(descriptionScroll, BorderLayout.CENTER)
@@ -105,10 +107,14 @@ class MrDetailPanel(
 
         tabbedPane.addTab(CockpitBundle.message("detail.tab.overview"), overviewPanel)
         tabbedPane.addTab(CockpitBundle.message("detail.tab.comments"), commentsPanel)
+        tabbedPane.addTab(CockpitBundle.message("pipelines.tab"), pipelinesPanel)
         tabbedPane.addChangeListener {
-            if (tabbedPane.selectedIndex == COMMENTS_TAB_INDEX) {
-                val iid = currentIid
-                if (iid != null && notesLoadedForIid != iid) loadNotes(iid)
+            when (tabbedPane.selectedIndex) {
+                COMMENTS_TAB_INDEX -> {
+                    val iid = currentIid
+                    if (iid != null && notesLoadedForIid != iid) loadNotes(iid)
+                }
+                PIPELINES_TAB_INDEX -> pipelinesPanel.onTabSelected()
             }
         }
         commentButton.addActionListener { onSubmitComment() }
@@ -119,6 +125,7 @@ class MrDetailPanel(
     /** EDT. Shows the "select an MR" placeholder and forgets the current selection. */
     fun showPlaceholder() {
         currentIid = null
+        pipelinesPanel.clear()
         setSingleMessage(CockpitBundle.message("detail.placeholder"))
     }
 
@@ -154,6 +161,9 @@ class MrDetailPanel(
         notesPane.text = CockpitHtml.wrapHtml("")
         setCommentsTabTitle(null)
 
+        // Rebind the Pipelines tab; it reloads lazily when shown (or now, if already selected).
+        pipelinesPanel.setMr(mr.iid, mr.sourceBranch)
+
         if (tabbedPane.parent !== this) {
             removeAll()
             add(tabbedPane, BorderLayout.CENTER)
@@ -163,6 +173,7 @@ class MrDetailPanel(
 
         loadApprovals(mr.iid)
         if (tabbedPane.selectedIndex == COMMENTS_TAB_INDEX) loadNotes(mr.iid)
+        if (tabbedPane.selectedIndex == PIPELINES_TAB_INDEX) pipelinesPanel.onTabSelected()
     }
 
     private fun setDescription(mr: GitLabMergeRequest) {
@@ -555,6 +566,7 @@ class MrDetailPanel(
 
     companion object {
         private const val COMMENTS_TAB_INDEX = 1
+        private const val PIPELINES_TAB_INDEX = 2
 
         /** For header rows: prefer the display name, fall back to the username. */
         private fun displayName(user: GitLabUser): String = user.name.ifBlank { user.username }

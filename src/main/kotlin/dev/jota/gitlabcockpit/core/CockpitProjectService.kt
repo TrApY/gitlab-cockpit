@@ -6,8 +6,10 @@ import com.intellij.openapi.project.Project
 import dev.jota.gitlabcockpit.CockpitBundle
 import dev.jota.gitlabcockpit.api.GitLabApiClient
 import dev.jota.gitlabcockpit.api.GitLabApprovals
+import dev.jota.gitlabcockpit.api.GitLabJob
 import dev.jota.gitlabcockpit.api.GitLabMergeRequest
 import dev.jota.gitlabcockpit.api.GitLabNote
+import dev.jota.gitlabcockpit.api.GitLabPipeline
 import dev.jota.gitlabcockpit.api.GitLabProject
 import dev.jota.gitlabcockpit.api.GitLabResult
 import dev.jota.gitlabcockpit.api.GitLabUser
@@ -28,6 +30,12 @@ import java.util.concurrent.ConcurrentHashMap
  * raw note list needs the same filtering.
  */
 fun userNotes(notes: List<GitLabNote>): List<GitLabNote> = notes.filterNot { it.system }
+
+/**
+ * Outcome of a "retry stage" run: how many jobs were actually retried and, if any retry failed, the
+ * first error message (already localized to a short `HTTP nnn` / network cause string).
+ */
+data class RetryStageResult(val retried: Int, val firstError: String?)
 
 /** Snapshot the tool window renders. Every terminal outcome of a load maps to one of these. */
 sealed interface CockpitState {
@@ -184,6 +192,66 @@ class CockpitProjectService(
     suspend fun getApprovalsFor(iid: Long): GitLabResult<GitLabApprovals> =
         withClientAndProject { client, glProject -> client.getApprovals(glProject.id, iid) }
 
+    // --- Pipelines (F2a) ----------------------------------------------------------------------
+
+    /** Pipelines the given MR has triggered, newest-first (as GitLab returns them). */
+    suspend fun getMrPipelines(iid: Long): GitLabResult<List<GitLabPipeline>> =
+        withClientAndProject { client, glProject -> client.getMrPipelines(glProject.id, iid) }
+
+    /** All jobs of a pipeline (stage-ordered), for the stage → job tree. */
+    suspend fun getPipelineJobs(pipelineId: Long): GitLabResult<List<GitLabJob>> =
+        withClientAndProject { client, glProject -> client.getPipelineJobs(glProject.id, pipelineId) }
+
+    /** Retries a whole pipeline. */
+    suspend fun retryPipeline(pipelineId: Long): GitLabResult<Unit> =
+        withClientAndProject { client, glProject -> client.retryPipeline(glProject.id, pipelineId) }
+
+    /** Cancels a whole pipeline. */
+    suspend fun cancelPipeline(pipelineId: Long): GitLabResult<Unit> =
+        withClientAndProject { client, glProject -> client.cancelPipeline(glProject.id, pipelineId) }
+
+    /** Retries a single job. */
+    suspend fun retryJob(jobId: Long): GitLabResult<Unit> =
+        withClientAndProject { client, glProject -> client.retryJob(glProject.id, jobId) }
+
+    /** Cancels a single job. */
+    suspend fun cancelJob(jobId: Long): GitLabResult<Unit> =
+        withClientAndProject { client, glProject -> client.cancelJob(glProject.id, jobId) }
+
+    /** Plays (starts) a manual job. */
+    suspend fun playJob(jobId: Long): GitLabResult<Unit> =
+        withClientAndProject { client, glProject -> client.playJob(glProject.id, jobId) }
+
+    /** Creates a new pipeline on [ref] (the MR's source branch). */
+    suspend fun createPipeline(ref: String): GitLabResult<Unit> =
+        withClientAndProject { client, glProject -> client.createPipeline(glProject.id, ref) }
+
+    /**
+     * "Retry stage": GitLab has no stage-retry endpoint, so this retries each retryable job of the
+     * stage sequentially. Only `failed`/`canceled` jobs (those [isJobRetryable]) are retried; already
+     * `success` jobs are left alone. Retrying continues past a failing job; the first error, if any,
+     * is reported. [pipelineId] is accepted for call-site symmetry with the other pipeline actions.
+     */
+    @Suppress("UNUSED_PARAMETER")
+    suspend fun retryStage(pipelineId: Long, stage: StageGroup): RetryStageResult {
+        val result = withClientAndProject { client, glProject ->
+            var retried = 0
+            var firstError: String? = null
+            val targets = stage.jobs.filter { isJobRetryable(it.status) && it.status in RETRY_STAGE_STATUSES }
+            for (job in targets) {
+                when (val r = client.retryJob(glProject.id, job.id)) {
+                    is GitLabResult.Success -> retried++
+                    else -> if (firstError == null) firstError = describeError(r)
+                }
+            }
+            GitLabResult.Success(RetryStageResult(retried, firstError))
+        }
+        return when (result) {
+            is GitLabResult.Success -> result.data
+            else -> RetryStageResult(0, describeError(result))
+        }
+    }
+
     /**
      * Resolves the client + project once (reusing [cachedProject]) and runs [block] against them.
      * When the instance/remote/project cannot be resolved the failure is surfaced as a
@@ -311,7 +379,17 @@ class CockpitProjectService(
             ),
         )
 
+    /** Short, non-localized description of a failed result, used inside [RetryStageResult.firstError]. */
+    private fun describeError(result: GitLabResult<*>): String = when (result) {
+        is GitLabResult.HttpError -> "HTTP ${result.status}"
+        is GitLabResult.NetworkError -> result.cause.message ?: result.cause.javaClass.simpleName
+        is GitLabResult.Success<*> -> ""
+    }
+
     companion object {
         fun getInstance(project: Project): CockpitProjectService = project.service()
+
+        /** Job statuses [retryStage] will actually retry (a subset of [isJobRetryable]). */
+        private val RETRY_STAGE_STATUSES = setOf("failed", "canceled")
     }
 }

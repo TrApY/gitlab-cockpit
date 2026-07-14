@@ -88,6 +88,38 @@ data class ApprovedBy(
 )
 
 /**
+ * A CI pipeline attached to a merge request (`/merge_requests/:iid/pipelines`). `status` is one of
+ * GitLab's pipeline statuses (`success` / `failed` / `running` / `pending` / `created` / `manual` /
+ * `canceled` / `skipped`…). Unknown fields are ignored by the configured [Json].
+ */
+@Serializable
+data class GitLabPipeline(
+    val id: Long,
+    val status: String,
+    val ref: String,
+    val sha: String,
+    @SerialName("web_url") val webUrl: String,
+    @SerialName("updated_at") val updatedAt: String? = null,
+    @SerialName("created_at") val createdAt: String? = null,
+)
+
+/**
+ * A CI job inside a pipeline (`/pipelines/:id/jobs`). `stage` groups jobs into pipeline stages and
+ * `status` mirrors [GitLabPipeline.status]. `duration` is the run time in seconds (null while the job
+ * has not run); `allowFailure` marks jobs whose failure must not fail the pipeline.
+ */
+@Serializable
+data class GitLabJob(
+    val id: Long,
+    val name: String,
+    val stage: String,
+    val status: String,
+    val duration: Double? = null,
+    @SerialName("allow_failure") val allowFailure: Boolean = false,
+    @SerialName("web_url") val webUrl: String,
+)
+
+/**
  * A note (comment) on a merge request from `/merge_requests/:iid/notes`. `system` is `true` for
  * GitLab's auto-generated notes (state changes, label edits, assignments…); the cockpit filters
  * those out and only shows human comments. Unknown fields are ignored by the configured [Json].
@@ -104,6 +136,10 @@ data class GitLabNote(
 /** Request body for `POST /merge_requests/:iid/notes`: `{ "body": "…" }`. */
 @Serializable
 private data class NoteCreateBody(val body: String)
+
+/** Request body for `POST /projects/:id/pipeline`: `{ "ref": "…" }`. */
+@Serializable
+private data class PipelineCreateBody(val ref: String)
 
 /**
  * Server-side query for [GitLabApiClient.getMergeRequests]. `state` is one of
@@ -269,6 +305,51 @@ class GitLabApiClient(
      */
     suspend fun unapproveMr(projectId: Long, mrIid: Long): GitLabResult<Unit> =
         post("/projects/$projectId/merge_requests/$mrIid/unapprove", null, null)
+
+    /** Calls `GET /projects/:id/merge_requests/:iid/pipelines` (GitLab returns them newest-first). */
+    suspend fun getMrPipelines(projectId: Long, mrIid: Long): GitLabResult<List<GitLabPipeline>> =
+        get(
+            "/projects/$projectId/merge_requests/$mrIid/pipelines",
+            emptyList(),
+            ListSerializer(GitLabPipeline.serializer()),
+        )
+
+    /** Calls `GET /projects/:id/pipelines/:pipeline_id/jobs?per_page=100`. */
+    suspend fun getPipelineJobs(projectId: Long, pipelineId: Long): GitLabResult<List<GitLabJob>> =
+        get(
+            "/projects/$projectId/pipelines/$pipelineId/jobs",
+            listOf("per_page" to "100"),
+            ListSerializer(GitLabJob.serializer()),
+        )
+
+    /** Calls `POST /projects/:id/pipelines/:pipeline_id/retry`; the returned pipeline JSON is ignored. */
+    suspend fun retryPipeline(projectId: Long, pipelineId: Long): GitLabResult<Unit> =
+        post("/projects/$projectId/pipelines/$pipelineId/retry", null, null)
+
+    /** Calls `POST /projects/:id/pipelines/:pipeline_id/cancel`; the returned pipeline JSON is ignored. */
+    suspend fun cancelPipeline(projectId: Long, pipelineId: Long): GitLabResult<Unit> =
+        post("/projects/$projectId/pipelines/$pipelineId/cancel", null, null)
+
+    /** Calls `POST /projects/:id/jobs/:job_id/retry`; the returned job JSON is ignored. */
+    suspend fun retryJob(projectId: Long, jobId: Long): GitLabResult<Unit> =
+        post("/projects/$projectId/jobs/$jobId/retry", null, null)
+
+    /** Calls `POST /projects/:id/jobs/:job_id/cancel`; the returned job JSON is ignored. */
+    suspend fun cancelJob(projectId: Long, jobId: Long): GitLabResult<Unit> =
+        post("/projects/$projectId/jobs/$jobId/cancel", null, null)
+
+    /** Calls `POST /projects/:id/jobs/:job_id/play` to start a manual job; the response is ignored. */
+    suspend fun playJob(projectId: Long, jobId: Long): GitLabResult<Unit> =
+        post("/projects/$projectId/jobs/$jobId/play", null, null)
+
+    /**
+     * Calls `POST /projects/:id/pipeline` with `{ "ref": … }` to create a new pipeline on [ref].
+     * GitLab answers `201` with the created pipeline JSON, which is intentionally ignored.
+     */
+    suspend fun createPipeline(projectId: Long, ref: String): GitLabResult<Unit> {
+        val payload = updateJson.encodeToString(PipelineCreateBody.serializer(), PipelineCreateBody(ref))
+        return post("/projects/$projectId/pipeline", payload, null)
+    }
 
     /**
      * Builds a GET request and delegates to [send]. Any failure while assembling the request is
