@@ -144,9 +144,11 @@ class PipelinesPanel(
             override fun onDoubleClick(event: MouseEvent): Boolean {
                 val path = tree.getPathForLocation(event.x, event.y) ?: return false
                 val node = path.lastPathComponent as? DefaultMutableTreeNode ?: return false
-                val data = node.userObject as? JobNodeData ?: return false
-                openJobLog(data.job)
-                return true
+                return when (val data = node.userObject) {
+                    is JobNodeData -> { openJobLog(data.job); true }
+                    is StageNodeData -> { openStageLogs(data.stage); true }
+                    else -> false
+                }
             }
         }.installOn(tree)
 
@@ -461,10 +463,27 @@ class PipelinesPanel(
         JobLogDialog(project, service, job).show()
     }
 
+    /**
+     * Opens the log viewer for a whole [stage]: a single-job stage reuses [openJobLog], a multi-job
+     * stage opens the tabbed [StageLogsDialog]. An empty stage does nothing.
+     */
+    private fun openStageLogs(stage: StageGroup) {
+        when {
+            stage.jobs.size == 1 -> openJobLog(stage.jobs.first())
+            stage.jobs.isNotEmpty() -> StageLogsDialog(project, service, stage).show()
+        }
+    }
+
     // --- Context menu -------------------------------------------------------------------------
 
     private fun buildContextMenu(node: DefaultMutableTreeNode): JPopupMenu? = when (val data = node.userObject) {
         is StageNodeData -> JPopupMenu().apply {
+            add(
+                JMenuItem(CockpitBundle.message("pipelines.stage.viewLogs")).apply {
+                    addActionListener { openStageLogs(data.stage) }
+                },
+            )
+            addSeparator()
             add(
                 JMenuItem(CockpitBundle.message("pipelines.retryStage")).apply {
                     addActionListener { onRetryStage(data.stage) }
