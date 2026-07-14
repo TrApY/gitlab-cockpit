@@ -7,6 +7,7 @@ import dev.jota.gitlabcockpit.CockpitBundle
 import dev.jota.gitlabcockpit.api.GitLabApiClient
 import dev.jota.gitlabcockpit.api.GitLabApprovals
 import dev.jota.gitlabcockpit.api.GitLabMergeRequest
+import dev.jota.gitlabcockpit.api.GitLabNote
 import dev.jota.gitlabcockpit.api.GitLabProject
 import dev.jota.gitlabcockpit.api.GitLabResult
 import dev.jota.gitlabcockpit.api.GitLabUser
@@ -20,6 +21,13 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import java.util.concurrent.ConcurrentHashMap
+
+/**
+ * Keeps only human comments, dropping GitLab's system notes (state changes, label edits,
+ * assignments…). Pure and platform-free so it can be unit tested directly, and reused wherever a
+ * raw note list needs the same filtering.
+ */
+fun userNotes(notes: List<GitLabNote>): List<GitLabNote> = notes.filterNot { it.system }
 
 /** Snapshot the tool window renders. Every terminal outcome of a load maps to one of these. */
 sealed interface CockpitState {
@@ -69,6 +77,14 @@ class CockpitProjectService(
 
     /** Keyed by MR iid; invalidated per-MR when its `updated_at` changes. */
     private val approvalsCache = ConcurrentHashMap<Long, CachedApprovals>()
+
+    /**
+     * The user the configured token belongs to, populated by the first list load. Exposed read-only
+     * so the detail panel can tell whether the current user already approved an MR without an extra
+     * round-trip. Null until the first successful load.
+     */
+    val currentUser: GitLabUser?
+        get() = cachedUser
 
     /** Drops all cached data so the next [loadMergeRequests] re-resolves everything. */
     fun refresh() {
@@ -130,6 +146,43 @@ class CockpitProjectService(
     /** Applies a partial update to an MR and returns the updated MR. */
     suspend fun updateMr(iid: Long, update: MergeRequestUpdate): GitLabResult<GitLabMergeRequest> =
         withClientAndProject { client, glProject -> client.updateMergeRequest(glProject.id, iid, update) }
+
+    /** Fetches an MR's comment thread, already filtered to human notes (system notes dropped). */
+    suspend fun getNotes(iid: Long): GitLabResult<List<GitLabNote>> =
+        withClientAndProject { client, glProject ->
+            when (val r = client.getMrNotes(glProject.id, iid)) {
+                is GitLabResult.Success -> GitLabResult.Success(userNotes(r.data))
+                is GitLabResult.HttpError -> r
+                is GitLabResult.NetworkError -> r
+            }
+        }
+
+    /** Posts a general comment on an MR and returns the created note. */
+    suspend fun addNote(iid: Long, body: String): GitLabResult<GitLabNote> =
+        withClientAndProject { client, glProject -> client.createMrNote(glProject.id, iid, body) }
+
+    /**
+     * Approves an MR as the current user. On success the MR's approvals cache entry is dropped so
+     * the "reviewer, not approved" list filter re-fetches instead of serving a stale approval state.
+     */
+    suspend fun approve(iid: Long): GitLabResult<Unit> =
+        withClientAndProject { client, glProject ->
+            client.approveMr(glProject.id, iid).also { if (it is GitLabResult.Success) approvalsCache.remove(iid) }
+        }
+
+    /** Revokes the current user's approval. Invalidates the approvals cache like [approve]. */
+    suspend fun unapprove(iid: Long): GitLabResult<Unit> =
+        withClientAndProject { client, glProject ->
+            client.unapproveMr(glProject.id, iid).also { if (it is GitLabResult.Success) approvalsCache.remove(iid) }
+        }
+
+    /**
+     * Fetches an MR's fresh approval state for the detail view, bypassing the `updated_at`-keyed
+     * [approvalsCache] used by the list filter so the overview always reflects the latest approve /
+     * revoke.
+     */
+    suspend fun getApprovalsFor(iid: Long): GitLabResult<GitLabApprovals> =
+        withClientAndProject { client, glProject -> client.getApprovals(glProject.id, iid) }
 
     /**
      * Resolves the client + project once (reusing [cachedProject]) and runs [block] against them.

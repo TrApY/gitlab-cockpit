@@ -1,7 +1,6 @@
 package dev.jota.gitlabcockpit.ui
 
 import com.intellij.icons.AllIcons
-import com.intellij.ide.BrowserUtil
 import com.intellij.openapi.application.EDT
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.ui.ComboBox
@@ -14,15 +13,17 @@ import com.intellij.ui.SimpleListCellRenderer
 import com.intellij.ui.components.ActionLink
 import com.intellij.ui.components.JBLabel
 import com.intellij.ui.components.JBScrollPane
+import com.intellij.ui.components.JBTabbedPane
 import com.intellij.ui.components.JBTextArea
 import com.intellij.ui.components.JBTextField
 import com.intellij.ui.components.panels.VerticalLayout
 import com.intellij.util.ui.FormBuilder
-import com.intellij.util.ui.HTMLEditorKitBuilder
 import com.intellij.util.ui.JBUI
 import com.intellij.util.ui.UIUtil
 import dev.jota.gitlabcockpit.CockpitBundle
+import dev.jota.gitlabcockpit.api.GitLabApprovals
 import dev.jota.gitlabcockpit.api.GitLabMergeRequest
+import dev.jota.gitlabcockpit.api.GitLabNote
 import dev.jota.gitlabcockpit.api.GitLabResult
 import dev.jota.gitlabcockpit.api.GitLabUser
 import dev.jota.gitlabcockpit.api.MergeRequestUpdate
@@ -39,19 +40,24 @@ import java.awt.Font
 import java.awt.GridBagLayout
 import javax.swing.JButton
 import javax.swing.JComponent
-import javax.swing.JEditorPane
 import javax.swing.JPanel
-import javax.swing.event.HyperlinkEvent
 
 /**
- * The detail pane shown below the MR list. Renders one merge request: header (`!iid title` +
- * DRAFT/conflicts badges + edit-title/description button), author/assignee row, reviewers row, and
- * the markdown description rendered to themed HTML. Editing is done through modal dialogs; every
- * network call (detail load, member load, update) runs on the service's coroutine scope and only
- * touches the EDT to render — never the other way around.
+ * The detail pane shown below the MR list. Renders one merge request inside a two-tab layout:
  *
- * @param onListReloadRequested called after a successful edit so the parent can silently refresh
- * the MR list.
+ * - **Overview**: header (`!iid title` + DRAFT/conflicts badges + edit-title/description button),
+ *   author/assignee row, reviewers row, an approvals row ("Approved by: …" + an Approve/Revoke
+ *   button that reflects whether the current user already approved) and the markdown description.
+ * - **Comments**: the MR's human notes (system notes filtered out) rendered as themed HTML, plus a
+ *   text area + Comment button to post a new general comment. Notes load lazily the first time the
+ *   tab is shown for each MR and again on every detail refresh; the tab title carries the count.
+ *
+ * Editing is done through modal dialogs; every network call (detail load, member load, update,
+ * approvals, notes, approve/unapprove, comment) runs on the service's coroutine scope and only
+ * touches the EDT to render. Stale results are dropped by re-checking [currentIid] on the EDT.
+ *
+ * @param onListReloadRequested called after a successful edit or approval change so the parent can
+ * silently refresh the MR list (e.g. so the "reviewer, not approved" filter reflects the change).
  */
 class MrDetailPanel(
     private val project: Project,
@@ -64,23 +70,49 @@ class MrDetailPanel(
         private set
 
     private var detailJob: Job? = null
+    private var notesJob: Job? = null
 
-    private val descriptionPane = JEditorPane().apply {
-        editorKit = HTMLEditorKitBuilder().withWordWrapViewFactory().build()
-        isEditable = false
-        isOpaque = false
-        border = JBUI.Borders.empty(4, 8)
-        addHyperlinkListener { event ->
-            if (event.eventType == HyperlinkEvent.EventType.ACTIVATED) {
-                val href = event.url?.toExternalForm() ?: event.description
-                if (!href.isNullOrBlank()) BrowserUtil.browse(href)
-            }
-        }
-    }
+    /** The MR whose notes are loaded (or loading). Reset on every [showMr] so a refresh re-fetches. */
+    private var notesLoadedForIid: Long? = null
 
+    /** Recreated by [buildHeader]; updated by the async approvals load. */
+    private var approvalsLabel: JBLabel? = null
+    private var approvalButton: JButton? = null
+
+    private val descriptionPane = CockpitHtml.createHtmlPane()
     private val descriptionScroll = JBScrollPane(descriptionPane)
+    private val headerContainer = JPanel(BorderLayout()).apply { isOpaque = false }
+    private val overviewPanel = JPanel(BorderLayout())
+
+    private val notesPane = CockpitHtml.createHtmlPane()
+    private val notesScroll = JBScrollPane(notesPane)
+    private val commentArea = JBTextArea(3, 0).apply {
+        lineWrap = true
+        wrapStyleWord = true
+        emptyText.text = CockpitBundle.message("detail.comment.placeholder")
+    }
+    private val commentButton = JButton(CockpitBundle.message("detail.comment.button"))
+    private val commentsPanel = JPanel(BorderLayout())
+
+    private val tabbedPane = JBTabbedPane()
 
     init {
+        overviewPanel.add(headerContainer, BorderLayout.NORTH)
+        overviewPanel.add(descriptionScroll, BorderLayout.CENTER)
+
+        commentsPanel.add(notesScroll, BorderLayout.CENTER)
+        commentsPanel.add(buildCommentInput(), BorderLayout.SOUTH)
+
+        tabbedPane.addTab(CockpitBundle.message("detail.tab.overview"), overviewPanel)
+        tabbedPane.addTab(CockpitBundle.message("detail.tab.comments"), commentsPanel)
+        tabbedPane.addChangeListener {
+            if (tabbedPane.selectedIndex == COMMENTS_TAB_INDEX) {
+                val iid = currentIid
+                if (iid != null && notesLoadedForIid != iid) loadNotes(iid)
+            }
+        }
+        commentButton.addActionListener { onSubmitComment() }
+
         showPlaceholder()
     }
 
@@ -93,6 +125,7 @@ class MrDetailPanel(
     /** EDT. Kicks off a background detail load for [iid] and renders the result when it arrives. */
     fun loadDetail(iid: Long) {
         currentIid = iid
+        commentArea.text = ""
         setSingleMessage(CockpitBundle.message("detail.loading"))
         detailJob?.cancel()
         detailJob = service.coroutineScope.launch {
@@ -107,24 +140,38 @@ class MrDetailPanel(
         }
     }
 
-    /** EDT. Renders [mr] into the header + description layout. */
+    /** EDT. Renders [mr] into the tabbed layout and kicks off the approvals (and lazy notes) loads. */
     private fun showMr(mr: GitLabMergeRequest) {
         currentIid = mr.iid
-        removeAll()
-        add(buildHeader(mr), BorderLayout.NORTH)
+
+        headerContainer.removeAll()
+        headerContainer.add(buildHeader(mr), BorderLayout.CENTER)
         setDescription(mr)
-        add(descriptionScroll, BorderLayout.CENTER)
+
+        // Reset the comment thread for the (possibly refreshed) MR; it reloads lazily / on demand.
+        notesJob?.cancel()
+        notesLoadedForIid = null
+        notesPane.text = CockpitHtml.wrapHtml("")
+        setCommentsTabTitle(null)
+
+        if (tabbedPane.parent !== this) {
+            removeAll()
+            add(tabbedPane, BorderLayout.CENTER)
+        }
         revalidate()
         repaint()
+
+        loadApprovals(mr.iid)
+        if (tabbedPane.selectedIndex == COMMENTS_TAB_INDEX) loadNotes(mr.iid)
     }
 
     private fun setDescription(mr: GitLabMergeRequest) {
         val fragment = if (mr.description.isNullOrBlank()) {
-            "<p><i>" + escapeHtml(CockpitBundle.message("detail.noDescription")) + "</i></p>"
+            "<p><i>" + CockpitHtml.escapeHtml(CockpitBundle.message("detail.noDescription")) + "</i></p>"
         } else {
-            stripBody(MarkdownRenderer.toHtml(mr.description))
+            CockpitHtml.stripBody(MarkdownRenderer.toHtml(mr.description))
         }
-        descriptionPane.text = wrapHtml(fragment)
+        descriptionPane.text = CockpitHtml.wrapHtml(fragment)
         descriptionPane.caretPosition = 0
     }
 
@@ -167,7 +214,174 @@ class MrDetailPanel(
         reviewersLine.add(ActionLink(CockpitBundle.message("detail.edit")) { onEditReviewers(mr) })
         header.add(reviewersLine)
 
+        val approvalsLine = flowLine()
+        val label = JBLabel(
+            CockpitBundle.message("detail.approvedBy", CockpitBundle.message("detail.approvals.loading")),
+        )
+        val button = JButton(CockpitBundle.message("detail.approve")).apply { isEnabled = false }
+        approvalsLine.add(label)
+        approvalsLine.add(button)
+        approvalsLabel = label
+        approvalButton = button
+        header.add(approvalsLine)
+
         return header
+    }
+
+    // --- Approvals ----------------------------------------------------------------------------
+
+    /** Fetches the fresh approval state and updates the approvals row (guarded by [currentIid]). */
+    private fun loadApprovals(iid: Long) {
+        service.coroutineScope.launch {
+            val result = service.getApprovalsFor(iid)
+            withContext(Dispatchers.EDT) {
+                if (currentIid != iid) return@withContext
+                when (result) {
+                    is GitLabResult.Success -> renderApprovals(result.data)
+                    else -> {
+                        approvalsLabel?.text = CockpitBundle.message(
+                            "detail.approvedBy",
+                            CockpitBundle.message("detail.approvals.unavailable"),
+                        )
+                        approvalButton?.isEnabled = false
+                    }
+                }
+            }
+        }
+    }
+
+    /** EDT. Fills the approvals label and re-targets the Approve/Revoke button for [approvals]. */
+    private fun renderApprovals(approvals: GitLabApprovals) {
+        val names = approvals.approvedBy.joinToString(", ") { displayName(it.user) }
+        val display = names.ifEmpty { CockpitBundle.message("detail.approvals.none") }
+        approvalsLabel?.text = CockpitBundle.message("detail.approvedBy", display)
+
+        val me = service.currentUser
+        val approved = me != null && approvals.approvedBy.any { it.user.id == me.id }
+        val button = approvalButton ?: return
+        button.text = CockpitBundle.message(if (approved) "detail.revokeApproval" else "detail.approve")
+        button.isEnabled = me != null
+        button.actionListeners.toList().forEach { button.removeActionListener(it) }
+        val iid = currentIid
+        if (iid != null) button.addActionListener { onToggleApproval(iid, approved) }
+    }
+
+    /** Approves or revokes in the background, then refreshes approvals and the list on success. */
+    private fun onToggleApproval(iid: Long, alreadyApproved: Boolean) {
+        approvalButton?.isEnabled = false
+        service.coroutineScope.launch {
+            val result = if (alreadyApproved) service.unapprove(iid) else service.approve(iid)
+            withContext(Dispatchers.EDT) {
+                if (currentIid != iid) return@withContext
+                when (result) {
+                    is GitLabResult.Success -> {
+                        loadApprovals(iid)
+                        onListReloadRequested()
+                    }
+                    else -> {
+                        approvalButton?.isEnabled = true
+                        showError("detail.error.approve", result)
+                    }
+                }
+            }
+        }
+    }
+
+    // --- Comments -----------------------------------------------------------------------------
+
+    private fun buildCommentInput(): JComponent {
+        val panel = JPanel(BorderLayout(0, JBUI.scale(4)))
+        panel.isOpaque = false
+        panel.border = JBUI.Borders.empty(6, 8)
+        panel.add(JBScrollPane(commentArea), BorderLayout.CENTER)
+        val buttons = JPanel(FlowLayout(FlowLayout.RIGHT, 0, 0)).apply { isOpaque = false }
+        buttons.add(commentButton)
+        panel.add(buttons, BorderLayout.SOUTH)
+        return panel
+    }
+
+    /** Fetches the MR's notes in the background and renders them (guarded by [currentIid]). */
+    private fun loadNotes(iid: Long) {
+        notesLoadedForIid = iid
+        notesPane.text = CockpitHtml.wrapHtml(
+            "<p><i>" + CockpitHtml.escapeHtml(CockpitBundle.message("detail.comment.loading")) + "</i></p>",
+        )
+        setCommentsTabTitle(null)
+        notesJob?.cancel()
+        notesJob = service.coroutineScope.launch {
+            val result = service.getNotes(iid)
+            withContext(Dispatchers.EDT) {
+                if (currentIid != iid) return@withContext
+                when (result) {
+                    is GitLabResult.Success -> renderNotes(result.data)
+                    else -> {
+                        notesLoadedForIid = null
+                        notesPane.text = CockpitHtml.wrapHtml(
+                            "<p><i>" +
+                                CockpitHtml.escapeHtml(CockpitBundle.message("detail.error.notes", describe(result))) +
+                                "</i></p>",
+                        )
+                        setCommentsTabTitle(null)
+                    }
+                }
+            }
+        }
+    }
+
+    /** EDT. Renders the human notes as one themed HTML document and updates the tab counter. */
+    private fun renderNotes(notes: List<GitLabNote>) {
+        if (notes.isEmpty()) {
+            notesPane.text = CockpitHtml.wrapHtml(
+                "<p><i>" + CockpitHtml.escapeHtml(CockpitBundle.message("detail.comment.empty")) + "</i></p>",
+            )
+        } else {
+            val metaColor = ColorUtil.toHtmlColor(UIUtil.getContextHelpForeground())
+            val body = buildString {
+                notes.forEachIndexed { index, note ->
+                    append("<div style=\"color:").append(metaColor).append(";\">")
+                    append(CockpitHtml.escapeHtml(displayName(note.author)))
+                    append(" &middot; ")
+                    append(CockpitHtml.escapeHtml(formatRelative(note.createdAt)))
+                    append("</div>")
+                    append(CockpitHtml.stripBody(MarkdownRenderer.toHtml(note.body)))
+                    if (index < notes.lastIndex) append("<hr>")
+                }
+            }
+            notesPane.text = CockpitHtml.wrapHtml(body)
+        }
+        notesPane.caretPosition = 0
+        setCommentsTabTitle(notes.size)
+    }
+
+    /** Posts the text area's content as a new comment, then clears it and reloads the thread. */
+    private fun onSubmitComment() {
+        val iid = currentIid ?: return
+        val text = commentArea.text.trim()
+        if (text.isEmpty()) return
+        commentButton.isEnabled = false
+        service.coroutineScope.launch {
+            val result = service.addNote(iid, text)
+            withContext(Dispatchers.EDT) {
+                commentButton.isEnabled = true
+                if (currentIid != iid) return@withContext
+                when (result) {
+                    is GitLabResult.Success -> {
+                        commentArea.text = ""
+                        loadNotes(iid)
+                    }
+                    else -> showError("detail.error.comment", result)
+                }
+            }
+        }
+    }
+
+    private fun setCommentsTabTitle(count: Int?) {
+        val title = if (count == null) {
+            CockpitBundle.message("detail.tab.comments")
+        } else {
+            CockpitBundle.message("detail.tab.commentsCount", count)
+        }
+        tabbedPane.setTitleAt(COMMENTS_TAB_INDEX, title)
     }
 
     // --- Edit actions -------------------------------------------------------------------------
@@ -257,20 +471,6 @@ class MrDetailPanel(
     private fun flowLine(): JPanel =
         JPanel(FlowLayout(FlowLayout.LEFT, JBUI.scale(6), 0)).apply { isOpaque = false }
 
-    private fun wrapHtml(inner: String): String {
-        val fg = ColorUtil.toHtmlColor(UIUtil.getLabelForeground())
-        val link = ColorUtil.toHtmlColor(JBUI.CurrentTheme.Link.Foreground.ENABLED)
-        return buildString {
-            append("<html><head><style>")
-            append("body { color: ").append(fg).append("; font-family: sans-serif; }")
-            append("a { color: ").append(link).append("; }")
-            append("code, pre { font-family: monospace; }")
-            append("</style></head><body>")
-            append(inner)
-            append("</body></html>")
-        }
-    }
-
     // --- Edit dialogs -------------------------------------------------------------------------
 
     private class EditMrDialog(
@@ -354,6 +554,8 @@ class MrDetailPanel(
     }
 
     companion object {
+        private const val COMMENTS_TAB_INDEX = 1
+
         /** For header rows: prefer the display name, fall back to the username. */
         private fun displayName(user: GitLabUser): String = user.name.ifBlank { user.username }
 
@@ -369,16 +571,5 @@ class MrDetailPanel(
                 result.cause.message ?: result.cause.javaClass.simpleName
             is GitLabResult.Success<*> -> ""
         }
-
-        /** Removes the single wrapping `<body>…</body>` the markdown generator emits. */
-        private fun stripBody(html: String): String {
-            var s = html.trim()
-            if (s.startsWith("<body>")) s = s.removePrefix("<body>")
-            if (s.endsWith("</body>")) s = s.removeSuffix("</body>")
-            return s
-        }
-
-        private fun escapeHtml(text: String): String =
-            text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
     }
 }

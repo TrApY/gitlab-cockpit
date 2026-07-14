@@ -106,4 +106,47 @@ class GitLabModelSerializationTest {
 
         assertTrue(approvals.approvedBy.isEmpty())
     }
+
+    @Test
+    fun `note tolerates unknown fields and defaults system to false`() {
+        val payload = """
+            {
+              "id": 101,
+              "type": null,
+              "body": "Looks good to me",
+              "attachment": null,
+              "author": {"id": 2, "username": "rev1", "name": "Reviewer One", "state": "active"},
+              "created_at": "2026-07-14T10:00:00.000Z",
+              "updated_at": "2026-07-14T10:00:00.000Z",
+              "noteable_id": 5,
+              "noteable_type": "MergeRequest",
+              "resolvable": false
+            }
+        """.trimIndent()
+
+        val note = json.decodeFromString<GitLabNote>(payload)
+
+        assertEquals(101L, note.id)
+        assertEquals("Looks good to me", note.body)
+        assertFalse(note.system)
+        assertEquals("rev1", note.author.username)
+        assertEquals("2026-07-14T10:00:00.000Z", note.createdAt)
+    }
+
+    @Test
+    fun `system note parses the system flag`() {
+        val note = json.decodeFromString<GitLabNote>(
+            """
+            {
+              "id": 9,
+              "body": "changed the description",
+              "system": true,
+              "author": {"id": 1, "username": "jota", "name": "Jo Ta"},
+              "created_at": "2026-07-14T09:00:00Z"
+            }
+            """.trimIndent(),
+        )
+
+        assertTrue(note.system)
+    }
 }

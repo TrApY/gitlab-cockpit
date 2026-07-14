@@ -88,6 +88,24 @@ data class ApprovedBy(
 )
 
 /**
+ * A note (comment) on a merge request from `/merge_requests/:iid/notes`. `system` is `true` for
+ * GitLab's auto-generated notes (state changes, label edits, assignments…); the cockpit filters
+ * those out and only shows human comments. Unknown fields are ignored by the configured [Json].
+ */
+@Serializable
+data class GitLabNote(
+    val id: Long,
+    val body: String,
+    val system: Boolean = false,
+    val author: GitLabUser,
+    @SerialName("created_at") val createdAt: String,
+)
+
+/** Request body for `POST /merge_requests/:iid/notes`: `{ "body": "…" }`. */
+@Serializable
+private data class NoteCreateBody(val body: String)
+
+/**
  * Server-side query for [GitLabApiClient.getMergeRequests]. `state` is one of
  * `opened` / `merged` / `closed` / `all`; the username filters are optional and only added to
  * the request when non-null.
@@ -218,6 +236,41 @@ class GitLabApiClient(
     }
 
     /**
+     * Calls `GET /projects/:id/merge_requests/:iid/notes` sorted oldest-first. Returns every note,
+     * including system notes; the caller (or [dev.jota.gitlabcockpit.core.userNotes]) filters those.
+     */
+    suspend fun getMrNotes(projectId: Long, mrIid: Long): GitLabResult<List<GitLabNote>> =
+        get(
+            "/projects/$projectId/merge_requests/$mrIid/notes",
+            listOf("sort" to "asc", "order_by" to "created_at", "per_page" to "100"),
+            ListSerializer(GitLabNote.serializer()),
+        )
+
+    /** Calls `POST /projects/:id/merge_requests/:iid/notes` with `{ "body": … }`; returns the note. */
+    suspend fun createMrNote(projectId: Long, mrIid: Long, body: String): GitLabResult<GitLabNote> {
+        val payload = updateJson.encodeToString(NoteCreateBody.serializer(), NoteCreateBody(body))
+        return post(
+            "/projects/$projectId/merge_requests/$mrIid/notes",
+            payload,
+            GitLabNote.serializer(),
+        )
+    }
+
+    /**
+     * Calls `POST /projects/:id/merge_requests/:iid/approve`. GitLab answers `201` with the approval
+     * JSON, which is intentionally ignored — success is all the caller needs.
+     */
+    suspend fun approveMr(projectId: Long, mrIid: Long): GitLabResult<Unit> =
+        post("/projects/$projectId/merge_requests/$mrIid/approve", null, null)
+
+    /**
+     * Calls `POST /projects/:id/merge_requests/:iid/unapprove`. GitLab answers `204` with no body,
+     * so nothing is decoded.
+     */
+    suspend fun unapproveMr(projectId: Long, mrIid: Long): GitLabResult<Unit> =
+        post("/projects/$projectId/merge_requests/$mrIid/unapprove", null, null)
+
+    /**
      * Builds a GET request and delegates to [send]. Any failure while assembling the request is
      * wrapped in [GitLabResult.NetworkError].
      */
@@ -268,6 +321,38 @@ class GitLabApiClient(
     }
 
     /**
+     * Builds a POST request and delegates to [sendOptional]. When [body] is non-null it is sent as a
+     * JSON payload (with `Content-Type: application/json`); a null [body] posts nothing (used by the
+     * bodyless approve/unapprove endpoints). A null [deserializer] means "don't decode the response"
+     * — the outcome is [Unit] on success. Any failure while assembling the request is wrapped in
+     * [GitLabResult.NetworkError].
+     */
+    private suspend fun <T> post(
+        path: String,
+        body: String?,
+        deserializer: DeserializationStrategy<T>?,
+    ): GitLabResult<T> {
+        val request = try {
+            val builder = HttpRequest.newBuilder()
+                .uri(URI.create(apiBase + path))
+                .timeout(REQUEST_TIMEOUT)
+                .header("PRIVATE-TOKEN", tokenProvider().orEmpty())
+            val publisher = if (body != null) {
+                builder.header("Content-Type", "application/json")
+                HttpRequest.BodyPublishers.ofString(body, StandardCharsets.UTF_8)
+            } else {
+                HttpRequest.BodyPublishers.noBody()
+            }
+            builder.POST(publisher).build()
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            return GitLabResult.NetworkError(e)
+        }
+        return sendOptional(request, deserializer)
+    }
+
+    /**
      * Shared send/decode step. Sends [request] off the EDT on [Dispatchers.IO] via
      * [runInterruptible] and decodes the body with [deserializer]. Any transport or decode failure
      * is wrapped in [GitLabResult.NetworkError]; non-2xx yields [GitLabResult.HttpError].
@@ -275,12 +360,28 @@ class GitLabApiClient(
     private suspend fun <T> send(
         request: HttpRequest,
         deserializer: DeserializationStrategy<T>,
+    ): GitLabResult<T> = sendOptional(request, deserializer)
+
+    /**
+     * Like [send], but tolerates a null [deserializer]: a `null` deserializer means the response
+     * body is irrelevant (approve returns `201` with JSON, unapprove `204` with none) and success
+     * yields `Success(Unit)` without ever touching the parser. When a [deserializer] is present the
+     * body is decoded exactly as [send] does — so routing [send] through here is behaviour-neutral.
+     */
+    @Suppress("UNCHECKED_CAST")
+    private suspend fun <T> sendOptional(
+        request: HttpRequest,
+        deserializer: DeserializationStrategy<T>?,
     ): GitLabResult<T> = try {
         val response = runInterruptible(Dispatchers.IO) {
             httpClient.send(request, HttpResponse.BodyHandlers.ofString())
         }
         if (response.statusCode() in 200..299) {
-            GitLabResult.Success(json.decodeFromString(deserializer, response.body()))
+            if (deserializer == null) {
+                GitLabResult.Success(Unit) as GitLabResult<T>
+            } else {
+                GitLabResult.Success(json.decodeFromString(deserializer, response.body()))
+            }
         } else {
             GitLabResult.HttpError(response.statusCode(), response.body())
         }
