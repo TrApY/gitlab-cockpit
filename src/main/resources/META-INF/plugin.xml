@@ -8,6 +8,7 @@
     ]]></description>
 
     <depends>com.intellij.modules.platform</depends>
+    <depends>Git4Idea</depends>
 
     <resource-bundle>messages.CockpitBundle</resource-bundle>
 
@@ -17,5 +18,10 @@
             instance="dev.jota.gitlabcockpit.settings.ui.GitLabCockpitConfigurable"
             id="dev.jota.gitlabcockpit.settings"
             displayName="Cockpit for GitLab"/>
+        <toolWindow
+            id="GitLab Cockpit"
+            anchor="right"
+            factoryClass="dev.jota.gitlabcockpit.ui.CockpitToolWindowFactory"
+            icon="AllIcons.Vcs.Vendors.Github"/>
     </extensions>
 </idea-plugin>
