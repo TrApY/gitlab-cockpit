@@ -80,8 +80,11 @@ data class DiffRefs(
 
 /**
  * A single changed file from `/merge_requests/:iid/diffs`. [oldPath]/[newPath] differ for renames;
- * the boolean flags classify the change (see [dev.jota.gitlabcockpit.core.changeTypeOf]). Unknown
- * fields (the textual `diff`, mode bits…) are ignored by the configured [Json].
+ * the boolean flags classify the change (see [dev.jota.gitlabcockpit.core.changeTypeOf]). [diff] is
+ * the file's unified-diff hunks (only the `@@`/` `/`+`/`-` lines — no `---`/`+++` headers), used by
+ * [dev.jota.gitlabcockpit.core.buildLineMap] to know which lines can be commented on; it defaults to
+ * empty so an absent `diff` never breaks parsing. Remaining fields (mode bits…) are ignored by the
+ * configured [Json].
  */
 @Serializable
 data class GitLabDiffFile(
@@ -90,6 +93,7 @@ data class GitLabDiffFile(
     @SerialName("new_file") val newFile: Boolean = false,
     @SerialName("renamed_file") val renamedFile: Boolean = false,
     @SerialName("deleted_file") val deletedFile: Boolean = false,
+    val diff: String = "",
 )
 
 /**
@@ -212,9 +216,34 @@ data class NotePosition(
     @SerialName("old_line") val oldLine: Int? = null,
 )
 
+/**
+ * Request-side diff position for [GitLabApiClient.createDiffDiscussion]. Serialized with
+ * [GitLabApiClient.discussionJson], which omits null fields but always emits [positionType]. The
+ * three SHAs come from the MR's `diff_refs`; [oldPath] and [newPath] are always both sent, while
+ * only the relevant one of [oldLine]/[newLine] is set (both, for a context line).
+ */
+@Serializable
+data class PositionPayload(
+    @SerialName("base_sha") val baseSha: String,
+    @SerialName("start_sha") val startSha: String,
+    @SerialName("head_sha") val headSha: String,
+    @SerialName("position_type") val positionType: String = "text",
+    @SerialName("old_path") val oldPath: String? = null,
+    @SerialName("new_path") val newPath: String? = null,
+    @SerialName("old_line") val oldLine: Int? = null,
+    @SerialName("new_line") val newLine: Int? = null,
+)
+
 /** Request body for `POST /merge_requests/:iid/notes`: `{ "body": "…" }`. */
 @Serializable
 private data class NoteCreateBody(val body: String)
+
+/** Request body for `POST /merge_requests/:iid/discussions`: `{ "body": …, "position": {…} }`. */
+@Serializable
+private data class DiffDiscussionCreateBody(
+    val body: String,
+    val position: PositionPayload,
+)
 
 /** Request body for `POST /projects/:id/pipeline`: `{ "ref": "…" }`. */
 @Serializable
@@ -265,6 +294,17 @@ class GitLabApiClient(
      */
     private val updateJson = Json {
         encodeDefaults = false
+        explicitNulls = false
+    }
+
+    /**
+     * Encoder for the diff-discussion body. Like [updateJson] it omits null fields
+     * (`explicitNulls = false`), but it keeps defaults (`encodeDefaults = true`) so
+     * [PositionPayload.positionType] is always emitted as `"text"` — GitLab requires it, and
+     * [updateJson]'s `encodeDefaults = false` would drop it because it equals the property default.
+     */
+    private val discussionJson = Json {
+        encodeDefaults = true
         explicitNulls = false
     }
 
@@ -441,6 +481,29 @@ class GitLabApiClient(
             "/projects/$projectId/merge_requests/$mrIid/discussions/$discussionId/notes",
             payload,
             GitLabDiscussionNote.serializer(),
+        )
+    }
+
+    /**
+     * Calls `POST /projects/:id/merge_requests/:iid/discussions` with a `{ "body": …, "position": {…} }`
+     * payload to open a new diff-anchored thread. [position] carries the `diff_refs` SHAs and the
+     * old/new path+line the note anchors to; its null fields are omitted and `position_type` is always
+     * `"text"`. Returns the created [GitLabDiscussion].
+     */
+    suspend fun createDiffDiscussion(
+        projectId: Long,
+        mrIid: Long,
+        body: String,
+        position: PositionPayload,
+    ): GitLabResult<GitLabDiscussion> {
+        val payload = discussionJson.encodeToString(
+            DiffDiscussionCreateBody.serializer(),
+            DiffDiscussionCreateBody(body, position),
+        )
+        return post(
+            "/projects/$projectId/merge_requests/$mrIid/discussions",
+            payload,
+            GitLabDiscussion.serializer(),
         )
     }
 

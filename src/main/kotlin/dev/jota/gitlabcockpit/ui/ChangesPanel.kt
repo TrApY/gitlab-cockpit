@@ -3,15 +3,28 @@ package dev.jota.gitlabcockpit.ui
 import com.intellij.diff.DiffContentFactory
 import com.intellij.diff.DiffManager
 import com.intellij.diff.requests.SimpleDiffRequest
+import com.intellij.diff.tools.util.DiffDataKeys
+import com.intellij.diff.tools.util.side.TwosideTextDiffViewer
+import com.intellij.diff.util.DiffUserDataKeys
+import com.intellij.diff.util.Side
 import com.intellij.icons.AllIcons
+import com.intellij.openapi.actionSystem.ActionUpdateThread
+import com.intellij.openapi.actionSystem.AnAction
+import com.intellij.openapi.actionSystem.AnActionEvent
+import com.intellij.openapi.actionSystem.CommonDataKeys
 import com.intellij.openapi.application.EDT
+import com.intellij.openapi.editor.Editor
 import com.intellij.openapi.fileTypes.FileTypeManager
 import com.intellij.openapi.project.Project
+import com.intellij.openapi.ui.ComboBox
+import com.intellij.openapi.ui.DialogWrapper
 import com.intellij.openapi.ui.Messages
+import com.intellij.openapi.ui.ValidationInfo
 import com.intellij.ui.CollectionListModel
 import com.intellij.ui.ColorUtil
 import com.intellij.ui.ColoredTreeCellRenderer
 import com.intellij.ui.DoubleClickListener
+import com.intellij.ui.JBColor
 import com.intellij.ui.OnePixelSplitter
 import com.intellij.ui.SimpleListCellRenderer
 import com.intellij.ui.SimpleTextAttributes
@@ -20,6 +33,7 @@ import com.intellij.ui.components.JBList
 import com.intellij.ui.components.JBScrollPane
 import com.intellij.ui.components.JBTextArea
 import com.intellij.ui.treeStructure.Tree
+import com.intellij.util.ui.FormBuilder
 import com.intellij.util.ui.JBUI
 import com.intellij.util.ui.UIUtil
 import com.intellij.util.ui.tree.TreeUtil
@@ -33,7 +47,10 @@ import dev.jota.gitlabcockpit.api.GitLabUser
 import dev.jota.gitlabcockpit.api.NotePosition
 import dev.jota.gitlabcockpit.core.ChangeType
 import dev.jota.gitlabcockpit.core.CockpitProjectService
+import dev.jota.gitlabcockpit.core.DiffLineMap
 import dev.jota.gitlabcockpit.core.FileNode
+import dev.jota.gitlabcockpit.core.LinePosition
+import dev.jota.gitlabcockpit.core.buildLineMap
 import dev.jota.gitlabcockpit.core.changeTypeOf
 import dev.jota.gitlabcockpit.core.buildFileTree
 import dev.jota.gitlabcockpit.core.discussionsByFile
@@ -96,10 +113,14 @@ class ChangesPanel(
     /** Path of the file whose comments the bottom panel currently shows; null when none. */
     private var selectedFilePath: String? = null
 
+    /** The changed file currently selected in the tree; enables "New thread". Null when none. */
+    private var selectedFile: GitLabDiffFile? = null
+
     private var loadJob: Job? = null
     private var discussionsJob: Job? = null
     private var diffJob: Job? = null
     private var replyJob: Job? = null
+    private var newThreadJob: Job? = null
 
     private val rootNode = DefaultMutableTreeNode()
     private val treeModel = DefaultTreeModel(rootNode)
@@ -124,6 +145,10 @@ class ChangesPanel(
         emptyText.text = CockpitBundle.message("changes.reply.placeholder")
     }
     private val replyButton = JButton(CockpitBundle.message("changes.reply.button"))
+    private val newThreadButton = JButton(CockpitBundle.message("changes.newThread")).apply {
+        isEnabled = false
+        addActionListener { onNewThread() }
+    }
 
     init {
         val splitter = OnePixelSplitter(true, 0.6f).apply {
@@ -135,6 +160,8 @@ class ChangesPanel(
         tree.addTreeSelectionListener {
             val node = tree.lastSelectedPathComponent as? DefaultMutableTreeNode
             val fileNode = node?.userObject as? FileNode
+            selectedFile = fileNode?.file
+            newThreadButton.isEnabled = selectedFile != null
             showFileComments(fileNode?.takeIf { it.file != null }?.path)
         }
 
@@ -163,7 +190,15 @@ class ChangesPanel(
     private fun buildCommentsPanel(): JComponent {
         val panel = JPanel(BorderLayout())
         commentsTitle.border = JBUI.Borders.empty(4, 8)
-        panel.add(commentsTitle, BorderLayout.NORTH)
+        val header = JPanel(BorderLayout())
+        header.add(commentsTitle, BorderLayout.CENTER)
+        val headerButtons = JPanel(FlowLayout(FlowLayout.RIGHT, 0, 0)).apply {
+            isOpaque = false
+            border = JBUI.Borders.empty(2, 8)
+        }
+        headerButtons.add(newThreadButton)
+        header.add(headerButtons, BorderLayout.EAST)
+        panel.add(header, BorderLayout.NORTH)
 
         val inner = OnePixelSplitter(false, 0.32f).apply {
             firstComponent = JBScrollPane(discussionList)
@@ -219,6 +254,7 @@ class ChangesPanel(
         discussionsJob?.cancel()
         diffJob?.cancel()
         replyJob?.cancel()
+        newThreadJob?.cancel()
     }
 
     private fun clearContent() {
@@ -226,6 +262,8 @@ class ChangesPanel(
         treeModel.reload()
         discussionsByFilePath = emptyMap()
         selectedFilePath = null
+        selectedFile = null
+        newThreadButton.isEnabled = false
         discussionListModel.removeAll()
         discussionPane.text = CockpitHtml.wrapHtml("")
         replyArea.text = ""
@@ -276,6 +314,8 @@ class ChangesPanel(
         TreeUtil.expandAll(tree)
         tree.emptyText.text = if (files.isEmpty()) CockpitBundle.message("changes.empty") else ""
         selectedFilePath = null
+        selectedFile = null
+        newThreadButton.isEnabled = false
         showFileComments(null)
         onFileCountChanged(files.size)
     }
@@ -318,7 +358,7 @@ class ChangesPanel(
                     )
                     return@withContext
                 }
-                showDiff(iid, file, oldSide.text, newSide.text)
+                showDiff(iid, file, refs, oldSide.text, newSide.text)
             }
         }
     }
@@ -338,8 +378,13 @@ class ChangesPanel(
             is GitLabResult.NetworkError -> null
         }
 
-    /** EDT. Assembles a [SimpleDiffRequest] with the file's type and shows it in the editor. */
-    private fun showDiff(iid: Long, file: GitLabDiffFile, oldText: String, newText: String) {
+    /**
+     * EDT. Assembles a [SimpleDiffRequest] with the file's type and shows it in the editor. A
+     * "Comment on line…" context action ([DiffUserDataKeys.CONTEXT_ACTIONS]) is attached so the user
+     * can start a review thread from the caret line without leaving the diff. The two editors show the
+     * whole base/head file, so an editor line number equals that side's GitLab line number.
+     */
+    private fun showDiff(iid: Long, file: GitLabDiffFile, refs: DiffRefs, oldText: String, newText: String) {
         val displayPath = if (file.deletedFile) file.oldPath else file.newPath
         val fileName = displayPath.substringAfterLast('/')
         val fileType = FileTypeManager.getInstance().getFileTypeByFileName(fileName)
@@ -351,6 +396,15 @@ class ChangesPanel(
             CockpitBundle.message("changes.diff.base"),
             CockpitBundle.message("changes.diff.head"),
         )
+        val commentAction = object : AnAction(
+            CockpitBundle.message("diff.commentAction"),
+            null,
+            AllIcons.General.Balloon,
+        ) {
+            override fun getActionUpdateThread(): ActionUpdateThread = ActionUpdateThread.EDT
+            override fun actionPerformed(e: AnActionEvent) = onCommentFromDiff(e, file, refs)
+        }
+        request.putUserData(DiffUserDataKeys.CONTEXT_ACTIONS, listOf<AnAction>(commentAction))
         DiffManager.getInstance().showDiff(project, request)
     }
 
@@ -449,6 +503,87 @@ class ChangesPanel(
         }
     }
 
+    // --- New review thread (F4a) --------------------------------------------------------------
+
+    /** "New thread" button: opens the dialog for the selected file, defaulting to the new side. */
+    private fun onNewThread() {
+        val file = selectedFile ?: return
+        val refs = diffRefs
+        if (refs == null) {
+            Messages.showErrorDialog(
+                project,
+                CockpitBundle.message("changes.diff.noRefs"),
+                CockpitBundle.message("detail.error.title"),
+            )
+            return
+        }
+        openNewThreadDialog(file, refs, ThreadSide.NEW, null)
+    }
+
+    /**
+     * Diff context action: opens the dialog pre-filled from the caret. The caret's editor line (1-based)
+     * is that side's GitLab line number; the side is derived by comparing the current editor with the
+     * two-side viewer's editors, degrading to the new side when it cannot be determined reliably.
+     */
+    private fun onCommentFromDiff(e: AnActionEvent, file: GitLabDiffFile, refs: DiffRefs) {
+        val editor = e.getData(DiffDataKeys.CURRENT_EDITOR) ?: e.getData(CommonDataKeys.EDITOR)
+        val caretLine = editor?.caretModel?.logicalPosition?.line?.plus(1)
+        val threadSide = when (determineSide(e, editor)) {
+            Side.LEFT -> ThreadSide.OLD
+            Side.RIGHT -> ThreadSide.NEW
+            else -> ThreadSide.NEW
+        }
+        openNewThreadDialog(file, refs, threadSide, caretLine)
+    }
+
+    /**
+     * Which side the [editor] belongs to, or null when it cannot be told reliably (e.g. a unified
+     * viewer). Compares the current editor against the two-side viewer's left/right editors.
+     */
+    private fun determineSide(e: AnActionEvent, editor: Editor?): Side? {
+        if (editor == null) return null
+        val viewer = e.getData(DiffDataKeys.DIFF_VIEWER)
+        if (viewer is TwosideTextDiffViewer) {
+            return when {
+                editor === viewer.getEditor(Side.LEFT) -> Side.LEFT
+                editor === viewer.getEditor(Side.RIGHT) -> Side.RIGHT
+                else -> null
+            }
+        }
+        return null
+    }
+
+    /** Parses [file]'s diff into a line-map and shows the [NewThreadDialog]; posts on OK. */
+    private fun openNewThreadDialog(file: GitLabDiffFile, refs: DiffRefs, side: ThreadSide, line: Int?) {
+        val iid = currentIid ?: return
+        val lineMap = buildLineMap(file.diff)
+        val dialog = NewThreadDialog(project, file, lineMap, side, line)
+        if (!dialog.showAndGet()) return
+        val pos = dialog.selectedPosition() ?: return
+        val body = dialog.body()
+        if (body.isBlank()) return
+        submitNewThread(iid, file, refs, pos, body)
+    }
+
+    /** Posts a new diff thread off the EDT, then reloads discussions and re-selects the new thread. */
+    private fun submitNewThread(iid: Long, file: GitLabDiffFile, refs: DiffRefs, pos: LinePosition, body: String) {
+        newThreadJob?.cancel()
+        newThreadJob = service.coroutineScope.launch {
+            val result = service.createDiffThread(iid, file, refs, pos, body)
+            withContext(Dispatchers.EDT) {
+                if (currentIid != iid) return@withContext
+                when (result) {
+                    is GitLabResult.Success -> reloadDiscussions(iid, file.newPath, result.data.id)
+                    else -> Messages.showErrorDialog(
+                        project,
+                        CockpitBundle.message("changes.error.createThread", describe(result)),
+                        CockpitBundle.message("detail.error.title"),
+                    )
+                }
+            }
+        }
+    }
+
     // --- Tree cell rendering ------------------------------------------------------------------
 
     private inner class FileTreeRenderer : ColoredTreeCellRenderer() {
@@ -475,6 +610,115 @@ class ChangesPanel(
                 }
             }
         }
+    }
+
+    /** Which diff side a new thread anchors to. */
+    private enum class ThreadSide { NEW, OLD }
+
+    /**
+     * Modal dialog to start a review thread on a diff line. Shows the file, a New/Old side selector,
+     * a line combo populated *only* with the [lineMap]'s commentable lines for the chosen side, and a
+     * comment box. When the file has no inline diff (no commentable line) the inputs are disabled and
+     * OK stays blocked with a notice. [selectedPosition] resolves the chosen side+line to a
+     * [LinePosition] via the line-map.
+     */
+    private class NewThreadDialog(
+        project: Project,
+        private val file: GitLabDiffFile,
+        private val lineMap: DiffLineMap,
+        initialSide: ThreadSide,
+        initialLine: Int?,
+    ) : DialogWrapper(project) {
+
+        private val hasCommentableLines =
+            lineMap.commentableNewLines.isNotEmpty() || lineMap.commentableOldLines.isNotEmpty()
+
+        private val sideCombo = ComboBox<ThreadSide>().apply {
+            addItem(ThreadSide.NEW)
+            addItem(ThreadSide.OLD)
+            renderer = SimpleListCellRenderer.create("") { side ->
+                when (side) {
+                    ThreadSide.NEW -> CockpitBundle.message("dialog.newThread.side.new")
+                    ThreadSide.OLD -> CockpitBundle.message("dialog.newThread.side.old")
+                    null -> ""
+                }
+            }
+            selectedItem = initialSide
+            isEnabled = hasCommentableLines
+        }
+
+        private val lineCombo = ComboBox<Int>().apply {
+            renderer = SimpleListCellRenderer.create("") { line ->
+                line?.let { CockpitBundle.message("dialog.newThread.line.label", it) } ?: ""
+            }
+        }
+
+        private val bodyArea = JBTextArea(6, 50).apply {
+            lineWrap = true
+            wrapStyleWord = true
+        }
+
+        private val noticeLabel = JBLabel(CockpitBundle.message("dialog.newThread.noDiff")).apply {
+            foreground = JBColor.RED
+            isVisible = !hasCommentableLines
+        }
+
+        init {
+            title = CockpitBundle.message("dialog.newThread.title")
+            sideCombo.addActionListener { repopulateLines(null) }
+            repopulateLines(initialLine)
+            init()
+        }
+
+        /** Fills the line combo with the commentable lines of the selected side, keeping [preferred] if present. */
+        private fun repopulateLines(preferred: Int?) {
+            val side = sideCombo.selectedItem as? ThreadSide ?: ThreadSide.NEW
+            val lines = if (side == ThreadSide.NEW) lineMap.commentableNewLines else lineMap.commentableOldLines
+            lineCombo.removeAllItems()
+            lines.forEach { lineCombo.addItem(it) }
+            lineCombo.isEnabled = lines.isNotEmpty()
+            when {
+                preferred != null && preferred in lines -> lineCombo.selectedItem = preferred
+                lines.isNotEmpty() -> lineCombo.selectedIndex = 0
+            }
+        }
+
+        override fun createCenterPanel(): JComponent {
+            val displayPath = if (file.deletedFile) file.oldPath else file.newPath
+            val builder = FormBuilder.createFormBuilder()
+                .addLabeledComponent(CockpitBundle.message("dialog.newThread.file"), JBLabel(displayPath))
+                .addLabeledComponent(CockpitBundle.message("dialog.newThread.side"), sideCombo)
+                .addLabeledComponent(CockpitBundle.message("dialog.newThread.line"), lineCombo)
+                .addLabeledComponentFillVertically(
+                    CockpitBundle.message("dialog.newThread.body"),
+                    JBScrollPane(bodyArea),
+                )
+            if (!hasCommentableLines) builder.addComponent(noticeLabel)
+            return builder.panel.apply { preferredSize = JBUI.size(520, 340) }
+        }
+
+        override fun doValidate(): ValidationInfo? = when {
+            !hasCommentableLines -> ValidationInfo(CockpitBundle.message("dialog.newThread.noDiff"))
+            lineCombo.selectedItem == null ->
+                ValidationInfo(CockpitBundle.message("dialog.newThread.selectLine"), lineCombo)
+            bodyArea.text.isBlank() ->
+                ValidationInfo(CockpitBundle.message("dialog.newThread.emptyBody"), bodyArea)
+            else -> null
+        }
+
+        override fun getPreferredFocusedComponent(): JComponent = bodyArea
+
+        /** The chosen line resolved to a [LinePosition] via the line-map, or null when none is selected. */
+        fun selectedPosition(): LinePosition? {
+            val line = lineCombo.selectedItem as? Int ?: return null
+            return when (sideCombo.selectedItem as? ThreadSide) {
+                ThreadSide.NEW -> lineMap.forNewLine(line)
+                ThreadSide.OLD -> lineMap.forOldLine(line)
+                null -> null
+            }
+        }
+
+        fun body(): String = bodyArea.text.trim()
     }
 
     companion object {

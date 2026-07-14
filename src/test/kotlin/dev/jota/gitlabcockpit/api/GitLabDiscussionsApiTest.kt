@@ -150,4 +150,67 @@ class GitLabDiscussionsApiTest {
         assertEquals("application/json", contentType)
         assertEquals("""{"body":"Done, renamed it"}""", requestBody)
     }
+
+    @Test
+    fun `createDiffDiscussion posts the body and nested position and parses the discussion`() {
+        responseStatus = 201
+        responseBody = """
+            {
+              "id": "newdisc1",
+              "notes": [
+                {
+                  "id": 555,
+                  "type": "DiffNote",
+                  "body": "Please rename this",
+                  "system": false,
+                  "author": {"id": 9, "username": "jota", "name": "Jo Ta"},
+                  "created_at": "2026-07-15T09:00:00Z",
+                  "position": {
+                    "base_sha": "b",
+                    "start_sha": "s",
+                    "head_sha": "h",
+                    "old_path": "src/App.kt",
+                    "new_path": "src/App.kt",
+                    "new_line": 12
+                  }
+                }
+              ]
+            }
+        """.trimIndent()
+        startServer()
+
+        val position = PositionPayload(
+            baseSha = "b",
+            startSha = "s",
+            headSha = "h",
+            oldPath = "src/App.kt",
+            newPath = "src/App.kt",
+            oldLine = null,
+            newLine = 12,
+        )
+        val result = runBlocking {
+            GitLabApiClient(baseUrl()) { "t" }.createDiffDiscussion(123, 42, "Please rename this", position)
+        }
+
+        assertTrue("expected Success but was $result", result is GitLabResult.Success)
+        val discussion = (result as GitLabResult.Success).data
+        assertEquals("newdisc1", discussion.id)
+        val note = discussion.notes.single()
+        assertEquals("src/App.kt", note.position?.newPath)
+        assertEquals(12, note.position?.newLine)
+
+        assertEquals("POST", method)
+        assertTrue(
+            "path is the discussions path, was: $rawPath",
+            rawPath!!.endsWith("/merge_requests/42/discussions"),
+        )
+        assertEquals("application/json", contentType)
+        // The body carries the comment and the nested position; the null old_line is omitted and
+        // position_type is always "text".
+        assertEquals(
+            """{"body":"Please rename this","position":{"base_sha":"b","start_sha":"s","head_sha":"h",""" +
+                """"position_type":"text","old_path":"src/App.kt","new_path":"src/App.kt","new_line":12}}""",
+            requestBody,
+        )
+    }
 }

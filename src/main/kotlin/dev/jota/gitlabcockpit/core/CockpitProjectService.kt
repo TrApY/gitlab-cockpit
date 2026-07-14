@@ -4,6 +4,7 @@ import com.intellij.openapi.components.Service
 import com.intellij.openapi.components.service
 import com.intellij.openapi.project.Project
 import dev.jota.gitlabcockpit.CockpitBundle
+import dev.jota.gitlabcockpit.api.DiffRefs
 import dev.jota.gitlabcockpit.api.GitLabApiClient
 import dev.jota.gitlabcockpit.api.GitLabApprovals
 import dev.jota.gitlabcockpit.api.GitLabDiffFile
@@ -18,6 +19,7 @@ import dev.jota.gitlabcockpit.api.GitLabResult
 import dev.jota.gitlabcockpit.api.GitLabUser
 import dev.jota.gitlabcockpit.api.MergeRequestQuery
 import dev.jota.gitlabcockpit.api.MergeRequestUpdate
+import dev.jota.gitlabcockpit.api.PositionPayload
 import dev.jota.gitlabcockpit.api.TraceChunk
 import dev.jota.gitlabcockpit.settings.GitLabCockpitSettings
 import dev.jota.gitlabcockpit.settings.TokenStore
@@ -217,6 +219,32 @@ class CockpitProjectService(
         body: String,
     ): GitLabResult<GitLabDiscussionNote> =
         withClientAndProject { client, glProject -> client.addDiscussionNote(glProject.id, iid, discussionId, body) }
+
+    /**
+     * Opens a new diff-anchored discussion on [file] at [pos]. Builds the [PositionPayload] from the
+     * MR's [refs] (its `diff_refs` SHAs) — passed in by the caller, which already holds them, so no
+     * extra round-trip or cached MR-detail state is needed. Both `old_path` and `new_path` are always
+     * sent (from [file]); the old/new line come from [pos]. Returns the created discussion.
+     */
+    suspend fun createDiffThread(
+        iid: Long,
+        file: GitLabDiffFile,
+        refs: DiffRefs,
+        pos: LinePosition,
+        body: String,
+    ): GitLabResult<GitLabDiscussion> =
+        withClientAndProject { client, glProject ->
+            val position = PositionPayload(
+                baseSha = refs.baseSha,
+                startSha = refs.startSha,
+                headSha = refs.headSha,
+                oldPath = file.oldPath,
+                newPath = file.newPath,
+                oldLine = pos.oldLine,
+                newLine = pos.newLine,
+            )
+            client.createDiffDiscussion(glProject.id, iid, body, position)
+        }
 
     // --- Pipelines (F2a) ----------------------------------------------------------------------
 
