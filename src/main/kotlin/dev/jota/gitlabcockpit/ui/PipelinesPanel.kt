@@ -8,6 +8,7 @@ import com.intellij.openapi.ui.ComboBox
 import com.intellij.openapi.ui.Messages
 import com.intellij.ui.AnimatedIcon
 import com.intellij.ui.ColoredTreeCellRenderer
+import com.intellij.ui.DoubleClickListener
 import com.intellij.ui.JBColor
 import com.intellij.ui.PopupHandler
 import com.intellij.ui.SimpleListCellRenderer
@@ -34,6 +35,7 @@ import kotlinx.coroutines.withContext
 import java.awt.BorderLayout
 import java.awt.Component
 import java.awt.FlowLayout
+import java.awt.event.MouseEvent
 import javax.swing.Icon
 import javax.swing.JButton
 import javax.swing.JComponent
@@ -137,6 +139,16 @@ class PipelinesPanel(
                 buildContextMenu(node)?.show(comp, x, y)
             }
         })
+
+        object : DoubleClickListener() {
+            override fun onDoubleClick(event: MouseEvent): Boolean {
+                val path = tree.getPathForLocation(event.x, event.y) ?: return false
+                val node = path.lastPathComponent as? DefaultMutableTreeNode ?: return false
+                val data = node.userObject as? JobNodeData ?: return false
+                openJobLog(data.job)
+                return true
+            }
+        }.installOn(tree)
 
         clear()
     }
@@ -444,6 +456,11 @@ class PipelinesPanel(
         )
     }
 
+    /** Opens the non-modal streaming log viewer for [job]. */
+    private fun openJobLog(job: GitLabJob) {
+        JobLogDialog(project, service, job).show()
+    }
+
     // --- Context menu -------------------------------------------------------------------------
 
     private fun buildContextMenu(node: DefaultMutableTreeNode): JPopupMenu? = when (val data = node.userObject) {
@@ -457,6 +474,12 @@ class PipelinesPanel(
         is JobNodeData -> {
             val job = data.job
             JPopupMenu().apply {
+                add(
+                    JMenuItem(CockpitBundle.message("log.viewLog")).apply {
+                        addActionListener { openJobLog(job) }
+                    },
+                )
+                addSeparator()
                 add(
                     JMenuItem(CockpitBundle.message("pipelines.job.retry")).apply {
                         isEnabled = isJobRetryable(job.status)

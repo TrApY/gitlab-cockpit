@@ -120,6 +120,13 @@ data class GitLabJob(
 )
 
 /**
+ * A slice of a CI job's raw trace (`/jobs/:job_id/trace`, plain text — not JSON). [content] is the
+ * new text that starts at the requested offset; [nextOffset] is the byte offset the next incremental
+ * poll should resume from (counted in UTF-8 bytes so it lines up with the `Range: bytes=` header).
+ */
+data class TraceChunk(val content: String, val nextOffset: Long)
+
+/**
  * A note (comment) on a merge request from `/merge_requests/:iid/notes`. `system` is `true` for
  * GitLab's auto-generated notes (state changes, label edits, assignments…); the cockpit filters
  * those out and only shows human comments. Unknown fields are ignored by the configured [Json].
@@ -322,6 +329,52 @@ class GitLabApiClient(
             ListSerializer(GitLabJob.serializer()),
         )
 
+    /** Calls `GET /projects/:id/jobs/:job_id` — a single job, used to poll its status while streaming. */
+    suspend fun getJob(projectId: Long, jobId: Long): GitLabResult<GitLabJob> =
+        get("/projects/$projectId/jobs/$jobId", emptyList(), GitLabJob.serializer())
+
+    /**
+     * Calls `GET /projects/:id/jobs/:job_id/trace` (plain text, not JSON) for the incremental log
+     * viewer, resuming at [offset] via a `Range: bytes=<offset>-` header. GitLab may answer:
+     *
+     * - `206 Partial Content`: [content] is the fragment; the next offset advances by the fragment's
+     *   UTF-8 byte size.
+     * - `200 OK`: the server ignored the Range and returned the whole trace. When [offset] > 0 the
+     *   first [offset] **bytes** are dropped (trimmed on the byte array, then re-decoded) so only the
+     *   unseen tail is returned; the next offset is the trace's total byte size.
+     * - `416 Range Not Satisfiable`: [offset] already equals the current size — an empty fragment at
+     *   the same offset.
+     *
+     * Any other non-2xx becomes [GitLabResult.HttpError]. Byte counting (not character counting) is
+     * deliberate so the offset stays aligned with the `Range` header even for multi-byte UTF-8 text.
+     */
+    suspend fun getJobTrace(projectId: Long, jobId: Long, offset: Long): GitLabResult<TraceChunk> {
+        val headers = if (offset > 0) listOf("Range" to "bytes=$offset-") else emptyList()
+        return when (val raw = getRaw("/projects/$projectId/jobs/$jobId/trace", headers)) {
+            is GitLabResult.Success -> {
+                val status = raw.data.status
+                val bodyBytes = raw.data.body.toByteArray(StandardCharsets.UTF_8)
+                val total = bodyBytes.size.toLong()
+                when {
+                    status == 206 -> GitLabResult.Success(TraceChunk(raw.data.body, offset + total))
+                    status == 416 -> GitLabResult.Success(TraceChunk("", offset))
+                    status in 200..299 -> {
+                        val start = offset.coerceIn(0, total).toInt()
+                        val content = if (start == 0) {
+                            raw.data.body
+                        } else {
+                            String(bodyBytes.copyOfRange(start, bodyBytes.size), StandardCharsets.UTF_8)
+                        }
+                        GitLabResult.Success(TraceChunk(content, total))
+                    }
+                    else -> GitLabResult.HttpError(status, raw.data.body)
+                }
+            }
+            is GitLabResult.HttpError -> raw
+            is GitLabResult.NetworkError -> raw
+        }
+    }
+
     /** Calls `POST /projects/:id/pipelines/:pipeline_id/retry`; the returned pipeline JSON is ignored. */
     suspend fun retryPipeline(projectId: Long, pipelineId: Long): GitLabResult<Unit> =
         post("/projects/$projectId/pipelines/$pipelineId/retry", null, null)
@@ -373,6 +426,43 @@ class GitLabApiClient(
             return GitLabResult.NetworkError(e)
         }
         return send(request, deserializer)
+    }
+
+    /** A raw (non-JSON) HTTP response: its status and body, both left untouched for the caller. */
+    private class RawResponse(val status: Int, val body: String)
+
+    /**
+     * Sends a GET with the extra [headers] (used for `Range`) and returns the raw response body as a
+     * string, without decoding JSON. Unlike [send], any *completed* response is a [GitLabResult.Success]
+     * regardless of its status code — the caller ([getJobTrace]) interprets 200 / 206 / 416 itself.
+     * Only transport failures become [GitLabResult.NetworkError].
+     */
+    private suspend fun getRaw(
+        path: String,
+        headers: List<Pair<String, String>>,
+    ): GitLabResult<RawResponse> {
+        val request = try {
+            val builder = HttpRequest.newBuilder()
+                .uri(URI.create(apiBase + path))
+                .timeout(REQUEST_TIMEOUT)
+                .header("PRIVATE-TOKEN", tokenProvider().orEmpty())
+            headers.forEach { (key, value) -> builder.header(key, value) }
+            builder.GET().build()
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            return GitLabResult.NetworkError(e)
+        }
+        return try {
+            val response = runInterruptible(Dispatchers.IO) {
+                httpClient.send(request, HttpResponse.BodyHandlers.ofString())
+            }
+            GitLabResult.Success(RawResponse(response.statusCode(), response.body()))
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            GitLabResult.NetworkError(e)
+        }
     }
 
     /**

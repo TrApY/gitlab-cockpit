@@ -15,6 +15,7 @@ import dev.jota.gitlabcockpit.api.GitLabResult
 import dev.jota.gitlabcockpit.api.GitLabUser
 import dev.jota.gitlabcockpit.api.MergeRequestQuery
 import dev.jota.gitlabcockpit.api.MergeRequestUpdate
+import dev.jota.gitlabcockpit.api.TraceChunk
 import dev.jota.gitlabcockpit.settings.GitLabCockpitSettings
 import dev.jota.gitlabcockpit.settings.TokenStore
 import git4idea.repo.GitRepositoryManager
@@ -252,6 +253,49 @@ class CockpitProjectService(
         }
     }
 
+    // --- Job logs (F2b) -----------------------------------------------------------------------
+
+    /** A slice of a job's trace starting at [offset], for the streaming log viewer. */
+    suspend fun getJobTrace(jobId: Long, offset: Long): GitLabResult<TraceChunk> =
+        withClientAndProject { client, glProject -> client.getJobTrace(glProject.id, jobId, offset) }
+
+    /** Fresh detail of a single job; the log viewer polls it to learn when the job leaves running. */
+    suspend fun getJob(jobId: Long): GitLabResult<GitLabJob> =
+        withClientAndProject { client, glProject -> client.getJob(glProject.id, jobId) }
+
+    // --- Pipeline notifications (F2b) ----------------------------------------------------------
+
+    /** Last known status of each MR's latest pipeline, keyed by MR iid; the watcher compares against it. */
+    private val lastPipelineStatus = ConcurrentHashMap<Long, String>()
+
+    /**
+     * One watcher pass: for the (at most [MAX_WATCHED_MRS] most recent) MRs the current user authored
+     * or is assigned to, fetches each MR's latest pipeline status in parallel and compares it to the
+     * last known one, returning the transitions worth notifying ([shouldNotify]). The status cache is
+     * updated on every pass via an atomic [ConcurrentHashMap.put] (so overlapping passes never notify
+     * twice); the first observation of an MR only memorizes. Never throws — unreachable MRs are
+     * skipped. [ready.mrs] arrives newest-first (`order_by=updated_at`), so `take` keeps the recents.
+     */
+    suspend fun detectPipelineStatusChanges(ready: CockpitState.Ready): List<PipelineStatusChange> {
+        val meId = ready.currentUser.id
+        val candidates = ready.mrs
+            .filter { mr -> mr.author.id == meId || mr.assignees.any { it.id == meId } }
+            .take(MAX_WATCHED_MRS)
+        if (candidates.isEmpty()) return emptyList()
+        return coroutineScope {
+            candidates.map { mr ->
+                async {
+                    val status = when (val r = getMrPipelines(mr.iid)) {
+                        is GitLabResult.Success -> r.data.firstOrNull()?.status
+                        else -> null
+                    } ?: return@async null
+                    val prev = lastPipelineStatus.put(mr.iid, status)
+                    if (shouldNotify(prev, status)) PipelineStatusChange(mr, status) else null
+                }
+            }.awaitAll().filterNotNull()
+        }
+    }
+
     /**
      * Resolves the client + project once (reusing [cachedProject]) and runs [block] against them.
      * When the instance/remote/project cannot be resolved the failure is surfaced as a
@@ -391,5 +435,8 @@ class CockpitProjectService(
 
         /** Job statuses [retryStage] will actually retry (a subset of [isJobRetryable]). */
         private val RETRY_STAGE_STATUSES = setOf("failed", "canceled")
+
+        /** Cap on how many of the current user's MRs the pipeline watcher inspects per pass. */
+        private const val MAX_WATCHED_MRS = 10
     }
 }

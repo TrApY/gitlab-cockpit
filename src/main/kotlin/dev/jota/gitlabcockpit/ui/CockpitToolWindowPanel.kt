@@ -25,6 +25,7 @@ import dev.jota.gitlabcockpit.core.CockpitProjectService
 import dev.jota.gitlabcockpit.core.CockpitState
 import dev.jota.gitlabcockpit.core.MergeRequestState
 import dev.jota.gitlabcockpit.core.MrFilterSelection
+import dev.jota.gitlabcockpit.core.PipelineWatcher
 import dev.jota.gitlabcockpit.core.RoleFilter
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -53,6 +54,9 @@ class CockpitToolWindowPanel(
 ) : JBPanel<CockpitToolWindowPanel>(BorderLayout()), Disposable {
 
     private val service = CockpitProjectService.getInstance(project)
+
+    /** Fires IDE balloons when the current user's MR pipelines flip to success / failed. */
+    private val pipelineWatcher = PipelineWatcher(project, service)
 
     private val roleCombo = ComboBox(RoleFilter.entries.toTypedArray()).apply {
         renderer = SimpleListCellRenderer.create<RoleFilter>("") { roleLabel(it) }
@@ -100,6 +104,7 @@ class CockpitToolWindowPanel(
             val selection = withContext(Dispatchers.EDT) { currentSelection() }
             val state = service.loadMergeRequests(selection)
             withContext(Dispatchers.EDT) { render(state) }
+            maybeWatch(state)
         }
     }
 
@@ -172,6 +177,7 @@ class CockpitToolWindowPanel(
         loadJob = service.coroutineScope.launch {
             val state = service.loadMergeRequests(selection)
             withContext(Dispatchers.EDT) { render(state) }
+            maybeWatch(state)
         }
     }
 
@@ -185,6 +191,17 @@ class CockpitToolWindowPanel(
         loadJob = service.coroutineScope.launch {
             val state = service.loadMergeRequests(selection)
             withContext(Dispatchers.EDT) { render(state) }
+            maybeWatch(state)
+        }
+    }
+
+    /**
+     * Runs the lightweight pipeline-notification watcher for a freshly loaded list, on its own root
+     * coroutine so it neither blocks the render nor is cancelled by the next [reload]. Off the EDT.
+     */
+    private fun maybeWatch(state: CockpitState) {
+        if (state is CockpitState.Ready) {
+            service.coroutineScope.launch { pipelineWatcher.onReady(state) }
         }
     }
 

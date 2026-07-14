@@ -23,5 +23,8 @@
             anchor="right"
             factoryClass="dev.jota.gitlabcockpit.ui.CockpitToolWindowFactory"
             icon="AllIcons.Vcs.Vendors.Github"/>
+        <notificationGroup
+            id="Cockpit for GitLab"
+            displayType="BALLOON"/>
     </extensions>
 </idea-plugin>
