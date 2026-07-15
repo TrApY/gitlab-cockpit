@@ -9,7 +9,7 @@ Plugin para IDEs IntelliJ centrado en **gestionar Merge Requests de GitLab** sin
 IDE: ver y administrar la MR (descripción, revisores, asignado, comentarios), navegar sus
 ficheros modificados con diff en el editor, comentar sobre el diff, y ver/operar los
 pipelines que la MR ha disparado. Primer entorno real: GitLab de Europcar
-(`gitlab.example.com`, API v4). Uso personal + aprendizaje, publicación final en Marketplace.
+(`la instancia corporativa`, API v4). Uso personal + aprendizaje, publicación final en Marketplace.
 
 ## 2. Contexto competitivo (actualizado tras el pivote)
 
@@ -53,7 +53,7 @@ parte más difícil: los comentarios inline sobre el diff.
 
 ## 4. Alcance funcional por fases
 
-Cada fase termina en algo instalable y usable por JoTa sobre la empresa.
+Cada fase termina en algo instalable y usable por JoTa sobre la instancia corporativa.
 
 ### Fase 1 — Cockpit de MRs (gestión)
 
@@ -110,9 +110,9 @@ simultánea · soporte GitHub · sugerencias de código (`suggestion:`) · AI.
 - Errores de red → estado "desconectado" + backoff, sin spam.
 - Textos en inglés con bundle preparado para ES.
 - Tests: unitarios del cliente REST (mock server) + smoke del Tool Window.
-- **Pruebas de aceptación: JoTa sobre gitlab.example.com con sus MRs reales.** El desarrollo
+- **Pruebas de aceptación: JoTa sobre la instancia corporativa con sus MRs reales.** El desarrollo
   y los tests automáticos usan un proyecto de prueba en gitlab.com + mocks (no tocamos
-  la empresa desde CI).
+  la instancia corporativa desde CI).
 
 ## 6. Riesgos y gotchas conocidos
 
@@ -125,7 +125,7 @@ simultánea · soporte GitHub · sugerencias de código (`suggestion:`) · AI.
    Se encapsula en el cliente con tests dedicados.
 3. **Filtro "revisor sin aprobar"**: no existe directo en REST → cruce con approvals por
    MR (cache, paginación corta); plan B GraphQL.
-4. **Versión GitLab de la empresa desconocida**: el plugin consulta `/api/v4/version` y
+4. **Versión GitLab de la instancia corporativa desconocida**: el plugin consulta `/api/v4/version` y
    degrada (multiline ≥18.6; draft notes ≥16.x aprox.). Endpoints core estables desde 13+.
 5. **Solapamiento con el nativo**: riesgo de construir algo que ya existe. Mitigación: el
    diferencial (gestión MR + pipelines + filtros) va PRIMERO (fases 1-2).
