@@ -1,6 +1,7 @@
 package dev.jota.gitlabcockpit.core
 
 import dev.jota.gitlabcockpit.api.GitLabJob
+import dev.jota.gitlabcockpit.api.GitLabPipeline
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -188,5 +189,35 @@ class PipelineModelTest {
         assertFalse(isJobPlayable("success"))
         assertFalse(isJobPlayable("created"))
         assertFalse(isJobPlayable("running"))
+    }
+
+    // --- mergeHeadPipeline ---------------------------------------------------------------------
+
+    private fun pipeline(id: Long, status: String = "success") = GitLabPipeline(
+        id = id,
+        status = status,
+        ref = "main",
+        sha = "sha$id",
+        webUrl = "https://gitlab.com/g/r/-/pipelines/$id",
+    )
+
+    @Test
+    fun `mergeHeadPipeline with a null head returns the list unchanged`() {
+        val list = listOf(pipeline(1), pipeline(2))
+        assertEquals(list, mergeHeadPipeline(list, null))
+    }
+
+    @Test
+    fun `mergeHeadPipeline keeps the list when the head is already present by id`() {
+        val list = listOf(pipeline(1), pipeline(2))
+        // Same id as an existing pipeline (even with a different status) → no duplicate, list as-is.
+        assertEquals(list, mergeHeadPipeline(list, pipeline(1, status = "failed")))
+    }
+
+    @Test
+    fun `mergeHeadPipeline prepends a head missing from the list`() {
+        val list = listOf(pipeline(1))
+        val head = pipeline(9)
+        assertEquals(listOf(head, pipeline(1)), mergeHeadPipeline(list, head))
     }
 }

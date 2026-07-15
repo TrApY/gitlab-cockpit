@@ -4,6 +4,8 @@ import com.intellij.icons.AllIcons
 import com.intellij.ide.BrowserUtil
 import com.intellij.openapi.Disposable
 import com.intellij.openapi.application.EDT
+import com.intellij.openapi.editor.event.DocumentEvent
+import com.intellij.openapi.editor.event.DocumentListener
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.ui.ComboBox
 import com.intellij.openapi.wm.ToolWindow
@@ -13,14 +15,17 @@ import com.intellij.ui.DoubleClickListener
 import com.intellij.ui.OnePixelSplitter
 import com.intellij.ui.SimpleListCellRenderer
 import com.intellij.ui.SimpleTextAttributes
+import com.intellij.ui.TextFieldWithAutoCompletion
+import com.intellij.ui.components.ActionLink
 import com.intellij.ui.components.JBLabel
 import com.intellij.ui.components.JBList
 import com.intellij.ui.components.JBPanel
 import com.intellij.ui.components.JBScrollPane
-import com.intellij.ui.components.JBTextField
+import com.intellij.util.Alarm
 import com.intellij.util.ui.JBUI
 import dev.jota.gitlabcockpit.CockpitBundle
 import dev.jota.gitlabcockpit.api.GitLabMergeRequest
+import dev.jota.gitlabcockpit.api.GitLabResult
 import dev.jota.gitlabcockpit.core.CockpitProjectService
 import dev.jota.gitlabcockpit.core.CockpitState
 import dev.jota.gitlabcockpit.core.MergeRequestState
@@ -63,10 +68,25 @@ class CockpitToolWindowPanel(
         selectedItem = RoleFilter.ALL
     }
 
-    private val userField = JBTextField(12).apply {
-        emptyText.text = CockpitBundle.message("toolwindow.filter.user.placeholder")
+    /** Feeds the "By user" field with member candidates matched by [filterMembers] semantics. */
+    private val userCompletionProvider = MemberCompletionProvider()
+
+    private val userField = TextFieldWithAutoCompletion(project, userCompletionProvider, true, "").apply {
+        setPlaceholder(CockpitBundle.message("toolwindow.filter.user.placeholder"))
+        setShowPlaceholderWhenFocused(true)
+        setPreferredWidth(JBUI.scale(160))
         isVisible = false
     }
+
+    /**
+     * Debounces the "By user" reload: every document change restarts a [USER_FILTER_DEBOUNCE_MS]
+     * timer so typing, pasting or picking from the popup all coalesce into a single reload. Parented
+     * to this panel so it is disposed with it.
+     */
+    private val userReloadAlarm = Alarm(Alarm.ThreadToUse.SWING_THREAD, this)
+
+    /** Whether the member candidates have been requested for the current (cached) roster. */
+    private var userCandidatesLoaded = false
 
     private val stateCombo = ComboBox(MergeRequestState.entries.toTypedArray()).apply {
         renderer = SimpleListCellRenderer.create<MergeRequestState>("") { stateLabel(it) }
@@ -75,6 +95,17 @@ class CockpitToolWindowPanel(
 
     private val refreshButton = JButton(AllIcons.Actions.Refresh).apply {
         toolTipText = CockpitBundle.message("toolwindow.refresh")
+    }
+
+    /** Web URL opened by [projectLink]; set from the resolved project on each successful load. */
+    private var projectWebUrl: String? = null
+
+    /** Clickable `path/with/namespace` of the resolved GitLab project; shown only in [CockpitState.Ready]. */
+    private val projectLink = ActionLink("") {
+        projectWebUrl?.let { BrowserUtil.browse(it) }
+    }.apply {
+        toolTipText = CockpitBundle.message("toolwindow.project.tooltip")
+        isVisible = false
     }
 
     private val listModel = CollectionListModel<GitLabMergeRequest>()
@@ -118,12 +149,19 @@ class CockpitToolWindowPanel(
         }
 
         roleCombo.addActionListener {
-            userField.isVisible = roleCombo.selectedItem == RoleFilter.BY_USER
+            val byUser = roleCombo.selectedItem == RoleFilter.BY_USER
+            userField.isVisible = byUser
             userField.parent?.revalidate()
+            if (byUser) ensureUserCandidatesLoaded()
             reload(invalidateCache = false)
         }
         stateCombo.addActionListener { reload(invalidateCache = false) }
-        userField.addActionListener { reload(invalidateCache = false) }
+        userField.addDocumentListener(object : DocumentListener {
+            override fun documentChanged(event: DocumentEvent) {
+                userReloadAlarm.cancelAllRequests()
+                userReloadAlarm.addRequest({ reload(invalidateCache = false) }, USER_FILTER_DEBOUNCE_MS)
+            }
+        })
         refreshButton.addActionListener { reload(invalidateCache = true) }
 
         installOpenActions()
@@ -140,6 +178,7 @@ class CockpitToolWindowPanel(
         toolbar.add(JBLabel(CockpitBundle.message("toolwindow.filter.state.label")))
         toolbar.add(stateCombo)
         toolbar.add(refreshButton)
+        toolbar.add(projectLink)
         return toolbar
     }
 
@@ -170,7 +209,12 @@ class CockpitToolWindowPanel(
 
     /** Runs on the EDT (event handlers / init). Shows Loading, then loads off the EDT. */
     private fun reload(invalidateCache: Boolean) {
-        if (invalidateCache) service.refresh()
+        if (invalidateCache) {
+            service.refresh()
+            // The member cache was just dropped; re-fetch candidates if the "By user" field is live.
+            userCandidatesLoaded = false
+            if (userField.isVisible) ensureUserCandidatesLoaded()
+        }
         render(CockpitState.Loading)
         val selection = currentSelection()
         loadJob?.cancel()
@@ -205,6 +249,26 @@ class CockpitToolWindowPanel(
         }
     }
 
+    /**
+     * Loads the project members off the EDT (once per cached roster) and hands them to the "By user"
+     * completion field. Called when the BY_USER filter first becomes visible and again after a manual
+     * refresh invalidates the cache. A failed load leaves the flag unset so a later trigger retries.
+     */
+    private fun ensureUserCandidatesLoaded() {
+        if (userCandidatesLoaded) return
+        userCandidatesLoaded = true
+        service.coroutineScope.launch {
+            val result = service.getMembers()
+            withContext(Dispatchers.EDT) {
+                if (result is GitLabResult.Success) {
+                    userField.setVariants(result.data)
+                } else {
+                    userCandidatesLoaded = false
+                }
+            }
+        }
+    }
+
     /** EDT. Loads/clears the detail to match the current list selection. */
     private fun reconcileDetailWithSelection() {
         val selected = mrList.selectedValue
@@ -217,6 +281,8 @@ class CockpitToolWindowPanel(
 
     /** Must be called on the EDT. */
     private fun render(state: CockpitState) {
+        if (state is CockpitState.Ready) renderProjectLink(state.glProject.pathWithNamespace, state.glProject.webUrl)
+        else hideProjectLink()
         when (state) {
             CockpitState.Loading ->
                 showMessage(CockpitBundle.message("toolwindow.empty.loading"))
@@ -237,6 +303,21 @@ class CockpitToolWindowPanel(
                 reconcileDetailWithSelection()
             }
         }
+    }
+
+    /** EDT. Shows the toolbar link to the resolved GitLab [pathWithNamespace], opening [webUrl]. */
+    private fun renderProjectLink(pathWithNamespace: String, webUrl: String) {
+        projectWebUrl = webUrl
+        projectLink.text = pathWithNamespace
+        projectLink.isVisible = true
+        projectLink.parent?.revalidate()
+    }
+
+    /** EDT. Hides the toolbar project link (any non-Ready state). */
+    private fun hideProjectLink() {
+        projectWebUrl = null
+        projectLink.isVisible = false
+        projectLink.parent?.revalidate()
     }
 
     private fun showMessage(text: String) {
@@ -289,6 +370,7 @@ class CockpitToolWindowPanel(
 
     companion object {
         private const val AUTO_REFRESH_MS = 60_000L
+        private const val USER_FILTER_DEBOUNCE_MS = 500
         private const val SPLITTER_PROPORTION_KEY = "dev.jota.gitlabcockpit.detail.splitter"
 
         private fun roleLabel(role: RoleFilter): String = when (role) {

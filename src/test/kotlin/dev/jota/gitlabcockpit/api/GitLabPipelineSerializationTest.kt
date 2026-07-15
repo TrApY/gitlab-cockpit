@@ -61,6 +61,39 @@ class GitLabPipelineSerializationTest {
     }
 
     @Test
+    fun `pipeline without a ref defaults it to null`() {
+        val pipeline = json.decodeFromString<GitLabPipeline>(
+            """
+            {
+              "id": 300,
+              "status": "success",
+              "sha": "eee555",
+              "web_url": "https://gitlab.com/g/r/-/pipelines/300"
+            }
+            """.trimIndent(),
+        )
+
+        assertNull(pipeline.ref)
+    }
+
+    @Test
+    fun `pipeline with an explicit null ref parses`() {
+        val pipeline = json.decodeFromString<GitLabPipeline>(
+            """
+            {
+              "id": 301,
+              "status": "running",
+              "ref": null,
+              "sha": "fff666",
+              "web_url": "https://gitlab.com/g/r/-/pipelines/301"
+            }
+            """.trimIndent(),
+        )
+
+        assertNull(pipeline.ref)
+    }
+
+    @Test
     fun `job with unknown fields parses and keeps the modeled ones`() {
         val payload = """
             {

@@ -59,6 +59,8 @@ sealed interface CockpitState {
     data class Ready(
         val mrs: List<GitLabMergeRequest>,
         val currentUser: GitLabUser,
+        /** The GitLab project resolved from this project's git remote, for the toolbar link. */
+        val glProject: GitLabProject,
     ) : CockpitState
 
     /** Something failed; [message] is already localized and user-facing. */
@@ -138,7 +140,7 @@ class CockpitProjectService(
             mrs
         }
 
-        return CockpitState.Ready(finalMrs, currentUser)
+        return CockpitState.Ready(finalMrs, currentUser, glProject)
     }
 
     /** Fetches the fresh detail of a single MR. Used by the detail panel on selection. */

@@ -64,6 +64,14 @@ data class GitLabMergeRequest(
      * not, so this is nullable. Needed to fetch base/head file contents for the diff viewer.
      */
     @SerialName("diff_refs") val diffRefs: DiffRefs? = null,
+    /**
+     * The MR's head pipeline, returned only by the detail endpoint (`/merge_requests/:iid`) — the
+     * *list* endpoint omits it, so this is nullable. It is the single source of truth for pipelines
+     * that GitLab does not list under `/pipelines` (e.g. externally reported ones from Jenkins), so
+     * the Pipelines tab merges it into the pipeline list (see
+     * [dev.jota.gitlabcockpit.core.mergeHeadPipeline]).
+     */
+    @SerialName("head_pipeline") val headPipeline: GitLabPipeline? = null,
 )
 
 /**
@@ -125,13 +133,15 @@ data class ApprovedBy(
 /**
  * A CI pipeline attached to a merge request (`/merge_requests/:iid/pipelines`). `status` is one of
  * GitLab's pipeline statuses (`success` / `failed` / `running` / `pending` / `created` / `manual` /
- * `canceled` / `skipped`…). Unknown fields are ignored by the configured [Json].
+ * `canceled` / `skipped`…). `ref` is the branch/tag the pipeline ran on; externally reported
+ * pipelines (e.g. Jenkins via GitLab's external pipeline API) can carry no ref, so it is nullable.
+ * Unknown fields are ignored by the configured [Json].
  */
 @Serializable
 data class GitLabPipeline(
     val id: Long,
     val status: String,
-    val ref: String,
+    val ref: String? = null,
     val sha: String,
     @SerialName("web_url") val webUrl: String,
     @SerialName("updated_at") val updatedAt: String? = null,
@@ -390,15 +400,34 @@ class GitLabApiClient(
         )
 
     /**
-     * Calls `GET /projects/:id/members/all` (inherited + direct members). Extra fields such as
-     * `access_level` are ignored by the model.
+     * Calls `GET /projects/:id/members/all` (inherited + direct members), paging through the result
+     * with `per_page=100` + `page=N` until a page comes back short (fewer than [MEMBER_PAGE_SIZE]
+     * items, i.e. the last page) or the [MAX_MEMBER_PAGES] safety cap is hit. The accumulated members
+     * of every page are concatenated. Any page that fails short-circuits: its error is returned as-is
+     * rather than the partial accumulation. Extra fields such as `access_level` are ignored by the
+     * model.
      */
-    suspend fun getProjectMembers(projectId: Long): GitLabResult<List<GitLabUser>> =
-        get(
-            "/projects/$projectId/members/all",
-            listOf("per_page" to "100"),
-            ListSerializer(GitLabUser.serializer()),
-        )
+    suspend fun getProjectMembers(projectId: Long): GitLabResult<List<GitLabUser>> {
+        val all = mutableListOf<GitLabUser>()
+        var page = 1
+        while (page <= MAX_MEMBER_PAGES) {
+            val result = get(
+                "/projects/$projectId/members/all",
+                listOf("per_page" to MEMBER_PAGE_SIZE.toString(), "page" to page.toString()),
+                ListSerializer(GitLabUser.serializer()),
+            )
+            when (result) {
+                is GitLabResult.Success -> {
+                    all += result.data
+                    if (result.data.size < MEMBER_PAGE_SIZE) return GitLabResult.Success(all)
+                    page++
+                }
+                is GitLabResult.HttpError -> return result
+                is GitLabResult.NetworkError -> return result
+            }
+        }
+        return GitLabResult.Success(all)
+    }
 
     /**
      * Calls `PUT /projects/:id/merge_requests/:iid` with only the non-null attributes of [update].
@@ -597,11 +626,11 @@ class GitLabApiClient(
         return put("/projects/$projectId/merge_requests/$mrIid/discussions/$discussionId", payload, null)
     }
 
-    /** Calls `GET /projects/:id/merge_requests/:iid/pipelines` (GitLab returns them newest-first). */
+    /** Calls `GET /projects/:id/merge_requests/:iid/pipelines?per_page=100` (newest-first). */
     suspend fun getMrPipelines(projectId: Long, mrIid: Long): GitLabResult<List<GitLabPipeline>> =
         get(
             "/projects/$projectId/merge_requests/$mrIid/pipelines",
-            emptyList(),
+            listOf("per_page" to "100"),
             ListSerializer(GitLabPipeline.serializer()),
         )
 
@@ -878,6 +907,12 @@ class GitLabApiClient(
     companion object {
         private val CONNECT_TIMEOUT: Duration = Duration.ofSeconds(10)
         private val REQUEST_TIMEOUT: Duration = Duration.ofSeconds(30)
+
+        /** Page size for the paginated `members/all` fetch; a short page signals the last one. */
+        private const val MEMBER_PAGE_SIZE = 100
+
+        /** Safety cap on how many member pages [getProjectMembers] will request. */
+        private const val MAX_MEMBER_PAGES = 20
 
         /**
          * Trims trailing slashes and ensures the URL ends with `/api/v4`, so callers may pass

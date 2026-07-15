@@ -4,6 +4,18 @@
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-07-15
+
+### Added
+
+- Incremental search in the Edit Assignee and Edit Reviewers dialogs (search field over the member list; reviewer checks are preserved even while a search hides them), with the full project member list now fetched across all pages
+- Autocompletion in the "By user" filter: type to complete project members (`Name (@username)`), with the reload debounced so typing, pasting or picking from the popup all coalesce
+- Resolved GitLab project shown as a clickable link in the tool window toolbar (opens the project in the browser)
+
+### Fixed
+
+- Pipelines tab no longer stays empty for merge requests whose CI is reported externally (e.g. Jenkins): the MR's head pipeline is merged into the list and pipelines without a ref render correctly
+
 ## [0.4.0] - 2026-07-15
 
 ### Added

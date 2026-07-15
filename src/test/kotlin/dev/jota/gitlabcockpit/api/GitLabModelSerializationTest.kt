@@ -3,6 +3,7 @@ package dev.jota.gitlabcockpit.api
 import kotlinx.serialization.json.Json
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -76,6 +77,38 @@ class GitLabModelSerializationTest {
         assertFalse(mr.hasConflicts)
         assertTrue(mr.reviewers.isEmpty())
         assertTrue(mr.assignees.isEmpty())
+        assertNull(mr.headPipeline)
+    }
+
+    @Test
+    fun `merge request detail parses head_pipeline including a null ref`() {
+        val payload = """
+            {
+              "iid": 42,
+              "title": "External CI",
+              "state": "opened",
+              "source_branch": "feature",
+              "target_branch": "main",
+              "web_url": "https://gitlab.com/g/r/-/merge_requests/42",
+              "updated_at": "2026-07-15T10:00:00Z",
+              "author": {"id": 1, "username": "jota", "name": "Jo Ta"},
+              "head_pipeline": {
+                "id": 501,
+                "status": "running",
+                "ref": null,
+                "sha": "deadbeef",
+                "web_url": "https://gitlab.com/g/r/-/pipelines/501"
+              }
+            }
+        """.trimIndent()
+
+        val mr = json.decodeFromString<GitLabMergeRequest>(payload)
+
+        val head = mr.headPipeline
+        assertNotNull(head)
+        assertEquals(501L, head!!.id)
+        assertEquals("running", head.status)
+        assertNull(head.ref)
     }
 
     @Test

@@ -28,6 +28,7 @@ import dev.jota.gitlabcockpit.core.groupByStage
 import dev.jota.gitlabcockpit.core.isJobCancelable
 import dev.jota.gitlabcockpit.core.isJobPlayable
 import dev.jota.gitlabcockpit.core.isJobRetryable
+import dev.jota.gitlabcockpit.core.mergeHeadPipeline
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
@@ -81,6 +82,12 @@ class PipelinesPanel(
         private set
 
     private var sourceBranch: String? = null
+
+    /**
+     * The MR's head pipeline (from the detail endpoint), merged into the loaded list so externally
+     * reported pipelines that `/pipelines` omits (e.g. Jenkins) still appear. Null when unknown.
+     */
+    private var headPipeline: GitLabPipeline? = null
 
     /** The iid whose pipelines have been loaded, so the tab only reloads when it changes. */
     private var loadedForIid: Long? = null
@@ -176,10 +183,15 @@ class PipelinesPanel(
 
     // --- Lifecycle called by MrDetailPanel ----------------------------------------------------
 
-    /** Binds this tab to [iid] / [branch] and marks the pipelines as needing a (re)load. */
-    fun setMr(iid: Long, branch: String) {
+    /**
+     * Binds this tab to [iid] / [branch] and marks the pipelines as needing a (re)load. [headPipeline]
+     * is the MR detail's `head_pipeline`, folded into the loaded list by [loadPipelines] so external
+     * pipelines still show even when `/pipelines` returns nothing.
+     */
+    fun setMr(iid: Long, branch: String, headPipeline: GitLabPipeline?) {
         currentIid = iid
         sourceBranch = branch
+        this.headPipeline = headPipeline
         loadedForIid = null
         selectedPipelineId = null
         pipelinesJob?.cancel()
@@ -195,6 +207,7 @@ class PipelinesPanel(
     fun clear() {
         currentIid = null
         sourceBranch = null
+        headPipeline = null
         loadedForIid = null
         selectedPipelineId = null
         pipelinesJob?.cancel()
@@ -227,7 +240,7 @@ class PipelinesPanel(
             withContext(Dispatchers.EDT) {
                 if (currentIid != iid) return@withContext
                 when (result) {
-                    is GitLabResult.Success -> renderPipelines(result.data)
+                    is GitLabResult.Success -> renderPipelines(mergeHeadPipeline(result.data, headPipeline))
                     else -> {
                         loadedForIid = null
                         tree.emptyText.text = CockpitBundle.message("pipelines.error.pipelines", describe(result))
@@ -558,11 +571,20 @@ class PipelinesPanel(
     }
 
     companion object {
-        /** `#id · status · ref · when` for the pipeline combo. */
+        /**
+         * `#id · status · ref · when` for the pipeline combo. The `ref` segment is dropped entirely
+         * when the pipeline has no ref (external pipelines), so no doubled separator is left behind.
+         */
         private fun pipelineLabel(p: GitLabPipeline): String {
             val dot = " \u00B7 "
             val when0 = formatRelative(p.updatedAt ?: p.createdAt ?: "")
-            return "#${p.id}$dot${p.status}$dot${p.ref}$dot$when0"
+            val parts = buildList {
+                add("#${p.id}")
+                add(p.status)
+                p.ref?.let { add(it) }
+                add(when0)
+            }
+            return parts.joinToString(dot)
         }
 
         /** Maps a job or aggregated stage status to its status icon. */

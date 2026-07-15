@@ -3,15 +3,19 @@ package dev.jota.gitlabcockpit.ui
 import com.intellij.icons.AllIcons
 import com.intellij.openapi.application.EDT
 import com.intellij.openapi.project.Project
-import com.intellij.openapi.ui.ComboBox
 import com.intellij.openapi.ui.DialogWrapper
 import com.intellij.openapi.ui.Messages
 import com.intellij.ui.CheckBoxList
+import com.intellij.ui.CollectionListModel
 import com.intellij.ui.ColorUtil
+import com.intellij.ui.DocumentAdapter
+import com.intellij.ui.DoubleClickListener
 import com.intellij.ui.JBColor
+import com.intellij.ui.SearchTextField
 import com.intellij.ui.SimpleListCellRenderer
 import com.intellij.ui.components.ActionLink
 import com.intellij.ui.components.JBLabel
+import com.intellij.ui.components.JBList
 import com.intellij.ui.components.JBScrollPane
 import com.intellij.ui.components.JBTabbedPane
 import com.intellij.ui.components.JBTextArea
@@ -28,6 +32,8 @@ import dev.jota.gitlabcockpit.api.GitLabResult
 import dev.jota.gitlabcockpit.api.GitLabUser
 import dev.jota.gitlabcockpit.api.MergeRequestUpdate
 import dev.jota.gitlabcockpit.core.CockpitProjectService
+import dev.jota.gitlabcockpit.core.ReviewerSelectionModel
+import dev.jota.gitlabcockpit.core.filterMembers
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.async
@@ -40,9 +46,12 @@ import java.awt.Cursor
 import java.awt.FlowLayout
 import java.awt.Font
 import java.awt.GridBagLayout
+import java.awt.event.MouseEvent
 import javax.swing.JButton
 import javax.swing.JComponent
 import javax.swing.JPanel
+import javax.swing.ListSelectionModel
+import javax.swing.event.DocumentEvent
 
 /**
  * The detail pane shown below the MR list. Renders one merge request inside a two-tab layout:
@@ -183,7 +192,7 @@ class MrDetailPanel(
         setCommentsTabTitle(null)
 
         // Rebind the Pipelines tab; it reloads lazily when shown (or now, if already selected).
-        pipelinesPanel.setMr(mr.iid, mr.sourceBranch)
+        pipelinesPanel.setMr(mr.iid, mr.sourceBranch, mr.headPipeline)
 
         // Rebind the Changes tab; it reloads lazily when shown (or now, if already selected).
         changesPanel.setMr(mr.iid, mr.diffRefs)
@@ -586,53 +595,126 @@ class MrDetailPanel(
         val editedDescription: String get() = descriptionArea.text
     }
 
+    /**
+     * Reviewer picker with an incremental search field over a [CheckBoxList]. The selection state
+     * lives in a pure [ReviewerSelectionModel], so a member checked while unfiltered stays checked
+     * even after a search hides it — the dialog is glue that repopulates the visible rows on each
+     * keystroke and forwards toggles to the model. [selectedIds] just reads the model.
+     */
     private class EditReviewersDialog(
         project: Project,
         members: List<GitLabUser>,
         currentReviewerIds: Set<Long>,
     ) : DialogWrapper(project) {
 
+        private val model = ReviewerSelectionModel(members, currentReviewerIds)
+        private val searchField = SearchTextField()
         private val checkList = CheckBoxList<GitLabUser>()
 
         init {
             title = CockpitBundle.message("dialog.editReviewers.title")
-            members.forEach { member ->
-                checkList.addItem(member, memberLabel(member), member.id in currentReviewerIds)
+            checkList.setCheckBoxListListener { index, value ->
+                checkList.getItemAt(index)?.let { model.setChecked(it.id, value) }
             }
+            searchField.addDocumentListener(object : DocumentAdapter() {
+                override fun textChanged(e: DocumentEvent) = repopulate()
+            })
+            repopulate()
             init()
         }
 
-        override fun createCenterPanel(): JComponent =
-            JBScrollPane(checkList).apply { preferredSize = JBUI.size(360, 320) }
+        /** EDT. Rebuilds the visible rows for the current query, checking each from the model. */
+        private fun repopulate() {
+            checkList.clear()
+            model.visibleItems(searchField.text).forEach { member ->
+                checkList.addItem(member, memberLabel(member), model.isChecked(member.id))
+            }
+        }
 
-        fun selectedIds(): List<Long> = checkList.checkedItems.map { it.id }
+        override fun createCenterPanel(): JComponent {
+            val scroll = JBScrollPane(checkList).apply { preferredSize = JBUI.size(360, 320) }
+            return JPanel(BorderLayout(0, JBUI.scale(4))).apply {
+                add(searchField, BorderLayout.NORTH)
+                add(scroll, BorderLayout.CENTER)
+            }
+        }
+
+        override fun getPreferredFocusedComponent(): JComponent = searchField.textEditor
+
+        fun selectedIds(): List<Long> = model.selectedIds()
     }
 
+    /**
+     * Assignee picker: an incremental search field over a single-selection [JBList] whose first row
+     * is always the fixed "None" option (null), kept visible regardless of the filter. Typing filters
+     * the members below it via [filterMembers]; the current assignee is preselected, a double click
+     * confirms, and [selectedIds] returns the picked user's id (empty for "None"). The `selectedIds`
+     * contract is unchanged from the previous combo-based dialog.
+     */
     private class EditAssigneeDialog(
         project: Project,
-        members: List<GitLabUser>,
+        private val members: List<GitLabUser>,
         currentAssigneeId: Long?,
     ) : DialogWrapper(project) {
 
-        private val combo = ComboBox<GitLabUser?>()
+        private val noneLabel = CockpitBundle.message("detail.none")
+        private val searchField = SearchTextField()
+        private val listModel = CollectionListModel<GitLabUser?>()
+        private val userList = JBList(listModel).apply {
+            selectionMode = ListSelectionModel.SINGLE_SELECTION
+            cellRenderer = SimpleListCellRenderer.create(noneLabel) { user -> user?.let(::memberLabel) ?: noneLabel }
+        }
 
         init {
             title = CockpitBundle.message("dialog.editAssignee.title")
-            val none = CockpitBundle.message("detail.none")
-            combo.addItem(null)
-            members.forEach { combo.addItem(it) }
-            combo.renderer = SimpleListCellRenderer.create(none) { user -> user?.let(::memberLabel) ?: none }
-            combo.selectedItem = members.firstOrNull { it.id == currentAssigneeId }
+            searchField.addDocumentListener(object : DocumentAdapter() {
+                override fun textChanged(e: DocumentEvent) = repopulate()
+            })
+            object : DoubleClickListener() {
+                override fun onDoubleClick(event: MouseEvent): Boolean {
+                    if (userList.selectedIndex < 0) return false
+                    doOKAction()
+                    return true
+                }
+            }.installOn(userList)
+            repopulate()
+            // Preselect the current assignee, or the "None" row (index 0) when there is none.
+            val preselect = members.firstOrNull { it.id == currentAssigneeId }
+            if (preselect != null) userList.setSelectedValue(preselect, true) else userList.selectedIndex = 0
             init()
         }
 
-        override fun createCenterPanel(): JComponent =
-            FormBuilder.createFormBuilder()
-                .addLabeledComponent(CockpitBundle.message("dialog.editAssignee.label"), combo)
-                .panel
+        /**
+         * EDT. Rebuilds the list — "None" first, then the members matching the current query. The
+         * prior selection is kept when it survives the filter; otherwise the fixed "None" row is
+         * selected (Swing's `setSelectedValue(null, …)` clears the selection, so it is set explicitly).
+         */
+        private fun repopulate() {
+            val previous = userList.selectedValue
+            val items = buildList<GitLabUser?> {
+                add(null)
+                addAll(filterMembers(members, searchField.text))
+            }
+            listModel.replaceAll(items)
+            if (previous != null && items.contains(previous)) {
+                userList.setSelectedValue(previous, true)
+            } else {
+                userList.selectedIndex = 0
+            }
+        }
+
+        override fun createCenterPanel(): JComponent {
+            val scroll = JBScrollPane(userList).apply { preferredSize = JBUI.size(360, 320) }
+            return JPanel(BorderLayout(0, JBUI.scale(4))).apply {
+                add(searchField, BorderLayout.NORTH)
+                add(scroll, BorderLayout.CENTER)
+            }
+        }
+
+        override fun getPreferredFocusedComponent(): JComponent = searchField.textEditor
 
         fun selectedIds(): List<Long> =
-            (combo.selectedItem as? GitLabUser)?.let { listOf(it.id) } ?: emptyList()
+            userList.selectedValue?.let { listOf(it.id) } ?: emptyList()
     }
 
     companion object {

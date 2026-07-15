@@ -1,6 +1,7 @@
 package dev.jota.gitlabcockpit.core
 
 import dev.jota.gitlabcockpit.api.GitLabJob
+import dev.jota.gitlabcockpit.api.GitLabPipeline
 
 /**
  * One pipeline stage: its [name], the jobs that belong to it (in their original order) and the
@@ -64,3 +65,18 @@ fun isJobPlayable(status: String): Boolean = status == "manual"
 
 private val RETRYABLE_STATUSES = setOf("failed", "canceled", "success")
 private val CANCELABLE_STATUSES = setOf("created", "pending", "running")
+
+/**
+ * Folds an MR's [head] pipeline into the list the `/pipelines` endpoint returned. GitLab omits
+ * externally reported pipelines (e.g. Jenkins) from that endpoint but still exposes them as the MR's
+ * `head_pipeline`, which otherwise leaves the Pipelines tab empty. The rules:
+ *
+ * - [head] null → [pipelines] unchanged (nothing to merge).
+ * - [head] already in [pipelines] (same [GitLabPipeline.id]) → [pipelines] unchanged (no duplicate).
+ * - otherwise → [head] prepended, so the head pipeline shows first (as the newest).
+ */
+fun mergeHeadPipeline(pipelines: List<GitLabPipeline>, head: GitLabPipeline?): List<GitLabPipeline> {
+    if (head == null) return pipelines
+    if (pipelines.any { it.id == head.id }) return pipelines
+    return listOf(head) + pipelines
+}
