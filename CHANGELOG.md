@@ -4,6 +4,12 @@
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-07-15
+
+### Added
+
+- Commented lines are marked in the diff (gutter icon with the comment count, plus an amber line highlight for threads that still need attention), comment anchors in the Comments tab jump to the thread in the diff (select the file, open the diff and scroll to it), and inline thread blocks are visually set off from the code with a colored left accent bar (amber while unresolved, green once resolved)
+
 ## [0.8.0] - 2026-07-15
 
 ### Added

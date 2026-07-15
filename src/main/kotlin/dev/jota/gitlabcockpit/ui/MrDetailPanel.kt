@@ -622,7 +622,8 @@ class MrDetailPanel(
                 .append("]")
         }
         threadAnchorLabel(thread)?.let { anchor ->
-            append("&nbsp;&nbsp;[").append(CockpitHtml.escapeHtml(anchor)).append("]")
+            append("&nbsp;&nbsp;[<a href=\"").append(GOTO_LINK_PREFIX).append(thread.discussionId).append("\">")
+                .append(CockpitHtml.escapeHtml(anchor)).append("</a>]")
         }
         append("</div>")
         append(CockpitHtml.stripBody(MarkdownRenderer.toHtml(first.body)))
@@ -676,14 +677,31 @@ class MrDetailPanel(
     // --- Reply mode ---------------------------------------------------------------------------
 
     /**
-     * Notes-pane hyperlink handler: a `cockpit:reply:<id>` link switches the comment box into reply
-     * mode for that thread (consumed, returns true); any other href is left to the default browser
-     * handling (returns false).
+     * Notes-pane hyperlink handler. A `cockpit:reply:<id>` link switches the comment box into reply
+     * mode for that thread; a `cockpit:goto:<id>` link (a diff-anchored thread's `[file:line]` tag)
+     * jumps to that thread inside the Changes tab's diff. Both are consumed (return true); any other
+     * href is left to the default browser handling (returns false).
      */
     private fun handleNotesLink(href: String): Boolean {
-        if (!href.startsWith(REPLY_LINK_PREFIX)) return false
-        enterReplyMode(href.removePrefix(REPLY_LINK_PREFIX))
-        return true
+        if (href.startsWith(REPLY_LINK_PREFIX)) {
+            enterReplyMode(href.removePrefix(REPLY_LINK_PREFIX))
+            return true
+        }
+        if (href.startsWith(GOTO_LINK_PREFIX)) {
+            gotoDiscussionInChanges(href.removePrefix(GOTO_LINK_PREFIX))
+            return true
+        }
+        return false
+    }
+
+    /**
+     * Jumps from a Comments-tab thread anchor to that thread inside the diff: selects the Changes tab
+     * (firing its lazy load when first shown) and asks it to reveal the discussion — select its file,
+     * open the diff and scroll to the thread. An unknown or non-positioned id is a silent no-op.
+     */
+    private fun gotoDiscussionInChanges(discussionId: String) {
+        tabbedPane.selectedIndex = CHANGES_TAB_INDEX
+        changesPanel.revealDiscussion(discussionId)
     }
 
     /** EDT. Switches the shared comment box to reply-to-thread mode for [discussionId]. */
@@ -1041,6 +1059,9 @@ class MrDetailPanel(
 
         /** Href scheme of a thread's Reply link; the discussion id follows the prefix. */
         private const val REPLY_LINK_PREFIX = "cockpit:reply:"
+
+        /** Href scheme of a diff-anchored thread's "jump to diff" link; the discussion id follows. */
+        private const val GOTO_LINK_PREFIX = "cockpit:goto:"
 
         /** For header rows: prefer the display name, fall back to the username. */
         private fun displayName(user: GitLabUser): String = user.name.ifBlank { user.username }

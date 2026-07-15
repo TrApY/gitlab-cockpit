@@ -135,6 +135,15 @@ class ChangesPanel(
     /** The changed file currently selected in the tree; enables "New thread". Null when none. */
     private var selectedFile: GitLabDiffFile? = null
 
+    /** The MR's changed files (flat), kept so a reveal can map a discussion's path back to its file. */
+    private var loadedFiles: List<GitLabDiffFile> = emptyList()
+
+    /** True once a load has populated the discussions/files, so a pending reveal can resolve. */
+    private var discussionsLoaded = false
+
+    /** A discussion the Comments tab asked to reveal; held until the changes finish loading. */
+    private var pendingRevealId: String? = null
+
     /** The MR's pending draft notes, loaded alongside the discussions; drives the "Pending review" section. */
     private var currentDrafts: List<GitLabDraftNote> = emptyList()
 
@@ -326,6 +335,17 @@ class ChangesPanel(
         if (loadedForRef != ref) load(ref)
     }
 
+    /**
+     * Reveals a discussion in the diff, driven by the Comments tab's "jump to thread" link. When the
+     * changes are already loaded it resolves immediately; otherwise the id is held and resolved once
+     * the (lazy) load triggered by the tab switch finishes. An unknown or non-positioned id is a
+     * silent no-op.
+     */
+    fun revealDiscussion(discussionId: String) {
+        pendingRevealId = discussionId
+        if (discussionsLoaded) resolvePendingReveal()
+    }
+
     private fun cancelJobs() {
         loadJob?.cancel()
         discussionsJob?.cancel()
@@ -342,6 +362,9 @@ class ChangesPanel(
         rootNode.removeAllChildren()
         treeModel.reload()
         discussionsByFilePath = emptyMap()
+        loadedFiles = emptyList()
+        discussionsLoaded = false
+        pendingRevealId = null
         selectedFilePath = null
         selectedFile = null
         newThreadButton.isEnabled = false
@@ -382,6 +405,8 @@ class ChangesPanel(
                         val discussions = (discussionsResult as? GitLabResult.Success)?.data ?: emptyList()
                         discussionsByFilePath = discussionsByFile(discussions)
                         renderFiles(diffsResult.data)
+                        discussionsLoaded = true
+                        resolvePendingReveal()
                     }
                     else -> {
                         loadedForRef = null
@@ -395,6 +420,7 @@ class ChangesPanel(
 
     /** EDT. Builds the file tree from [files] and updates the tab counter. */
     private fun renderFiles(files: List<GitLabDiffFile>) {
+        loadedFiles = files
         val root = buildFileTree(files)
         rootNode.removeAllChildren()
         for (child in root.children) rootNode.add(toTreeNode(child))
@@ -421,7 +447,7 @@ class ChangesPanel(
      * MR's `diff_refs` base/head SHAs (the missing side of an add/delete is empty); the diff is then
      * assembled and shown on the EDT. A missing `diff_refs` is a hard error (nothing to anchor to).
      */
-    private fun openDiff(file: GitLabDiffFile) {
+    private fun openDiff(file: GitLabDiffFile, revealDiscussionId: String? = null) {
         val ref = currentRef ?: return
         val refs = diffRefs
         if (refs == null) {
@@ -446,7 +472,7 @@ class ChangesPanel(
                     )
                     return@withContext
                 }
-                showDiff(ref, file, refs, oldSide.text, newSide.text)
+                showDiff(ref, file, refs, oldSide.text, newSide.text, revealDiscussionId)
             }
         }
     }
@@ -476,8 +502,18 @@ class ChangesPanel(
      * discussions, so [dev.jota.gitlabcockpit.ui.diff.CockpitDiffExtension] can render the review
      * threads inline in the diff editors. Threads created via "Comment on line…" show up the next
      * time the diff is opened (the discussions are reloaded after posting).
+     *
+     * [revealDiscussionId], when set, is carried on the [CockpitDiffContext] so the renderer scrolls
+     * the freshly opened diff to that thread (the Comments-tab "jump to thread" path).
      */
-    private fun showDiff(ref: MrRef, file: GitLabDiffFile, refs: DiffRefs, oldText: String, newText: String) {
+    private fun showDiff(
+        ref: MrRef,
+        file: GitLabDiffFile,
+        refs: DiffRefs,
+        oldText: String,
+        newText: String,
+        revealDiscussionId: String? = null,
+    ) {
         val displayPath = if (file.deletedFile) file.oldPath else file.newPath
         val fileName = displayPath.substringAfterLast('/')
         val fileType = FileTypeManager.getInstance().getFileTypeByFileName(fileName)
@@ -505,9 +541,46 @@ class ChangesPanel(
                 .distinctBy { it.id }
         request.putUserData(
             CockpitDiffContext.KEY,
-            CockpitDiffContext(ref, file, refs, fileDiscussions, projectWebUrl),
+            CockpitDiffContext(ref, file, refs, fileDiscussions, projectWebUrl, revealDiscussionId),
         )
         DiffManager.getInstance().showDiff(project, request)
+    }
+
+    /**
+     * Resolves a [pendingRevealId] once the changes are loaded: finds the file the discussion is
+     * anchored to (via the by-file discussion keys), selects it in the tree and opens its diff with
+     * the reveal target set. Consumes the pending id; a discussion that is unknown or not anchored to
+     * a file is a silent no-op. The diff is (re-)issued as a fresh request — the same thing a
+     * double-click does — since the architecture builds a new [SimpleDiffRequest] per open; the new
+     * request carries the reveal id so its viewer scrolls to the thread.
+     */
+    private fun resolvePendingReveal() {
+        val id = pendingRevealId ?: return
+        pendingRevealId = null
+        val path = discussionsByFilePath.entries
+            .firstOrNull { (_, threads) -> threads.any { it.id == id } }
+            ?.key ?: return
+        val file = loadedFiles.firstOrNull { it.newPath == path || it.oldPath == path } ?: return
+        selectFileInTree(file)
+        openDiff(file, revealDiscussionId = id)
+    }
+
+    /** Selects [file]'s leaf in the changed-files tree (also refreshing the bottom comments panel). */
+    private fun selectFileInTree(file: GitLabDiffFile) {
+        val targetPath = if (file.deletedFile) file.oldPath else file.newPath
+        val node = findFileNode(rootNode, targetPath) ?: return
+        TreeUtil.selectNode(tree, node)
+    }
+
+    /** Depth-first search for the file leaf whose [FileNode.path] equals [path]. */
+    private fun findFileNode(node: DefaultMutableTreeNode, path: String): DefaultMutableTreeNode? {
+        val data = node.userObject as? FileNode
+        if (data?.file != null && data.path == path) return node
+        for (index in 0 until node.childCount) {
+            val child = node.getChildAt(index) as? DefaultMutableTreeNode ?: continue
+            findFileNode(child, path)?.let { return it }
+        }
+        return null
     }
 
     // --- Comments -----------------------------------------------------------------------------

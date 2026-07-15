@@ -1,6 +1,7 @@
 package dev.jota.gitlabcockpit.core
 
 import dev.jota.gitlabcockpit.api.GitLabDiscussion
+import dev.jota.gitlabcockpit.api.GitLabDiscussionNote
 import dev.jota.gitlabcockpit.api.NotePosition
 
 /** Which diff editor a review thread anchors to: the base (old) side or the head (new) side. */
@@ -45,3 +46,13 @@ fun threadsByAnchor(discussions: List<GitLabDiscussion>): Map<DiffAnchor, List<G
     }
     return byAnchor
 }
+
+/**
+ * Whether a review thread still needs attention: at least one of its [notes] is resolvable but not
+ * yet resolved. A plain comment thread (no resolvable note) and a thread whose resolvable notes are
+ * all resolved both return false. Shared by the diff line highlight (amber background only on
+ * threads needing attention) and the embedded thread panel's accent bar, so both agree on what
+ * "unresolved" means. Pure and platform-free.
+ */
+fun threadNeedsAttention(notes: List<GitLabDiscussionNote>): Boolean =
+    notes.any { it.resolvable && !it.resolved }

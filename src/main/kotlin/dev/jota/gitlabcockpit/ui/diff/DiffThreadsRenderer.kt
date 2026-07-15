@@ -3,15 +3,29 @@ package dev.jota.gitlabcockpit.ui.diff
 import com.intellij.diff.tools.util.base.DiffViewerListener
 import com.intellij.diff.tools.util.side.TwosideTextDiffViewer
 import com.intellij.diff.util.Side
+import com.intellij.icons.AllIcons
 import com.intellij.openapi.Disposable
+import com.intellij.openapi.editor.Editor
+import com.intellij.openapi.editor.LogicalPosition
+import com.intellij.openapi.editor.ScrollType
 import com.intellij.openapi.editor.impl.EditorEmbeddedComponentManager
+import com.intellij.openapi.editor.markup.GutterIconRenderer
+import com.intellij.openapi.editor.markup.HighlighterLayer
+import com.intellij.openapi.editor.markup.RangeHighlighter
+import com.intellij.openapi.editor.markup.TextAttributes
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.util.Disposer
+import com.intellij.ui.JBColor
 import com.intellij.ui.components.panels.VerticalLayout
 import com.intellij.util.ui.JBUI
+import dev.jota.gitlabcockpit.CockpitBundle
+import dev.jota.gitlabcockpit.api.GitLabDiscussion
 import dev.jota.gitlabcockpit.core.AnchorSide
 import dev.jota.gitlabcockpit.core.CockpitProjectService
+import dev.jota.gitlabcockpit.core.threadNeedsAttention
 import dev.jota.gitlabcockpit.core.threadsByAnchor
+import java.awt.Color
+import javax.swing.Icon
 import javax.swing.JPanel
 
 /**
@@ -21,9 +35,15 @@ import javax.swing.JPanel
  * (one per discussion on that line), shown *below* the anchored line of the corresponding side's
  * editor.
  *
+ * On the same pass it also *marks* every commented line: a gutter icon (with the line's comment
+ * count as tooltip) plus, for lines whose thread still needs attention (an unresolved resolvable
+ * note), a translucent amber line background. Fully resolved threads keep the gutter icon but get no
+ * background.
+ *
  * Lifecycle: mounting is deferred to the viewer's `onInit` (editors fully initialized), and every
- * inlay is registered against the viewer via [Disposer] — closing the diff cancels the panels'
- * in-flight actions and disposes the inlays, so nothing survives the viewer.
+ * inlay and line highlighter is registered against the viewer via [Disposer] — closing the diff
+ * cancels the panels' in-flight actions and disposes the inlays/highlighters, so nothing survives
+ * the viewer (and a reopened diff rebuilds them from scratch — no orphans after a refresh).
  */
 internal class DiffThreadsRenderer(
     private val project: Project,
@@ -38,20 +58,20 @@ internal class DiffThreadsRenderer(
         })
     }
 
-    /** EDT. Creates one embedded inlay per anchor and ties its lifetime to the viewer. */
+    /** EDT. Creates one embedded inlay + line marker per anchor and ties their lifetime to the viewer. */
     private fun mount() {
         val service = CockpitProjectService.getInstance(project)
+        // The line (and its editor) hosting the discussion the diff was asked to scroll to, if any.
+        var revealTarget: Pair<Editor, Int>? = null
+
         for ((anchor, discussions) in threadsByAnchor(diffContext.discussions)) {
             val editor = viewer.getEditor(if (anchor.side == AnchorSide.OLD) Side.LEFT else Side.RIGHT)
             val document = editor.document
             // GitLab lines are 1-based, editor lines 0-based: line N lives at document line N-1.
             // The index is clamped to the document so a stale position (side shorter than the note
             // expects) still mounts on the last line instead of throwing; an empty side anchors at 0.
-            val offset = if (document.lineCount == 0) {
-                0
-            } else {
-                document.getLineStartOffset((anchor.line - 1).coerceIn(0, document.lineCount - 1))
-            }
+            val lineIndex = if (document.lineCount == 0) 0 else (anchor.line - 1).coerceIn(0, document.lineCount - 1)
+            val offset = if (document.lineCount == 0) 0 else document.getLineStartOffset(lineIndex)
 
             val panels = discussions.map {
                 DiffThreadPanel(project, service, diffContext.mrRef, it, diffContext.projectWebUrl)
@@ -77,6 +97,14 @@ internal class DiffThreadsRenderer(
                 ),
             ) ?: continue
 
+            val highlighter = addLineMarker(editor, lineIndex, discussions)
+
+            if (diffContext.revealDiscussionId != null &&
+                discussions.any { it.id == diffContext.revealDiscussionId }
+            ) {
+                revealTarget = editor to lineIndex
+            }
+
             panels.forEach { panel ->
                 panel.onContentChanged = {
                     group.revalidate()
@@ -86,14 +114,55 @@ internal class DiffThreadsRenderer(
             }
 
             // Child disposables run before the viewer's own dispose, i.e. while the editor is still
-            // alive; the isValid guard skips inlays the editor release already killed.
+            // alive; the isValid guards skip inlays/highlighters the editor release already killed.
             Disposer.register(
                 viewer,
                 Disposable {
                     panels.forEach { it.cancelPendingAction() }
                     if (inlay.isValid) Disposer.dispose(inlay)
+                    if (highlighter.isValid) highlighter.dispose()
                 },
             )
         }
+
+        revealTarget?.let { (editor, line) ->
+            editor.scrollingModel.scrollTo(LogicalPosition(line, 0), ScrollType.CENTER)
+        }
+        // One-shot: never scroll again if this viewer re-inits.
+        diffContext.revealDiscussionId = null
+    }
+
+    /**
+     * Adds the gutter icon (tooltip = the line's comment count) plus, when any thread on the line
+     * still needs attention, the translucent amber line background. The highlighter is returned so
+     * the caller can tie its disposal to the viewer.
+     */
+    private fun addLineMarker(
+        editor: Editor,
+        lineIndex: Int,
+        discussions: List<GitLabDiscussion>,
+    ): RangeHighlighter {
+        val needsAttention = discussions.any { threadNeedsAttention(it.notes) }
+        val commentCount = discussions.sumOf { discussion -> discussion.notes.count { !it.system } }
+        val attributes = if (needsAttention) TextAttributes().apply { backgroundColor = LINE_BACKGROUND } else null
+        val highlighter = editor.markupModel.addLineHighlighter(lineIndex, HighlighterLayer.SELECTION - 1, attributes)
+        highlighter.gutterIconRenderer =
+            ThreadGutterIconRenderer(CockpitBundle.message("diff.gutter.tooltip", commentCount))
+        return highlighter
+    }
+
+    /** Gutter marker for a commented line; its tooltip carries the line's comment count. */
+    private class ThreadGutterIconRenderer(private val tooltip: String) : GutterIconRenderer() {
+        override fun getIcon(): Icon = AllIcons.Toolwindows.ToolWindowMessages
+        override fun getTooltipText(): String = tooltip
+        override fun getAlignment(): Alignment = Alignment.LEFT
+        override fun equals(other: Any?): Boolean = other is ThreadGutterIconRenderer && other.tooltip == tooltip
+        override fun hashCode(): Int = tooltip.hashCode()
+    }
+
+    companion object {
+        /** Translucent amber background for a commented line whose thread still needs attention. */
+        private val LINE_BACKGROUND =
+            JBColor(Color(0xFF, 0xC1, 0x07, 0x18), Color(0xD6, 0xA2, 0x43, 0x20))
     }
 }

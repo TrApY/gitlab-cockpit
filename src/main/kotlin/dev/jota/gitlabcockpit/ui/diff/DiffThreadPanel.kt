@@ -20,6 +20,7 @@ import dev.jota.gitlabcockpit.api.GitLabResult
 import dev.jota.gitlabcockpit.api.GitLabUser
 import dev.jota.gitlabcockpit.core.CockpitProjectService
 import dev.jota.gitlabcockpit.core.MrRef
+import dev.jota.gitlabcockpit.core.threadNeedsAttention
 import dev.jota.gitlabcockpit.ui.CockpitHtml
 import dev.jota.gitlabcockpit.ui.MarkdownRenderer
 import dev.jota.gitlabcockpit.ui.applyMarkdownUploads
@@ -33,9 +34,11 @@ import java.awt.Cursor
 import java.awt.FlowLayout
 import java.awt.event.MouseAdapter
 import java.awt.event.MouseEvent
+import javax.swing.BorderFactory
 import javax.swing.JButton
 import javax.swing.JComponent
 import javax.swing.JPanel
+import javax.swing.border.MatteBorder
 
 /**
  * One review thread embedded under its diff line. Collapsed it is a single header row —
@@ -109,10 +112,7 @@ internal class DiffThreadPanel(
     init {
         isOpaque = true
         background = UIUtil.getPanelBackground()
-        border = JBUI.Borders.compound(
-            JBUI.Borders.customLine(JBColor.border(), 1),
-            JBUI.Borders.empty(6, 8),
-        )
+        updateAccentBorder()
 
         add(buildHeader(), BorderLayout.NORTH)
         add(buildBody(), BorderLayout.CENTER)
@@ -120,6 +120,22 @@ internal class DiffThreadPanel(
         updateSummary()
         updateResolveUi()
         renderNotes()
+    }
+
+    /**
+     * Sets the panel off from the surrounding code: a 3px left accent bar — amber while the thread
+     * needs attention, green once resolved — over the panel background, wrapped in an outer line
+     * border and inner padding. Recomputed whenever the resolution state changes.
+     */
+    private fun updateAccentBorder() {
+        val accent = if (threadNeedsAttention(notes)) ACCENT_ATTENTION else ACCENT_RESOLVED
+        border = BorderFactory.createCompoundBorder(
+            JBUI.Borders.customLine(JBColor.border(), 1),
+            BorderFactory.createCompoundBorder(
+                MatteBorder(0, JBUI.scale(3), 0, 0, accent),
+                JBUI.Borders.empty(6, 8),
+            ),
+        )
     }
 
     /** Cancels any in-flight reply/resolve; called when the hosting diff viewer is disposed. */
@@ -278,7 +294,11 @@ internal class DiffThreadPanel(
                 when (result) {
                     is GitLabResult.Success -> {
                         resolved = target
+                        // Flip the resolvable notes so threadNeedsAttention (the accent's source of
+                        // truth) reflects the new state without refetching the thread.
+                        notes.replaceAll { if (it.resolvable) it.copy(resolved = target) else it }
                         updateResolveUi()
+                        updateAccentBorder()
                         notifyContentChanged()
                     }
                     else -> Messages.showErrorDialog(
@@ -292,6 +312,12 @@ internal class DiffThreadPanel(
     }
 
     companion object {
+        /** Amber (light/dark) left accent for a thread that still needs attention. */
+        private val ACCENT_ATTENTION = JBColor(0xB07800, 0xD6A243)
+
+        /** Green (light/dark) left accent for a resolved (or non-resolvable) thread. */
+        private val ACCENT_RESOLVED = JBColor(0x2E7D32, 0x499C54)
+
         private fun displayName(user: GitLabUser): String = user.name.ifBlank { user.username }
 
         private fun describe(result: GitLabResult<*>): String = when (result) {
