@@ -9,6 +9,21 @@ plugins {
 
 intellijPlatform {
     pluginConfiguration {
+        // Marketplace listing description. Single source of truth: the section of README.md
+        // between the "<!-- Plugin description -->" markers, injected verbatim into the plugin.xml
+        // <description> at build time. The section is authored directly in the Marketplace-allowed
+        // HTML subset (p, ul, li, b), so no Markdown-to-HTML conversion is applied here.
+        description = providers.fileContents(layout.projectDirectory.file("README.md")).asText.map {
+            val start = "<!-- Plugin description -->"
+            val end = "<!-- Plugin description end -->"
+            with(it.lines()) {
+                if (!containsAll(listOf(start, end))) {
+                    throw GradleException("Plugin description section not found in README.md between '$start' and '$end'")
+                }
+                subList(indexOf(start) + 1, indexOf(end)).joinToString("\n")
+            }
+        }
+
         ideaVersion {
             sinceBuild = providers.gradleProperty("pluginSinceBuild")
             // Sin tope superior: el plugin se instala from-disk en IDEs futuros sin re-empaquetar

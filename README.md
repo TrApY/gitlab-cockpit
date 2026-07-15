@@ -1,7 +1,16 @@
 # Cockpit for GitLab
 
 <!-- Plugin description -->
-Manage GitLab merge requests without leaving your IDE: edit reviewers and assignees, comment, review diffs, and control the merge request's pipelines — view live logs, retry or cancel jobs.
+<p>Run the full GitLab merge request review cycle without leaving your IDE. Cockpit for GitLab adds a dedicated tool window where you browse, review and merge your merge requests, and follow their pipelines from first job to green.</p>
+<ul>
+  <li><b>Browse and filter</b> merge requests by role (author, reviewer, reviewer not yet approved) or by user, across a single project, every project of the instance, and multi-root repositories.</li>
+  <li><b>Review in depth</b>: discussion threads with replies, draft reviews with bulk submit, and inline comments anchored to the diff, right inside the editor.</li>
+  <li><b>Merge</b> with a status-aware button that knows when the request is mergeable, offers "merge when the pipeline succeeds", and shows the blocking reason otherwise.</li>
+  <li><b>Pipelines</b> for each merge request: stages, jobs, retry, cancel and play actions, and live logs with ANSI colors streamed as the job runs.</li>
+  <li><b>Images and attachments</b> from descriptions and comments are fetched with your token and rendered inline.</li>
+  <li><b>Configurable notifications</b>, including background polling with the tool window closed and a per-merge-request watch toggle.</li>
+</ul>
+<p>Setup: open <b>Settings &gt; Tools &gt; Cockpit for GitLab</b>, add a personal access token with the <b>api</b> scope, and point it at your instance. Works with self-managed GitLab 17+ and gitlab.com.</p>
 <!-- Plugin description end -->
 
 Plugin para IDEs IntelliJ que permite gestionar Merge Requests de GitLab sin salir del IDE:
