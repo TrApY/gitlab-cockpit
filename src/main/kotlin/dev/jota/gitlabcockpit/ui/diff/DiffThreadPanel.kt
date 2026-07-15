@@ -22,6 +22,7 @@ import dev.jota.gitlabcockpit.core.CockpitProjectService
 import dev.jota.gitlabcockpit.core.MrRef
 import dev.jota.gitlabcockpit.ui.CockpitHtml
 import dev.jota.gitlabcockpit.ui.MarkdownRenderer
+import dev.jota.gitlabcockpit.ui.applyMarkdownUploads
 import dev.jota.gitlabcockpit.ui.formatRelative
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -58,6 +59,7 @@ internal class DiffThreadPanel(
     private val service: CockpitProjectService,
     private val mrRef: MrRef,
     discussion: GitLabDiscussion,
+    private val projectWebUrl: String?,
 ) : JPanel(BorderLayout()) {
 
     private val discussionId: String = discussion.id
@@ -211,8 +213,16 @@ internal class DiffThreadPanel(
                 if (index < notes.lastIndex) append("<hr>")
             }
         }
-        htmlPane.text = CockpitHtml.wrapHtml(body)
-        htmlPane.caretPosition = 0
+        // The async image re-apply is dropped once the thread grows (a reply re-renders it).
+        val renderedNoteCount = notes.size
+        applyMarkdownUploads(
+            pane = htmlPane,
+            fragment = body,
+            service = service,
+            projectId = mrRef.projectId,
+            projectWebUrl = projectWebUrl,
+            isCurrent = { notes.size == renderedNoteCount },
+        )
     }
 
     /** `author · relative date` meta line for one note. */

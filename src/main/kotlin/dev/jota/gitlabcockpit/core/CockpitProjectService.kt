@@ -102,6 +102,15 @@ class CockpitProjectService(
     private val approvalsCache = ConcurrentHashMap<MrRef, CachedApprovals>()
 
     /**
+     * Downloads + caches Markdown image uploads to disk (one temp dir per project), fetching each
+     * upload authenticated against the MR's own project. Not cleared by [refresh] — the bytes on disk
+     * never go stale (an upload's secret+filename is immutable), so cached copies stay valid.
+     */
+    private val uploadImageCache = UploadImageCache { projectId, ref ->
+        withClientAndProject { client, _ -> client.getProjectUpload(projectId, ref.secret, ref.filename) }
+    }
+
+    /**
      * The user the configured token belongs to, populated by the first list load. Exposed read-only
      * so the detail panel can tell whether the current user already approved an MR without an extra
      * round-trip. Null until the first successful load.
@@ -238,6 +247,23 @@ class CockpitProjectService(
      */
     suspend fun getApprovalsFor(ref: MrRef): GitLabResult<GitLabApprovals> =
         withClientAndProject { client, _ -> client.getApprovals(ref.projectId, ref.iid) }
+
+    // --- Upload images in markdown (GLC-23) ---------------------------------------------------
+
+    /**
+     * Rewrites the upload image srcs in [html] to local `file://` URLs so the HTML editor kit can
+     * render them: finds every `/uploads/<secret>/<filename>` image, downloads (authenticated) and
+     * caches the ones not yet on disk against [projectId], and rewrites their srcs. Uploads that fail
+     * to download keep their original src (they stay broken rather than dangling). When [html] embeds
+     * no upload image it is returned unchanged with no network cost.
+     */
+    suspend fun resolveUploadImages(projectId: Long, html: String): String {
+        val refs = findUploadImageRefs(html)
+        if (refs.isEmpty()) return html
+        val mapping = uploadImageCache.resolve(projectId, refs)
+        if (mapping.isEmpty()) return html
+        return rewriteUploadImageSrcs(html, mapping)
+    }
 
     // --- Changed files & diff (F3) ------------------------------------------------------------
 

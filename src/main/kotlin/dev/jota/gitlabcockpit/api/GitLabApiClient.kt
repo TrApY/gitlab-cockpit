@@ -546,6 +546,23 @@ class GitLabApiClient(
         }
     }
 
+    /**
+     * Calls `GET /projects/:id/uploads/:secret/:filename` (the Markdown uploads download API, GitLab
+     * 17+) for one embedded attachment, authenticated with the PAT so images referenced as
+     * `/uploads/…` in a description or comment can be fetched. [filename] is encoded as a single path
+     * segment. The response is binary: `2xx` yields the raw bytes; any non-2xx becomes
+     * [GitLabResult.HttpError] (its body decoded best-effort as UTF-8); a transport failure becomes
+     * [GitLabResult.NetworkError].
+     */
+    suspend fun getProjectUpload(
+        projectId: Long,
+        secret: String,
+        filename: String,
+    ): GitLabResult<ByteArray> {
+        val encodedFilename = URLEncoder.encode(filename, StandardCharsets.UTF_8)
+        return getBytes("/projects/$projectId/uploads/$secret/$encodedFilename")
+    }
+
     /** Calls `GET /projects/:id/merge_requests/:iid/discussions?per_page=100` — the MR's threads. */
     suspend fun getMrDiscussions(projectId: Long, mrIid: Long): GitLabResult<List<GitLabDiscussion>> =
         get(
@@ -771,6 +788,42 @@ class GitLabApiClient(
             return GitLabResult.NetworkError(e)
         }
         return send(request, deserializer)
+    }
+
+    /**
+     * Sends a GET and returns the response body as raw bytes (via [HttpResponse.BodyHandlers.ofByteArray]),
+     * for binary payloads such as image uploads. `2xx` yields [GitLabResult.Success] with the bytes; any
+     * other completed response is a [GitLabResult.HttpError] whose body is decoded best-effort as UTF-8;
+     * only transport failures become [GitLabResult.NetworkError].
+     */
+    private suspend fun getBytes(path: String): GitLabResult<ByteArray> {
+        val request = try {
+            HttpRequest.newBuilder()
+                .uri(URI.create(apiBase + path))
+                .timeout(REQUEST_TIMEOUT)
+                .header("PRIVATE-TOKEN", tokenProvider().orEmpty())
+                .GET()
+                .build()
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            return GitLabResult.NetworkError(e)
+        }
+        return try {
+            val response = runInterruptible(Dispatchers.IO) {
+                httpClient.send(request, HttpResponse.BodyHandlers.ofByteArray())
+            }
+            if (response.statusCode() in 200..299) {
+                GitLabResult.Success(response.body())
+            } else {
+                val body = runCatching { String(response.body(), StandardCharsets.UTF_8) }.getOrNull()
+                GitLabResult.HttpError(response.statusCode(), body)
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            GitLabResult.NetworkError(e)
+        }
     }
 
     /** A raw (non-JSON) HTTP response: its status and body, both left untouched for the caller. */

@@ -25,8 +25,7 @@ fun projectLabelOf(mr: GitLabMergeRequest): String? {
 
 /** Extracts `group/project` (or `group/sub/project`) from a merge-request web URL, or null. */
 private fun labelFromWebUrl(webUrl: String): String? {
-    val marker = "/-/merge_requests/"
-    val markerIndex = webUrl.indexOf(marker)
+    val markerIndex = webUrl.indexOf(MERGE_REQUESTS_MARKER)
     if (markerIndex < 0) return null
     val beforeMarker = webUrl.substring(0, markerIndex)
     val afterScheme = beforeMarker.substringAfter("://", beforeMarker)

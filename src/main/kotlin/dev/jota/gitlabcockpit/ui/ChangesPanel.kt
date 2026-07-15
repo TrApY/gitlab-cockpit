@@ -120,6 +120,9 @@ class ChangesPanel(
     /** The MR's diff SHAs; needed to open a diff. Null until the detail is bound (or if absent). */
     private var diffRefs: DiffRefs? = null
 
+    /** The MR's project base web URL, used to absolutize relative `/uploads/…` attachment links. */
+    private var projectWebUrl: String? = null
+
     /** The ref whose changes have been loaded, so the tab only reloads when it changes. */
     private var loadedForRef: MrRef? = null
 
@@ -294,9 +297,10 @@ class ChangesPanel(
     // --- Lifecycle called by MrDetailPanel ----------------------------------------------------
 
     /** Binds this tab to [ref] / [refs] and marks the changes as needing a (re)load. */
-    fun setMr(ref: MrRef, refs: DiffRefs?) {
+    fun setMr(ref: MrRef, refs: DiffRefs?, projectWebUrl: String?) {
         currentRef = ref
         diffRefs = refs
+        this.projectWebUrl = projectWebUrl
         loadedForRef = null
         cancelJobs()
         clearContent()
@@ -308,6 +312,7 @@ class ChangesPanel(
     fun clear() {
         currentRef = null
         diffRefs = null
+        projectWebUrl = null
         loadedForRef = null
         cancelJobs()
         clearContent()
@@ -498,7 +503,10 @@ class ChangesPanel(
         val fileDiscussions =
             (discussionsByFilePath[file.newPath].orEmpty() + discussionsByFilePath[file.oldPath].orEmpty())
                 .distinctBy { it.id }
-        request.putUserData(CockpitDiffContext.KEY, CockpitDiffContext(ref, file, refs, fileDiscussions))
+        request.putUserData(
+            CockpitDiffContext.KEY,
+            CockpitDiffContext(ref, file, refs, fileDiscussions, projectWebUrl),
+        )
         DiffManager.getInstance().showDiff(project, request)
     }
 
@@ -539,8 +547,15 @@ class ChangesPanel(
                 if (index < notes.lastIndex) append("<hr>")
             }
         }
-        discussionPane.text = CockpitHtml.wrapHtml(body)
-        discussionPane.caretPosition = 0
+        // The async image re-apply is dropped once the user selects a different thread.
+        applyMarkdownUploads(
+            pane = discussionPane,
+            fragment = body,
+            service = service,
+            projectId = currentRef?.projectId ?: return,
+            projectWebUrl = projectWebUrl,
+            isCurrent = { discussionList.selectedValue === discussion },
+        )
     }
 
     /** Posts the reply-box text to the selected thread, then reloads the MR's discussions. */

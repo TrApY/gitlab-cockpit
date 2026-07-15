@@ -4,6 +4,12 @@
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-07-15
+
+### Added
+
+- Images attached to merge request descriptions and comments now render: each embedded `/uploads/…` image is downloaded authenticated with your token and cached on disk, so the pictures show up instead of broken-image icons. Non-image attachment links are absolutized and open in the browser
+
 ## [0.5.2] - 2026-07-15
 
 ### Fixed

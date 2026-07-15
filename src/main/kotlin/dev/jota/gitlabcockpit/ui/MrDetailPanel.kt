@@ -35,6 +35,7 @@ import dev.jota.gitlabcockpit.core.CockpitProjectService
 import dev.jota.gitlabcockpit.core.MrRef
 import dev.jota.gitlabcockpit.core.ReviewerSelectionModel
 import dev.jota.gitlabcockpit.core.filterMembers
+import dev.jota.gitlabcockpit.core.projectWebUrlOf
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.async
@@ -81,11 +82,21 @@ class MrDetailPanel(
     var currentRef: MrRef? = null
         private set
 
+    /** The MR currently displayed; kept so the async upload load knows its project's base web URL. */
+    private var currentMr: GitLabMergeRequest? = null
+
     private var detailJob: Job? = null
     private var notesJob: Job? = null
 
     /** The MR whose notes are loaded (or loading). Reset on every [showMr] so a refresh re-fetches. */
     private var notesLoadedForRef: MrRef? = null
+
+    /**
+     * Bumped on every notes (re)load and MR switch. The async upload re-apply carries the epoch it was
+     * started under and is dropped once the epoch moves on, so a slow image download from a superseded
+     * load never clobbers freshly rendered notes.
+     */
+    private var notesEpoch: Int = 0
 
     /** Recreated by [buildHeader]; updated by the async approvals load. */
     private var approvalsLabel: JBLabel? = null
@@ -154,6 +165,7 @@ class MrDetailPanel(
     /** EDT. Shows the "select an MR" placeholder and forgets the current selection. */
     fun showPlaceholder() {
         currentRef = null
+        currentMr = null
         pipelinesPanel.clear()
         changesPanel.clear()
         setSingleMessage(CockpitBundle.message("detail.placeholder"))
@@ -181,6 +193,7 @@ class MrDetailPanel(
     private fun showMr(mr: GitLabMergeRequest) {
         val ref = MrRef(mr.projectId, mr.iid)
         currentRef = ref
+        currentMr = mr
 
         headerContainer.removeAll()
         headerContainer.add(buildHeader(mr), BorderLayout.CENTER)
@@ -188,6 +201,7 @@ class MrDetailPanel(
 
         // Reset the comment thread for the (possibly refreshed) MR; it reloads lazily / on demand.
         notesJob?.cancel()
+        notesEpoch++
         notesLoadedForRef = null
         notesPane.text = CockpitHtml.wrapHtml("")
         draftBanner.isVisible = false
@@ -197,7 +211,7 @@ class MrDetailPanel(
         pipelinesPanel.setMr(ref, mr.sourceBranch, mr.headPipeline)
 
         // Rebind the Changes tab; it reloads lazily when shown (or now, if already selected).
-        changesPanel.setMr(ref, mr.diffRefs)
+        changesPanel.setMr(ref, mr.diffRefs, projectWebUrlOf(mr))
 
         if (tabbedPane.parent !== this) {
             removeAll()
@@ -218,8 +232,15 @@ class MrDetailPanel(
         } else {
             CockpitHtml.stripBody(MarkdownRenderer.toHtml(mr.description))
         }
-        descriptionPane.text = CockpitHtml.wrapHtml(fragment)
-        descriptionPane.caretPosition = 0
+        val ref = MrRef(mr.projectId, mr.iid)
+        applyMarkdownUploads(
+            pane = descriptionPane,
+            fragment = fragment,
+            service = service,
+            projectId = mr.projectId,
+            projectWebUrl = projectWebUrlOf(mr),
+            isCurrent = { currentRef == ref },
+        )
     }
 
     private fun buildHeader(mr: GitLabMergeRequest): JComponent {
@@ -354,6 +375,7 @@ class MrDetailPanel(
      */
     private fun loadNotes(ref: MrRef) {
         notesLoadedForRef = ref
+        notesEpoch++
         notesPane.text = CockpitHtml.wrapHtml(
             "<p><i>" + CockpitHtml.escapeHtml(CockpitBundle.message("detail.comment.loading")) + "</i></p>",
         )
@@ -412,22 +434,32 @@ class MrDetailPanel(
             notesPane.text = CockpitHtml.wrapHtml(
                 "<p><i>" + CockpitHtml.escapeHtml(CockpitBundle.message("detail.comment.empty")) + "</i></p>",
             )
-        } else {
-            val metaColor = ColorUtil.toHtmlColor(UIUtil.getContextHelpForeground())
-            val body = buildString {
-                notes.forEachIndexed { index, note ->
-                    append("<div style=\"color:").append(metaColor).append(";\">")
-                    append(CockpitHtml.escapeHtml(displayName(note.author)))
-                    append(" &middot; ")
-                    append(CockpitHtml.escapeHtml(formatRelative(note.createdAt)))
-                    append("</div>")
-                    append(CockpitHtml.stripBody(MarkdownRenderer.toHtml(note.body)))
-                    if (index < notes.lastIndex) append("<hr>")
-                }
-            }
-            notesPane.text = CockpitHtml.wrapHtml(body)
+            notesPane.caretPosition = 0
+            setCommentsTabTitle(notes.size)
+            return
         }
-        notesPane.caretPosition = 0
+        val metaColor = ColorUtil.toHtmlColor(UIUtil.getContextHelpForeground())
+        val body = buildString {
+            notes.forEachIndexed { index, note ->
+                append("<div style=\"color:").append(metaColor).append(";\">")
+                append(CockpitHtml.escapeHtml(displayName(note.author)))
+                append(" &middot; ")
+                append(CockpitHtml.escapeHtml(formatRelative(note.createdAt)))
+                append("</div>")
+                append(CockpitHtml.stripBody(MarkdownRenderer.toHtml(note.body)))
+                if (index < notes.lastIndex) append("<hr>")
+            }
+        }
+        val ref = currentRef
+        val epoch = notesEpoch
+        applyMarkdownUploads(
+            pane = notesPane,
+            fragment = body,
+            service = service,
+            projectId = ref?.projectId ?: 0L,
+            projectWebUrl = currentMr?.let(::projectWebUrlOf),
+            isCurrent = { currentRef == ref && notesEpoch == epoch },
+        )
         setCommentsTabTitle(notes.size)
     }
 
