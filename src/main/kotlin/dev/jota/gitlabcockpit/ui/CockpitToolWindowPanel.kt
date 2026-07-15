@@ -45,6 +45,7 @@ import java.awt.BorderLayout
 import java.awt.FlowLayout
 import java.awt.event.KeyEvent
 import java.awt.event.MouseEvent
+import javax.swing.DefaultComboBoxModel
 import javax.swing.JButton
 import javax.swing.JComponent
 import javax.swing.JPanel
@@ -117,6 +118,26 @@ class CockpitToolWindowPanel(
     }.apply {
         toolTipText = CockpitBundle.message("toolwindow.project.tooltip")
         isVisible = false
+    }
+
+    /** Guards the remote selector's listener while it is repopulated programmatically by [render]. */
+    private var suppressRemoteSelectorEvents = false
+
+    /**
+     * Repo selector shown instead of [projectLink] when the project has several git roots matching
+     * the configured instance (e.g. submodules). Picking one persists the choice and reloads the list.
+     * Mutually exclusive with [projectLink]; both are hidden outside [CockpitState.Ready].
+     */
+    private val remoteSelector = ComboBox<String>().apply {
+        toolTipText = CockpitBundle.message("toolwindow.remoteSelector.tooltip")
+        isVisible = false
+        addActionListener {
+            if (suppressRemoteSelectorEvents) return@addActionListener
+            val path = selectedItem as? String ?: return@addActionListener
+            service.selectRemote(path)
+            // selectRemote already refreshed the caches, so no invalidateCache here.
+            reload(invalidateCache = false)
+        }
     }
 
     private val listModel = CollectionListModel<GitLabMergeRequest>()
@@ -209,6 +230,7 @@ class CockpitToolWindowPanel(
         toolbar.add(allProjectsCheckBox)
         toolbar.add(refreshButton)
         toolbar.add(projectLink)
+        toolbar.add(remoteSelector)
         return toolbar
     }
 
@@ -314,8 +336,7 @@ class CockpitToolWindowPanel(
     /** Must be called on the EDT. [showProject] mirrors the load's "All projects" mode for the rows. */
     private fun render(state: CockpitState, showProject: Boolean) {
         mrCellRenderer.showProject = showProject
-        if (state is CockpitState.Ready) renderProjectLink(state.glProject.pathWithNamespace, state.glProject.webUrl)
-        else hideProjectLink()
+        renderRemoteControls(state)
         when (state) {
             CockpitState.Loading ->
                 showMessage(CockpitBundle.message("toolwindow.empty.loading"))
@@ -338,6 +359,40 @@ class CockpitToolWindowPanel(
                 reconcileDetailWithSelection()
             }
         }
+    }
+
+    /**
+     * EDT. Reconciles the two mutually-exclusive toolbar controls with [state]: a repo selector when
+     * a Ready load has more than one matching git root, otherwise the single-project link; both hidden
+     * in any non-Ready state.
+     */
+    private fun renderRemoteControls(state: CockpitState) {
+        if (state is CockpitState.Ready && state.remotePaths.size > 1) {
+            hideProjectLink()
+            renderRemoteSelector(state.remotePaths, state.glProject.pathWithNamespace)
+        } else if (state is CockpitState.Ready) {
+            hideRemoteSelector()
+            renderProjectLink(state.glProject.pathWithNamespace, state.glProject.webUrl)
+        } else {
+            hideRemoteSelector()
+            hideProjectLink()
+        }
+    }
+
+    /** EDT. Populates and shows the repo selector, selecting the currently resolved [selected] path. */
+    private fun renderRemoteSelector(paths: List<String>, selected: String) {
+        suppressRemoteSelectorEvents = true
+        remoteSelector.model = DefaultComboBoxModel(paths.toTypedArray())
+        remoteSelector.selectedItem = selected
+        suppressRemoteSelectorEvents = false
+        remoteSelector.isVisible = true
+        remoteSelector.parent?.revalidate()
+    }
+
+    /** EDT. Hides the repo selector (single-root or non-Ready state). */
+    private fun hideRemoteSelector() {
+        remoteSelector.isVisible = false
+        remoteSelector.parent?.revalidate()
     }
 
     /** EDT. Shows the toolbar link to the resolved GitLab [pathWithNamespace], opening [webUrl]. */

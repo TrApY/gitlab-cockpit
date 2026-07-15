@@ -4,6 +4,12 @@
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-07-15
+
+### Fixed
+
+- Repo selector for projects with several git roots (submodules): a toolbar dropdown appears when more than one git root matches the configured GitLab instance, letting you choose which repository the tool window browses. The default is no longer arbitrary — the project's own root wins over nested submodules instead of whichever remote was found first
+
 ## [0.5.0] - 2026-07-15
 
 ### Added

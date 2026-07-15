@@ -1,5 +1,6 @@
 package dev.jota.gitlabcockpit.core
 
+import com.intellij.ide.util.PropertiesComponent
 import com.intellij.openapi.components.Service
 import com.intellij.openapi.components.service
 import com.intellij.openapi.project.Project
@@ -61,6 +62,12 @@ sealed interface CockpitState {
         val currentUser: GitLabUser,
         /** The GitLab project resolved from this project's git remote, for the toolbar link. */
         val glProject: GitLabProject,
+        /**
+         * The `pathWithNamespace` of every git root of this project whose remote matches the
+         * configured instance, already ordered and de-duplicated. Drives the repo selector when the
+         * project has several matching roots (e.g. submodules); a single entry means no selector.
+         */
+        val remotePaths: List<String> = emptyList(),
     ) : CockpitState
 
     /** Something failed; [message] is already localized and user-facing. */
@@ -112,12 +119,15 @@ class CockpitProjectService(
 
     /** Loads merge requests for [selection], resolving project/user/remote as needed. */
     suspend fun loadMergeRequests(selection: MrFilterSelection): CockpitState {
-        val (client, glProject) = when (val resolution = resolveClientAndProject()) {
-            is ProjectResolution.Ok -> resolution.client to resolution.glProject
+        val ok = when (val resolution = resolveClientAndProject()) {
+            is ProjectResolution.Ok -> resolution
             ProjectResolution.NotConfigured -> return CockpitState.NotConfigured
             ProjectResolution.NoRemote -> return CockpitState.NoGitLabRemote
             is ProjectResolution.Failed -> return toErrorState(resolution.error)
         }
+        val client = ok.client
+        val glProject = ok.glProject
+        val remotePaths = ok.remotePaths
 
         val currentUser = cachedUser ?: when (val r = client.getCurrentUser()) {
             is GitLabResult.Success -> r.data.also { cachedUser = it }
@@ -127,7 +137,7 @@ class CockpitProjectService(
 
         // A global "By user" filter with no username would query the whole instance — short-circuit it.
         if (isGlobalByUserWithoutUser(selection)) {
-            return CockpitState.Ready(emptyList(), currentUser, glProject)
+            return CockpitState.Ready(emptyList(), currentUser, glProject, remotePaths)
         }
 
         val query = buildQuery(selection, currentUser)
@@ -144,7 +154,17 @@ class CockpitProjectService(
             mrs
         }
 
-        return CockpitState.Ready(finalMrs, currentUser, glProject)
+        return CockpitState.Ready(finalMrs, currentUser, glProject, remotePaths)
+    }
+
+    /**
+     * Persists [pathWithNamespace] as the git root the user chose to browse and drops all cached
+     * data (via [refresh]) so the next load re-resolves against it. Does not reload by itself — the
+     * panel triggers the reload.
+     */
+    fun selectRemote(pathWithNamespace: String) {
+        PropertiesComponent.getInstance(project).setValue(SELECTED_REMOTE_PATH_KEY, pathWithNamespace)
+        refresh()
     }
 
     /** Fetches the fresh detail of a single MR. Used by the detail panel on selection. */
@@ -455,18 +475,24 @@ class CockpitProjectService(
         if (baseUrl.isEmpty()) return ProjectResolution.NotConfigured
 
         val instanceHost = GitLabProjectResolver.hostOf(baseUrl) ?: return ProjectResolution.NotConfigured
-        val coords = findMatchingRemote(instanceHost) ?: return ProjectResolution.NoRemote
+        val candidates = findMatchingRemotes(instanceHost)
+        val chosen = chooseRemote(candidates, persistedRemotePath(), project.basePath)
+            ?: return ProjectResolution.NoRemote
 
         val token = TokenStore.get(baseUrl)
         val client = GitLabApiClient(baseUrl) { token }
 
-        val glProject = cachedProject ?: when (val r = client.getProjectByPath(coords.pathWithNamespace)) {
+        val glProject = cachedProject ?: when (val r = client.getProjectByPath(chosen.coords.pathWithNamespace)) {
             is GitLabResult.Success -> r.data.also { cachedProject = it }
             is GitLabResult.HttpError -> return ProjectResolution.Failed(r)
             is GitLabResult.NetworkError -> return ProjectResolution.Failed(r)
         }
-        return ProjectResolution.Ok(client, glProject)
+        return ProjectResolution.Ok(client, glProject, candidates.map { it.coords.pathWithNamespace })
     }
+
+    /** The `pathWithNamespace` the user last chose via [selectRemote], or null if none. */
+    private fun persistedRemotePath(): String? =
+        PropertiesComponent.getInstance(project).getValue(SELECTED_REMOTE_PATH_KEY)
 
     private fun toErrorState(result: GitLabResult<Nothing>): CockpitState.Error = when (result) {
         is GitLabResult.HttpError -> httpError(result)
@@ -476,7 +502,12 @@ class CockpitProjectService(
 
     /** Outcome of resolving the configured instance to a live client + project. */
     private sealed interface ProjectResolution {
-        data class Ok(val client: GitLabApiClient, val glProject: GitLabProject) : ProjectResolution
+        data class Ok(
+            val client: GitLabApiClient,
+            val glProject: GitLabProject,
+            /** `pathWithNamespace` of every matching git root, ordered and de-duplicated. */
+            val remotePaths: List<String>,
+        ) : ProjectResolution
         object NotConfigured : ProjectResolution
         object NoRemote : ProjectResolution
         data class Failed(val error: GitLabResult<Nothing>) : ProjectResolution
@@ -540,16 +571,22 @@ class CockpitProjectService(
             .toMap()
     }
 
-    private fun findMatchingRemote(instanceHost: String): RemoteCoords? {
+    /**
+     * Enumerates every git root of this project whose first matching remote resolves to
+     * [instanceHost], as [CandidateRemote]s carrying the repo's root path. The result is ordered and
+     * de-duplicated by [orderCandidates] (the project's own root first). Replaces the old
+     * "first matching remote wins" behaviour, which let a nested submodule hijack the tool window.
+     */
+    private fun findMatchingRemotes(instanceHost: String): List<CandidateRemote> {
+        val candidates = mutableListOf<CandidateRemote>()
         for (repo in GitRepositoryManager.getInstance(project).repositories) {
-            for (remote in repo.remotes) {
-                for (url in remote.urls) {
-                    val coords = GitLabProjectResolver.parseRemoteUrl(url) ?: continue
-                    if (coords.host.equals(instanceHost, ignoreCase = true)) return coords
-                }
-            }
+            val coords = repo.remotes.asSequence()
+                .flatMap { it.urls.asSequence() }
+                .mapNotNull { GitLabProjectResolver.parseRemoteUrl(it) }
+                .firstOrNull { it.host.equals(instanceHost, ignoreCase = true) }
+            if (coords != null) candidates.add(CandidateRemote(coords, repo.root.path))
         }
-        return null
+        return orderCandidates(candidates, project.basePath)
     }
 
     private fun httpError(error: GitLabResult.HttpError): CockpitState.Error =
@@ -572,6 +609,9 @@ class CockpitProjectService(
 
     companion object {
         fun getInstance(project: Project): CockpitProjectService = project.service()
+
+        /** Project-level [PropertiesComponent] key storing the chosen git root's `pathWithNamespace`. */
+        private const val SELECTED_REMOTE_PATH_KEY = "dev.jota.gitlabcockpit.selectedRemotePath"
 
         /** Job statuses [retryStage] will actually retry (a subset of [isJobRetryable]). */
         private val RETRY_STAGE_STATUSES = setOf("failed", "canceled")
