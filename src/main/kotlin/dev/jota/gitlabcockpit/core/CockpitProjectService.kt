@@ -248,6 +248,22 @@ class CockpitProjectService(
     suspend fun getApprovalsFor(ref: MrRef): GitLabResult<GitLabApprovals> =
         withClientAndProject { client, _ -> client.getApprovals(ref.projectId, ref.iid) }
 
+    /**
+     * Merges [ref] with the given options ([squash], [removeSourceBranch], [mergeWhenPipelineSucceeds]).
+     * On success the MR's approvals cache entry is dropped so a subsequent detail reload reflects the
+     * post-merge state instead of a stale one.
+     */
+    suspend fun merge(
+        ref: MrRef,
+        squash: Boolean,
+        removeSourceBranch: Boolean,
+        mergeWhenPipelineSucceeds: Boolean,
+    ): GitLabResult<Unit> =
+        withClientAndProject { client, _ ->
+            client.mergeMr(ref.projectId, ref.iid, squash, removeSourceBranch, mergeWhenPipelineSucceeds)
+                .also { if (it is GitLabResult.Success) approvalsCache.remove(ref) }
+        }
+
     // --- Upload images in markdown (GLC-23) ---------------------------------------------------
 
     /**

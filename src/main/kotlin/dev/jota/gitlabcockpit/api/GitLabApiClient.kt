@@ -85,6 +85,27 @@ data class GitLabMergeRequest(
      * [dev.jota.gitlabcockpit.core.projectLabelOf]).
      */
     val references: GitLabReferences? = null,
+    /**
+     * GitLab's fine-grained mergeability status (`detailed_merge_status`), returned by the detail
+     * endpoint: `mergeable`, `ci_still_running`, `conflict`, `not_approved`, `draft_status`,
+     * `discussions_not_resolved`, `need_rebase`, `unchecked`/`checking`… It drives the Merge button
+     * state (see [dev.jota.gitlabcockpit.core.mergeButtonState]); nullable because the list endpoint
+     * omits it.
+     */
+    @SerialName("detailed_merge_status") val detailedMergeStatus: String? = null,
+    /** ISO-8601 creation timestamp; shown in the Overview dates line. Nullable on trimmed payloads. */
+    @SerialName("created_at") val createdAt: String? = null,
+    /** ISO-8601 merge timestamp; present only once the MR is merged. */
+    @SerialName("merged_at") val mergedAt: String? = null,
+    /** ISO-8601 close timestamp; present only once the MR is closed. */
+    @SerialName("closed_at") val closedAt: String? = null,
+    /** Whether the MR is set to squash its commits on merge; the default pre-check of the merge dialog. */
+    val squash: Boolean = false,
+    /**
+     * Whether merging should remove the source branch (`force_remove_source_branch`). Nullable because
+     * GitLab omits it when unset; the merge dialog treats a null as `false`.
+     */
+    @SerialName("force_remove_source_branch") val forceRemoveSourceBranch: Boolean? = null,
 )
 
 /**
@@ -144,6 +165,10 @@ data class MergeRequestUpdate(
 @Serializable
 data class GitLabApprovals(
     @SerialName("approved_by") val approvedBy: List<ApprovedBy> = emptyList(),
+    /** How many approvals the MR's rules require; nullable when the payload omits approval rules. */
+    @SerialName("approvals_required") val approvalsRequired: Int? = null,
+    /** How many approvals are still missing; `0` means the requirement is met. Nullable when absent. */
+    @SerialName("approvals_left") val approvalsLeft: Int? = null,
 )
 
 /** Wrapper GitLab uses for each approver: `{ "user": { ... } }`. */
@@ -307,6 +332,19 @@ private data class DraftNoteCreateBody(
 /** Request body for `PUT /merge_requests/:iid/discussions/:id`: `{ "resolved": true|false }`. */
 @Serializable
 private data class DiscussionResolveBody(val resolved: Boolean)
+
+/**
+ * Request body for `PUT /merge_requests/:iid/merge`. [squash] and [shouldRemoveSourceBranch] are
+ * always sent (no defaults, so [GitLabApiClient.updateJson]'s `encodeDefaults = false` keeps them);
+ * [mergeWhenPipelineSucceeds] is only emitted when non-null (set to `true` for the MWPS action) —
+ * its null default is dropped by `explicitNulls = false`.
+ */
+@Serializable
+private data class MergeMrBody(
+    val squash: Boolean,
+    @SerialName("should_remove_source_branch") val shouldRemoveSourceBranch: Boolean,
+    @SerialName("merge_when_pipeline_succeeds") val mergeWhenPipelineSucceeds: Boolean? = null,
+)
 
 /**
  * Server-side query for [GitLabApiClient.getMergeRequests]. `state` is one of
@@ -497,6 +535,31 @@ class GitLabApiClient(
             payload,
             GitLabNote.serializer(),
         )
+    }
+
+    /**
+     * Calls `PUT /projects/:id/merge_requests/:iid/merge` with
+     * `{ "squash": …, "should_remove_source_branch": … }`, adding `"merge_when_pipeline_succeeds": true`
+     * only when [mergeWhenPipelineSucceeds] is set. GitLab answers `200` with the merged MR JSON, which
+     * is intentionally ignored (null deserializer) — success is all the caller needs; a non-mergeable MR
+     * comes back as `405` and becomes [GitLabResult.HttpError].
+     */
+    suspend fun mergeMr(
+        projectId: Long,
+        mrIid: Long,
+        squash: Boolean,
+        removeSourceBranch: Boolean,
+        mergeWhenPipelineSucceeds: Boolean,
+    ): GitLabResult<Unit> {
+        val payload = updateJson.encodeToString(
+            MergeMrBody.serializer(),
+            MergeMrBody(
+                squash = squash,
+                shouldRemoveSourceBranch = removeSourceBranch,
+                mergeWhenPipelineSucceeds = if (mergeWhenPipelineSucceeds) true else null,
+            ),
+        )
+        return put("/projects/$projectId/merge_requests/$mrIid/merge", payload, null)
     }
 
     /**

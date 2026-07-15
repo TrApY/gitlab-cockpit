@@ -4,6 +4,12 @@
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-07-15
+
+### Added
+
+- Merge from the Overview tab: a merge-status-aware button (enabled when the merge request is mergeable, offering "Merge when pipeline succeeds" while CI is running, disabled with the blocker reason as a tooltip otherwise), a confirmation dialog with Squash and Delete source branch options that are remembered (and editable in Settings), created/merged/closed dates in the header, and colored approvals (green when satisfied, amber with "N more required" when pending)
+
 ## [0.7.0] - 2026-07-15
 
 ### Added

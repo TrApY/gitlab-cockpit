@@ -84,6 +84,63 @@ class GitLabModelSerializationTest {
         assertTrue(mr.assignees.isEmpty())
         assertNull(mr.headPipeline)
         assertNull(mr.references)
+        // Merge-related fields (GLC-26) default when absent.
+        assertNull(mr.detailedMergeStatus)
+        assertNull(mr.createdAt)
+        assertNull(mr.mergedAt)
+        assertNull(mr.closedAt)
+        assertFalse(mr.squash)
+        assertNull(mr.forceRemoveSourceBranch)
+    }
+
+    @Test
+    fun `merge request parses the merge status dates squash and force_remove_source_branch`() {
+        val payload = """
+            {
+              "iid": 42,
+              "project_id": 100,
+              "title": "Mergeable MR",
+              "state": "merged",
+              "source_branch": "feature",
+              "target_branch": "main",
+              "web_url": "https://gitlab.com/g/r/-/merge_requests/42",
+              "updated_at": "2026-07-15T10:00:00Z",
+              "created_at": "2026-07-14T08:00:00Z",
+              "merged_at": "2026-07-15T09:59:00Z",
+              "closed_at": null,
+              "detailed_merge_status": "mergeable",
+              "squash": true,
+              "force_remove_source_branch": true,
+              "author": {"id": 1, "username": "jota", "name": "Jo Ta"}
+            }
+        """.trimIndent()
+
+        val mr = json.decodeFromString<GitLabMergeRequest>(payload)
+
+        assertEquals("mergeable", mr.detailedMergeStatus)
+        assertEquals("2026-07-14T08:00:00Z", mr.createdAt)
+        assertEquals("2026-07-15T09:59:00Z", mr.mergedAt)
+        assertNull(mr.closedAt)
+        assertTrue(mr.squash)
+        assertEquals(true, mr.forceRemoveSourceBranch)
+    }
+
+    @Test
+    fun `approvals parses approvals_required and approvals_left when present`() {
+        val approvals = json.decodeFromString<GitLabApprovals>(
+            """{"approvals_required": 2, "approvals_left": 1, "approved_by": []}""",
+        )
+
+        assertEquals(2, approvals.approvalsRequired)
+        assertEquals(1, approvals.approvalsLeft)
+    }
+
+    @Test
+    fun `approvals defaults approvals_required and approvals_left to null when absent`() {
+        val approvals = json.decodeFromString<GitLabApprovals>("""{"approved_by": []}""")
+
+        assertNull(approvals.approvalsRequired)
+        assertNull(approvals.approvalsLeft)
     }
 
     @Test

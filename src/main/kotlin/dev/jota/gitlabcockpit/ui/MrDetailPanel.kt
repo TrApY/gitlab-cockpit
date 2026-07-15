@@ -14,6 +14,7 @@ import com.intellij.ui.JBColor
 import com.intellij.ui.SearchTextField
 import com.intellij.ui.SimpleListCellRenderer
 import com.intellij.ui.components.ActionLink
+import com.intellij.ui.components.JBCheckBox
 import com.intellij.ui.components.JBLabel
 import com.intellij.ui.components.JBList
 import com.intellij.ui.components.JBScrollPane
@@ -30,14 +31,19 @@ import dev.jota.gitlabcockpit.api.GitLabMergeRequest
 import dev.jota.gitlabcockpit.api.GitLabResult
 import dev.jota.gitlabcockpit.api.GitLabUser
 import dev.jota.gitlabcockpit.api.MergeRequestUpdate
+import dev.jota.gitlabcockpit.core.ApprovalsHealth
 import dev.jota.gitlabcockpit.core.CockpitProjectService
 import dev.jota.gitlabcockpit.core.CommentThread
+import dev.jota.gitlabcockpit.core.MergeAction
 import dev.jota.gitlabcockpit.core.MrRef
 import dev.jota.gitlabcockpit.core.ReviewerSelectionModel
+import dev.jota.gitlabcockpit.core.approvalsHealth
 import dev.jota.gitlabcockpit.core.commentThreads
 import dev.jota.gitlabcockpit.core.filterMembers
+import dev.jota.gitlabcockpit.core.mergeButtonState
 import dev.jota.gitlabcockpit.core.projectWebUrlOf
 import dev.jota.gitlabcockpit.core.threadAnchorLabel
+import dev.jota.gitlabcockpit.settings.GitLabCockpitSettings
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.async
@@ -105,6 +111,9 @@ class MrDetailPanel(
     /** Recreated by [buildHeader]; updated by the async approvals load. */
     private var approvalsLabel: JBLabel? = null
     private var approvalButton: JButton? = null
+
+    /** Recreated by [buildHeader]; its state is fully derived from the MR (no async load needed). */
+    private var mergeButton: JButton? = null
 
     private val descriptionPane = CockpitHtml.createHtmlPane()
     private val descriptionScroll = JBScrollPane(descriptionPane)
@@ -305,6 +314,8 @@ class MrDetailPanel(
         reviewersLine.add(ActionLink(CockpitBundle.message("detail.edit")) { onEditReviewers(mr) })
         header.add(reviewersLine)
 
+        buildDatesLine(mr)?.let { header.add(it) }
+
         val approvalsLine = flowLine()
         val label = JBLabel(
             CockpitBundle.message("detail.approvedBy", CockpitBundle.message("detail.approvals.loading")),
@@ -314,9 +325,103 @@ class MrDetailPanel(
         approvalsLine.add(button)
         approvalsLabel = label
         approvalButton = button
+        approvalsLine.add(buildMergeButton(mr))
         header.add(approvalsLine)
 
         return header
+    }
+
+    /**
+     * The gray "Created … · Merged/Closed …" line, or null when the MR carries none of those
+     * timestamps (so no empty row is added). Merged and Closed are mutually exclusive in practice.
+     */
+    private fun buildDatesLine(mr: GitLabMergeRequest): JComponent? {
+        val parts = buildList {
+            mr.createdAt?.let { add(CockpitBundle.message("detail.dates.created", formatRelative(it))) }
+            mr.mergedAt?.let { add(CockpitBundle.message("detail.dates.merged", formatRelative(it))) }
+            mr.closedAt?.let { add(CockpitBundle.message("detail.dates.closed", formatRelative(it))) }
+        }
+        if (parts.isEmpty()) return null
+        val line = flowLine()
+        line.add(
+            JBLabel(parts.joinToString(DATE_SEPARATOR)).apply {
+                foreground = UIUtil.getContextHelpForeground()
+            },
+        )
+        return line
+    }
+
+    /**
+     * Builds the Merge button for [mr] from [mergeButtonState]: enabled for a mergeable MR (or a
+     * "when pipeline succeeds" variant), otherwise disabled with the blocker reason as a tooltip (no
+     * tooltip when there is no reason, e.g. an already merged/closed MR).
+     */
+    private fun buildMergeButton(mr: GitLabMergeRequest): JButton {
+        val button = JButton(CockpitBundle.message("detail.merge"))
+        val ref = MrRef(mr.projectId, mr.iid)
+        val state = mergeButtonState(mr.state, mr.detailedMergeStatus)
+        when (state.action) {
+            MergeAction.MERGE -> {
+                button.isEnabled = true
+                button.addActionListener { onMerge(ref, mr, mergeWhenPipelineSucceeds = false) }
+            }
+            MergeAction.MERGE_WHEN_PIPELINE_SUCCEEDS -> {
+                button.text = CockpitBundle.message("detail.merge.whenPipeline")
+                button.isEnabled = true
+                button.addActionListener { onMerge(ref, mr, mergeWhenPipelineSucceeds = true) }
+            }
+            MergeAction.DISABLED -> {
+                button.isEnabled = false
+                button.toolTipText = state.reasonKey?.let { CockpitBundle.message(it) }
+            }
+        }
+        mergeButton = button
+        return button
+    }
+
+    /**
+     * Opens the [MergeMrDialog] pre-checked from the remembered settings (falling back to the MR's own
+     * squash / remove-source-branch defaults), then merges in the background. On success the remembered
+     * options are updated (when the user opted in), the detail is reloaded and the list is refreshed.
+     */
+    private fun onMerge(ref: MrRef, mr: GitLabMergeRequest, mergeWhenPipelineSucceeds: Boolean) {
+        val settings = GitLabCockpitSettings.getInstance()
+        val squashDefault = settings.mergeSquash ?: mr.squash
+        val deleteDefault = settings.mergeDeleteSourceBranch ?: (mr.forceRemoveSourceBranch ?: false)
+        val dialog = MergeMrDialog(
+            project,
+            mr.sourceBranch,
+            mr.targetBranch,
+            squashDefault,
+            deleteDefault,
+            mergeWhenPipelineSucceeds,
+        )
+        if (!dialog.showAndGet()) return
+
+        val squash = dialog.squash
+        val removeSourceBranch = dialog.deleteSourceBranch
+        if (dialog.rememberOptions) {
+            settings.mergeSquash = squash
+            settings.mergeDeleteSourceBranch = removeSourceBranch
+        }
+
+        mergeButton?.isEnabled = false
+        service.coroutineScope.launch {
+            val result = service.merge(ref, squash, removeSourceBranch, mergeWhenPipelineSucceeds)
+            withContext(Dispatchers.EDT) {
+                if (currentRef != ref) return@withContext
+                when (result) {
+                    is GitLabResult.Success -> {
+                        loadDetail(ref)
+                        onListReloadRequested()
+                    }
+                    else -> {
+                        mergeButton?.isEnabled = true
+                        showError("detail.error.merge", result)
+                    }
+                }
+            }
+        }
     }
 
     // --- Approvals ----------------------------------------------------------------------------
@@ -344,8 +449,19 @@ class MrDetailPanel(
     /** EDT. Fills the approvals label and re-targets the Approve/Revoke button for [approvals]. */
     private fun renderApprovals(approvals: GitLabApprovals) {
         val names = approvals.approvedBy.joinToString(", ") { displayName(it.user) }
-        val display = names.ifEmpty { CockpitBundle.message("detail.approvals.none") }
-        approvalsLabel?.text = CockpitBundle.message("detail.approvedBy", display)
+        val left = approvals.approvalsLeft ?: 0
+        val display = buildString {
+            append(names.ifEmpty { CockpitBundle.message("detail.approvals.none") })
+            if (left > 0) append(" ").append(CockpitBundle.message("detail.approvals.left", left))
+        }
+        approvalsLabel?.let { label ->
+            label.text = CockpitBundle.message("detail.approvedBy", display)
+            label.foreground = when (approvalsHealth(approvals)) {
+                ApprovalsHealth.SATISFIED -> APPROVALS_SATISFIED_COLOR
+                ApprovalsHealth.PENDING -> APPROVALS_PENDING_COLOR
+                ApprovalsHealth.UNKNOWN -> UIUtil.getLabelForeground()
+            }
+        }
 
         val me = service.currentUser
         val approved = me != null && approvals.approvedBy.any { it.user.id == me.id }
@@ -867,10 +983,61 @@ class MrDetailPanel(
             userList.selectedValue?.let { listOf(it.id) } ?: emptyList()
     }
 
+    /**
+     * Merge confirmation dialog: a gray `source → target` summary and three checkboxes — Squash and
+     * Delete source branch (pre-checked by the caller) plus "Remember these options". For the
+     * merge-when-pipeline-succeeds action the OK button reads "Merge when pipeline succeeds"; the
+     * caller reads [squash] / [deleteSourceBranch] / [rememberOptions] after a confirmation.
+     */
+    private class MergeMrDialog(
+        project: Project,
+        private val sourceBranch: String,
+        private val targetBranch: String,
+        squashDefault: Boolean,
+        deleteDefault: Boolean,
+        mergeWhenPipelineSucceeds: Boolean,
+    ) : DialogWrapper(project) {
+
+        private val squashCheck = JBCheckBox(CockpitBundle.message("dialog.merge.squash"), squashDefault)
+        private val deleteCheck = JBCheckBox(CockpitBundle.message("dialog.merge.deleteSource"), deleteDefault)
+        private val rememberCheck = JBCheckBox(CockpitBundle.message("dialog.merge.remember"), false)
+
+        init {
+            title = CockpitBundle.message("dialog.merge.title")
+            init()
+            if (mergeWhenPipelineSucceeds) setOKButtonText(CockpitBundle.message("detail.merge.whenPipeline"))
+        }
+
+        override fun createCenterPanel(): JComponent {
+            val summary = JBLabel(CockpitBundle.message("dialog.merge.summary", sourceBranch, targetBranch)).apply {
+                foreground = UIUtil.getContextHelpForeground()
+            }
+            return FormBuilder.createFormBuilder()
+                .addComponent(summary)
+                .addComponent(squashCheck)
+                .addComponent(deleteCheck)
+                .addComponent(rememberCheck)
+                .panel
+        }
+
+        val squash: Boolean get() = squashCheck.isSelected
+        val deleteSourceBranch: Boolean get() = deleteCheck.isSelected
+        val rememberOptions: Boolean get() = rememberCheck.isSelected
+    }
+
     companion object {
         private const val COMMENTS_TAB_INDEX = 1
         private const val PIPELINES_TAB_INDEX = 2
         private const val CHANGES_TAB_INDEX = 3
+
+        /** Separator between the Overview date parts (a spaced middle dot U+00B7). */
+        private const val DATE_SEPARATOR = " · "
+
+        /** Green (light/dark) for a satisfied approvals line. */
+        private val APPROVALS_SATISFIED_COLOR = JBColor(0x2E7D32, 0x499C54)
+
+        /** Amber (light/dark) for a pending approvals line. */
+        private val APPROVALS_PENDING_COLOR = JBColor(0xB07800, 0xD6A243)
 
         /** Href scheme of a thread's Reply link; the discussion id follows the prefix. */
         private const val REPLY_LINK_PREFIX = "cockpit:reply:"

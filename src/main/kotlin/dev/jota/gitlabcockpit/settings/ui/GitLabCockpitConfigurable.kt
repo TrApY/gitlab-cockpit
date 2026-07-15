@@ -6,6 +6,7 @@ import com.intellij.openapi.options.Configurable
 import com.intellij.openapi.progress.ProgressIndicator
 import com.intellij.openapi.progress.ProgressManager
 import com.intellij.openapi.progress.Task
+import com.intellij.openapi.ui.ComboBox
 import com.intellij.ui.components.JBLabel
 import com.intellij.ui.components.JBPasswordField
 import com.intellij.ui.components.JBTextField
@@ -34,6 +35,9 @@ class GitLabCockpitConfigurable : Configurable {
     private val tokenField = JBPasswordField()
     private val resultLabel = JBLabel()
 
+    private val squashCombo = ComboBox(MergeDefault.values())
+    private val deleteSourceCombo = ComboBox(MergeDefault.values())
+
     override fun getDisplayName(): String = CockpitBundle.message("settings.displayName")
 
     override fun createComponent(): JComponent {
@@ -51,6 +55,14 @@ class GitLabCockpitConfigurable : Configurable {
                 button(CockpitBundle.message("settings.test.button")) { testConnection() }
                 cell(resultLabel)
             }
+            group(CockpitBundle.message("settings.merge.title")) {
+                row(CockpitBundle.message("settings.merge.squash.label")) {
+                    cell(squashCombo)
+                }
+                row(CockpitBundle.message("settings.merge.deleteSource.label")) {
+                    cell(deleteSourceCombo)
+                }
+            }
         }
         reset()
         return dialogPanel
@@ -64,7 +76,9 @@ class GitLabCockpitConfigurable : Configurable {
         val urlChanged = urlField.text != (instance?.baseUrl ?: "")
         // A non-empty token field always means the user typed a new token to save.
         val tokenChanged = tokenField.password.isNotEmpty()
-        return nameChanged || urlChanged || tokenChanged
+        val squashChanged = selectedMerge(squashCombo).value != settings.mergeSquash
+        val deleteChanged = selectedMerge(deleteSourceCombo).value != settings.mergeDeleteSourceBranch
+        return nameChanged || urlChanged || tokenChanged || squashChanged || deleteChanged
     }
 
     override fun apply() {
@@ -86,6 +100,10 @@ class GitLabCockpitConfigurable : Configurable {
         }
         // Never keep the token in the field; refresh the placeholder to reflect what is saved.
         resetTokenField(url)
+
+        settings.mergeSquash = selectedMerge(squashCombo).value
+        settings.mergeDeleteSourceBranch = selectedMerge(deleteSourceCombo).value
+
         resultLabel.text = ""
     }
 
@@ -94,8 +112,15 @@ class GitLabCockpitConfigurable : Configurable {
         nameField.text = instance?.name.orEmpty()
         urlField.text = instance?.baseUrl.orEmpty()
         resetTokenField(instance?.baseUrl.orEmpty())
+
+        squashCombo.selectedItem = MergeDefault.of(settings.mergeSquash)
+        deleteSourceCombo.selectedItem = MergeDefault.of(settings.mergeDeleteSourceBranch)
+
         resultLabel.text = ""
     }
+
+    private fun selectedMerge(combo: ComboBox<MergeDefault>): MergeDefault =
+        combo.selectedItem as? MergeDefault ?: MergeDefault.GITLAB_DEFAULT
 
     private fun resetTokenField(baseUrl: String) {
         tokenField.text = ""
@@ -144,5 +169,22 @@ class GitLabCockpitConfigurable : Configurable {
 
     private fun setResult(text: String) {
         resultLabel.text = text
+    }
+
+    /**
+     * The three choices of a merge-option combo, mapped to the tri-state [value] persisted by
+     * [GitLabCockpitSettings] (`null` = defer to the MR's GitLab default). [toString] renders the
+     * localized label, which the combo shows directly.
+     */
+    private enum class MergeDefault(private val labelKey: String, val value: Boolean?) {
+        GITLAB_DEFAULT("settings.merge.option.default", null),
+        ALWAYS_ON("settings.merge.option.on", true),
+        ALWAYS_OFF("settings.merge.option.off", false);
+
+        override fun toString(): String = CockpitBundle.message(labelKey)
+
+        companion object {
+            fun of(value: Boolean?): MergeDefault = values().first { it.value == value }
+        }
     }
 }
