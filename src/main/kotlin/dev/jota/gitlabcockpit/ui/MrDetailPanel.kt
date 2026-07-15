@@ -32,6 +32,7 @@ import dev.jota.gitlabcockpit.api.GitLabResult
 import dev.jota.gitlabcockpit.api.GitLabUser
 import dev.jota.gitlabcockpit.api.MergeRequestUpdate
 import dev.jota.gitlabcockpit.core.CockpitProjectService
+import dev.jota.gitlabcockpit.core.MrRef
 import dev.jota.gitlabcockpit.core.ReviewerSelectionModel
 import dev.jota.gitlabcockpit.core.filterMembers
 import kotlinx.coroutines.Dispatchers
@@ -65,7 +66,7 @@ import javax.swing.event.DocumentEvent
  *
  * Editing is done through modal dialogs; every network call (detail load, member load, update,
  * approvals, notes, approve/unapprove, comment) runs on the service's coroutine scope and only
- * touches the EDT to render. Stale results are dropped by re-checking [currentIid] on the EDT.
+ * touches the EDT to render. Stale results are dropped by re-checking [currentRef] on the EDT.
  *
  * @param onListReloadRequested called after a successful edit or approval change so the parent can
  * silently refresh the MR list (e.g. so the "reviewer, not approved" filter reflects the change).
@@ -76,15 +77,15 @@ class MrDetailPanel(
     private val onListReloadRequested: () -> Unit,
 ) : JPanel(BorderLayout()) {
 
-    /** iid of the MR currently displayed (or being loaded); null when showing the placeholder. */
-    var currentIid: Long? = null
+    /** Ref of the MR currently displayed (or being loaded); null when showing the placeholder. */
+    var currentRef: MrRef? = null
         private set
 
     private var detailJob: Job? = null
     private var notesJob: Job? = null
 
     /** The MR whose notes are loaded (or loading). Reset on every [showMr] so a refresh re-fetches. */
-    private var notesLoadedForIid: Long? = null
+    private var notesLoadedForRef: MrRef? = null
 
     /** Recreated by [buildHeader]; updated by the async approvals load. */
     private var approvalsLabel: JBLabel? = null
@@ -138,8 +139,8 @@ class MrDetailPanel(
         tabbedPane.addChangeListener {
             when (tabbedPane.selectedIndex) {
                 COMMENTS_TAB_INDEX -> {
-                    val iid = currentIid
-                    if (iid != null && notesLoadedForIid != iid) loadNotes(iid)
+                    val ref = currentRef
+                    if (ref != null && notesLoadedForRef != ref) loadNotes(ref)
                 }
                 PIPELINES_TAB_INDEX -> pipelinesPanel.onTabSelected()
                 CHANGES_TAB_INDEX -> changesPanel.onTabSelected()
@@ -152,22 +153,22 @@ class MrDetailPanel(
 
     /** EDT. Shows the "select an MR" placeholder and forgets the current selection. */
     fun showPlaceholder() {
-        currentIid = null
+        currentRef = null
         pipelinesPanel.clear()
         changesPanel.clear()
         setSingleMessage(CockpitBundle.message("detail.placeholder"))
     }
 
-    /** EDT. Kicks off a background detail load for [iid] and renders the result when it arrives. */
-    fun loadDetail(iid: Long) {
-        currentIid = iid
+    /** EDT. Kicks off a background detail load for [ref] and renders the result when it arrives. */
+    fun loadDetail(ref: MrRef) {
+        currentRef = ref
         commentArea.text = ""
         setSingleMessage(CockpitBundle.message("detail.loading"))
         detailJob?.cancel()
         detailJob = service.coroutineScope.launch {
-            val result = service.getMrDetail(iid)
+            val result = service.getMrDetail(ref)
             withContext(Dispatchers.EDT) {
-                if (currentIid != iid) return@withContext
+                if (currentRef != ref) return@withContext
                 when (result) {
                     is GitLabResult.Success -> showMr(result.data)
                     else -> setSingleMessage(CockpitBundle.message("detail.error.load", describe(result)))
@@ -178,7 +179,8 @@ class MrDetailPanel(
 
     /** EDT. Renders [mr] into the tabbed layout and kicks off the approvals (and lazy notes) loads. */
     private fun showMr(mr: GitLabMergeRequest) {
-        currentIid = mr.iid
+        val ref = MrRef(mr.projectId, mr.iid)
+        currentRef = ref
 
         headerContainer.removeAll()
         headerContainer.add(buildHeader(mr), BorderLayout.CENTER)
@@ -186,16 +188,16 @@ class MrDetailPanel(
 
         // Reset the comment thread for the (possibly refreshed) MR; it reloads lazily / on demand.
         notesJob?.cancel()
-        notesLoadedForIid = null
+        notesLoadedForRef = null
         notesPane.text = CockpitHtml.wrapHtml("")
         draftBanner.isVisible = false
         setCommentsTabTitle(null)
 
         // Rebind the Pipelines tab; it reloads lazily when shown (or now, if already selected).
-        pipelinesPanel.setMr(mr.iid, mr.sourceBranch, mr.headPipeline)
+        pipelinesPanel.setMr(ref, mr.sourceBranch, mr.headPipeline)
 
         // Rebind the Changes tab; it reloads lazily when shown (or now, if already selected).
-        changesPanel.setMr(mr.iid, mr.diffRefs)
+        changesPanel.setMr(ref, mr.diffRefs)
 
         if (tabbedPane.parent !== this) {
             removeAll()
@@ -204,8 +206,8 @@ class MrDetailPanel(
         revalidate()
         repaint()
 
-        loadApprovals(mr.iid)
-        if (tabbedPane.selectedIndex == COMMENTS_TAB_INDEX) loadNotes(mr.iid)
+        loadApprovals(ref)
+        if (tabbedPane.selectedIndex == COMMENTS_TAB_INDEX) loadNotes(ref)
         if (tabbedPane.selectedIndex == PIPELINES_TAB_INDEX) pipelinesPanel.onTabSelected()
         if (tabbedPane.selectedIndex == CHANGES_TAB_INDEX) changesPanel.onTabSelected()
     }
@@ -275,12 +277,12 @@ class MrDetailPanel(
 
     // --- Approvals ----------------------------------------------------------------------------
 
-    /** Fetches the fresh approval state and updates the approvals row (guarded by [currentIid]). */
-    private fun loadApprovals(iid: Long) {
+    /** Fetches the fresh approval state and updates the approvals row (guarded by [currentRef]). */
+    private fun loadApprovals(ref: MrRef) {
         service.coroutineScope.launch {
-            val result = service.getApprovalsFor(iid)
+            val result = service.getApprovalsFor(ref)
             withContext(Dispatchers.EDT) {
-                if (currentIid != iid) return@withContext
+                if (currentRef != ref) return@withContext
                 when (result) {
                     is GitLabResult.Success -> renderApprovals(result.data)
                     else -> {
@@ -307,20 +309,20 @@ class MrDetailPanel(
         button.text = CockpitBundle.message(if (approved) "detail.revokeApproval" else "detail.approve")
         button.isEnabled = me != null
         button.actionListeners.toList().forEach { button.removeActionListener(it) }
-        val iid = currentIid
-        if (iid != null) button.addActionListener { onToggleApproval(iid, approved) }
+        val ref = currentRef
+        if (ref != null) button.addActionListener { onToggleApproval(ref, approved) }
     }
 
     /** Approves or revokes in the background, then refreshes approvals and the list on success. */
-    private fun onToggleApproval(iid: Long, alreadyApproved: Boolean) {
+    private fun onToggleApproval(ref: MrRef, alreadyApproved: Boolean) {
         approvalButton?.isEnabled = false
         service.coroutineScope.launch {
-            val result = if (alreadyApproved) service.unapprove(iid) else service.approve(iid)
+            val result = if (alreadyApproved) service.unapprove(ref) else service.approve(ref)
             withContext(Dispatchers.EDT) {
-                if (currentIid != iid) return@withContext
+                if (currentRef != ref) return@withContext
                 when (result) {
                     is GitLabResult.Success -> {
-                        loadApprovals(iid)
+                        loadApprovals(ref)
                         onListReloadRequested()
                     }
                     else -> {
@@ -346,12 +348,12 @@ class MrDetailPanel(
     }
 
     /**
-     * Fetches the MR's notes in the background and renders them (guarded by [currentIid]). The pending
+     * Fetches the MR's notes in the background and renders them (guarded by [currentRef]). The pending
      * draft count is loaded in the same cycle (in parallel, non-blocking and non-fatal) to drive the
      * "pending draft notes" banner.
      */
-    private fun loadNotes(iid: Long) {
-        notesLoadedForIid = iid
+    private fun loadNotes(ref: MrRef) {
+        notesLoadedForRef = ref
         notesPane.text = CockpitHtml.wrapHtml(
             "<p><i>" + CockpitHtml.escapeHtml(CockpitBundle.message("detail.comment.loading")) + "</i></p>",
         )
@@ -359,17 +361,17 @@ class MrDetailPanel(
         notesJob?.cancel()
         notesJob = service.coroutineScope.launch {
             val (notesResult, draftsResult) = coroutineScope {
-                val notes = async { service.getNotes(iid) }
-                val drafts = async { service.getDraftNotes(iid) }
+                val notes = async { service.getNotes(ref) }
+                val drafts = async { service.getDraftNotes(ref) }
                 notes.await() to drafts.await()
             }
             withContext(Dispatchers.EDT) {
-                if (currentIid != iid) return@withContext
+                if (currentRef != ref) return@withContext
                 renderDraftBanner((draftsResult as? GitLabResult.Success)?.data?.size ?: 0)
                 when (notesResult) {
                     is GitLabResult.Success -> renderNotes(notesResult.data)
                     else -> {
-                        notesLoadedForIid = null
+                        notesLoadedForRef = null
                         notesPane.text = CockpitHtml.wrapHtml(
                             "<p><i>" +
                                 CockpitHtml.escapeHtml(CockpitBundle.message("detail.error.notes", describe(notesResult))) +
@@ -399,9 +401,9 @@ class MrDetailPanel(
      */
     private fun onReviewSubmitted() {
         draftBanner.isVisible = false
-        val iid = currentIid ?: return
-        notesLoadedForIid = null
-        if (tabbedPane.selectedIndex == COMMENTS_TAB_INDEX) loadNotes(iid)
+        val ref = currentRef ?: return
+        notesLoadedForRef = null
+        if (tabbedPane.selectedIndex == COMMENTS_TAB_INDEX) loadNotes(ref)
     }
 
     /** EDT. Renders the human notes as one themed HTML document and updates the tab counter. */
@@ -431,19 +433,19 @@ class MrDetailPanel(
 
     /** Posts the text area's content as a new comment, then clears it and reloads the thread. */
     private fun onSubmitComment() {
-        val iid = currentIid ?: return
+        val ref = currentRef ?: return
         val text = commentArea.text.trim()
         if (text.isEmpty()) return
         commentButton.isEnabled = false
         service.coroutineScope.launch {
-            val result = service.addNote(iid, text)
+            val result = service.addNote(ref, text)
             withContext(Dispatchers.EDT) {
                 commentButton.isEnabled = true
-                if (currentIid != iid) return@withContext
+                if (currentRef != ref) return@withContext
                 when (result) {
                     is GitLabResult.Success -> {
                         commentArea.text = ""
-                        loadNotes(iid)
+                        loadNotes(ref)
                     }
                     else -> showError("detail.error.comment", result)
                 }
@@ -481,33 +483,40 @@ class MrDetailPanel(
     private fun onEditTitleDescription(mr: GitLabMergeRequest) {
         val dialog = EditMrDialog(project, mr.title, mr.description.orEmpty())
         if (dialog.showAndGet()) {
-            applyUpdate(mr.iid, MergeRequestUpdate(title = dialog.editedTitle, description = dialog.editedDescription))
+            applyUpdate(
+                MrRef(mr.projectId, mr.iid),
+                MergeRequestUpdate(title = dialog.editedTitle, description = dialog.editedDescription),
+            )
         }
     }
 
     private fun onEditReviewers(mr: GitLabMergeRequest) {
-        withMembers { members ->
+        withMembers(mr.projectId) { members ->
             val dialog = EditReviewersDialog(project, members, mr.reviewers.map { it.id }.toSet())
             if (dialog.showAndGet()) {
-                applyUpdate(mr.iid, MergeRequestUpdate(reviewerIds = dialog.selectedIds()))
+                applyUpdate(MrRef(mr.projectId, mr.iid), MergeRequestUpdate(reviewerIds = dialog.selectedIds()))
             }
         }
     }
 
     private fun onEditAssignee(mr: GitLabMergeRequest) {
-        withMembers { members ->
+        withMembers(mr.projectId) { members ->
             val dialog = EditAssigneeDialog(project, members, mr.assignees.firstOrNull()?.id)
             if (dialog.showAndGet()) {
-                applyUpdate(mr.iid, MergeRequestUpdate(assigneeIds = dialog.selectedIds()))
+                applyUpdate(MrRef(mr.projectId, mr.iid), MergeRequestUpdate(assigneeIds = dialog.selectedIds()))
             }
         }
     }
 
-    /** Loads members off the EDT (with a wait cursor), then runs [onLoaded] on the EDT. */
-    private fun withMembers(onLoaded: (List<GitLabUser>) -> Unit) {
+    /**
+     * Loads [projectId]'s members off the EDT (with a wait cursor), then runs [onLoaded] on the EDT.
+     * The MR's own project id is used so, in the "All projects" mode, the picker lists the members of
+     * the MR's project rather than the git-resolved one.
+     */
+    private fun withMembers(projectId: Long, onLoaded: (List<GitLabUser>) -> Unit) {
         cursor = Cursor.getPredefinedCursor(Cursor.WAIT_CURSOR)
         service.coroutineScope.launch {
-            val result = service.getMembers()
+            val result = service.getMembers(projectId)
             withContext(Dispatchers.EDT) {
                 cursor = Cursor.getDefaultCursor()
                 when (result) {
@@ -519,13 +528,13 @@ class MrDetailPanel(
     }
 
     /** Runs the PUT off the EDT, then refreshes the detail and the list on success. */
-    private fun applyUpdate(iid: Long, update: MergeRequestUpdate) {
+    private fun applyUpdate(ref: MrRef, update: MergeRequestUpdate) {
         service.coroutineScope.launch {
-            val result = service.updateMr(iid, update)
+            val result = service.updateMr(ref, update)
             withContext(Dispatchers.EDT) {
                 when (result) {
                     is GitLabResult.Success -> {
-                        if (currentIid == iid) showMr(result.data)
+                        if (currentRef == ref) showMr(result.data)
                         onListReloadRequested()
                     }
                     else -> showError("detail.error.update", result)

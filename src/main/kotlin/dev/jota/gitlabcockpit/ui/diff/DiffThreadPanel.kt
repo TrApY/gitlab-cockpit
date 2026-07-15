@@ -19,6 +19,7 @@ import dev.jota.gitlabcockpit.api.GitLabDiscussionNote
 import dev.jota.gitlabcockpit.api.GitLabResult
 import dev.jota.gitlabcockpit.api.GitLabUser
 import dev.jota.gitlabcockpit.core.CockpitProjectService
+import dev.jota.gitlabcockpit.core.MrRef
 import dev.jota.gitlabcockpit.ui.CockpitHtml
 import dev.jota.gitlabcockpit.ui.MarkdownRenderer
 import dev.jota.gitlabcockpit.ui.formatRelative
@@ -55,7 +56,7 @@ import javax.swing.JPanel
 internal class DiffThreadPanel(
     private val project: Project,
     private val service: CockpitProjectService,
-    private val mrIid: Long,
+    private val mrRef: MrRef,
     discussion: GitLabDiscussion,
 ) : JPanel(BorderLayout()) {
 
@@ -234,7 +235,7 @@ internal class DiffThreadPanel(
         sendButton.isEnabled = false
         actionJob?.cancel()
         actionJob = service.coroutineScope.launch {
-            val result = service.replyToDiscussion(mrIid, discussionId, text)
+            val result = service.replyToDiscussion(mrRef, discussionId, text)
             withContext(Dispatchers.EDT) {
                 sendButton.isEnabled = true
                 when (result) {
@@ -261,7 +262,7 @@ internal class DiffThreadPanel(
         resolveLink.isEnabled = false
         actionJob?.cancel()
         actionJob = service.coroutineScope.launch {
-            val result = service.setDiscussionResolved(mrIid, discussionId, target)
+            val result = service.setDiscussionResolved(mrRef, discussionId, target)
             withContext(Dispatchers.EDT) {
                 resolveLink.isEnabled = true
                 when (result) {

@@ -23,6 +23,7 @@ import dev.jota.gitlabcockpit.api.GitLabJob
 import dev.jota.gitlabcockpit.api.GitLabPipeline
 import dev.jota.gitlabcockpit.api.GitLabResult
 import dev.jota.gitlabcockpit.core.CockpitProjectService
+import dev.jota.gitlabcockpit.core.MrRef
 import dev.jota.gitlabcockpit.core.StageGroup
 import dev.jota.gitlabcockpit.core.groupByStage
 import dev.jota.gitlabcockpit.core.isJobCancelable
@@ -68,7 +69,7 @@ private data class JobNodeData(val job: GitLabJob)
  *   failed jobs or retry / cancel / play / open a single job.
  *
  * All network calls run on the service's coroutine scope (never the EDT); results are marshaled back
- * with [Dispatchers.EDT] and dropped when stale (re-checking [currentIid] and the selected pipeline).
+ * with [Dispatchers.EDT] and dropped when stale (re-checking [currentRef] and the selected pipeline).
  * Pipelines load lazily the first time the tab is shown for an MR ([onTabSelected]) and again after
  * every detail refresh ([setMr]).
  */
@@ -77,8 +78,8 @@ class PipelinesPanel(
     private val service: CockpitProjectService,
 ) : JPanel(BorderLayout()) {
 
-    /** iid of the MR currently displayed; null when cleared. */
-    var currentIid: Long? = null
+    /** Ref of the MR currently displayed; null when cleared. */
+    var currentRef: MrRef? = null
         private set
 
     private var sourceBranch: String? = null
@@ -89,8 +90,8 @@ class PipelinesPanel(
      */
     private var headPipeline: GitLabPipeline? = null
 
-    /** The iid whose pipelines have been loaded, so the tab only reloads when it changes. */
-    private var loadedForIid: Long? = null
+    /** The ref whose pipelines have been loaded, so the tab only reloads when it changes. */
+    private var loadedForRef: MrRef? = null
 
     /** The pipeline whose jobs are shown (or loading); used to drop stale job loads. */
     private var selectedPipelineId: Long? = null
@@ -132,7 +133,7 @@ class PipelinesPanel(
         add(buildNorth(), BorderLayout.NORTH)
         add(JBScrollPane(tree), BorderLayout.CENTER)
 
-        refreshButton.addActionListener { currentIid?.let { loadPipelines(it) } }
+        refreshButton.addActionListener { currentRef?.let { loadPipelines(it) } }
         runButton.addActionListener { onRunPipeline() }
         retryPipelineButton.addActionListener { onRetryPipeline() }
         cancelPipelineButton.addActionListener { onCancelPipeline() }
@@ -188,11 +189,11 @@ class PipelinesPanel(
      * is the MR detail's `head_pipeline`, folded into the loaded list by [loadPipelines] so external
      * pipelines still show even when `/pipelines` returns nothing.
      */
-    fun setMr(iid: Long, branch: String, headPipeline: GitLabPipeline?) {
-        currentIid = iid
+    fun setMr(ref: MrRef, branch: String, headPipeline: GitLabPipeline?) {
+        currentRef = ref
         sourceBranch = branch
         this.headPipeline = headPipeline
-        loadedForIid = null
+        loadedForRef = null
         selectedPipelineId = null
         pipelinesJob?.cancel()
         jobsJob?.cancel()
@@ -205,10 +206,10 @@ class PipelinesPanel(
 
     /** Resets to the empty placeholder (no MR selected). */
     fun clear() {
-        currentIid = null
+        currentRef = null
         sourceBranch = null
         headPipeline = null
-        loadedForIid = null
+        loadedForRef = null
         selectedPipelineId = null
         pipelinesJob?.cancel()
         jobsJob?.cancel()
@@ -221,14 +222,14 @@ class PipelinesPanel(
 
     /** Called when the Pipelines tab becomes visible; loads pipelines the first time per MR. */
     fun onTabSelected() {
-        val iid = currentIid ?: return
-        if (loadedForIid != iid) loadPipelines(iid)
+        val ref = currentRef ?: return
+        if (loadedForRef != ref) loadPipelines(ref)
     }
 
     // --- Loading ------------------------------------------------------------------------------
 
-    private fun loadPipelines(iid: Long, preservePipelineId: Long? = null) {
-        loadedForIid = iid
+    private fun loadPipelines(ref: MrRef, preservePipelineId: Long? = null) {
+        loadedForRef = ref
         pendingSelectPipelineId = preservePipelineId
         runButton.isEnabled = true
         refreshButton.isEnabled = true
@@ -236,13 +237,13 @@ class PipelinesPanel(
         tree.emptyText.text = CockpitBundle.message("pipelines.loading")
         pipelinesJob?.cancel()
         pipelinesJob = service.coroutineScope.launch {
-            val result = service.getMrPipelines(iid)
+            val result = service.getMrPipelines(ref)
             withContext(Dispatchers.EDT) {
-                if (currentIid != iid) return@withContext
+                if (currentRef != ref) return@withContext
                 when (result) {
                     is GitLabResult.Success -> renderPipelines(mergeHeadPipeline(result.data, headPipeline))
                     else -> {
-                        loadedForIid = null
+                        loadedForRef = null
                         tree.emptyText.text = CockpitBundle.message("pipelines.error.pipelines", describe(result))
                     }
                 }
@@ -280,7 +281,7 @@ class PipelinesPanel(
     }
 
     private fun loadJobs(pipeline: GitLabPipeline) {
-        val iid = currentIid ?: return
+        val ref = currentRef ?: return
         rootNode.removeAllChildren()
         treeModel.reload()
         stageStrip.removeAll()
@@ -290,9 +291,9 @@ class PipelinesPanel(
         updatePipelineButtons(pipeline.status)
         jobsJob?.cancel()
         jobsJob = service.coroutineScope.launch {
-            val result = service.getPipelineJobs(pipeline.id)
+            val result = service.getPipelineJobs(ref.projectId, pipeline.id)
             withContext(Dispatchers.EDT) {
-                if (currentIid != iid || selectedPipelineId != pipeline.id) return@withContext
+                if (currentRef != ref || selectedPipelineId != pipeline.id) return@withContext
                 when (result) {
                     is GitLabResult.Success -> renderJobs(result.data)
                     else -> tree.emptyText.text = CockpitBundle.message("pipelines.error.jobs", describe(result))
@@ -356,7 +357,7 @@ class PipelinesPanel(
 
     private fun onRunPipeline() {
         val branch = sourceBranch ?: return
-        val iid = currentIid ?: return
+        val ref = currentRef ?: return
         val confirm = Messages.showYesNoDialog(
             project,
             CockpitBundle.message("pipelines.run.confirm", branch),
@@ -366,11 +367,11 @@ class PipelinesPanel(
         if (confirm != Messages.YES) return
         actionJob?.cancel()
         actionJob = service.coroutineScope.launch {
-            val result = service.createPipeline(branch)
+            val result = service.createPipeline(ref.projectId, branch)
             withContext(Dispatchers.EDT) {
-                if (currentIid != iid) return@withContext
+                if (currentRef != ref) return@withContext
                 when (result) {
-                    is GitLabResult.Success -> loadPipelines(iid) // newest pipeline selected
+                    is GitLabResult.Success -> loadPipelines(ref) // newest pipeline selected
                     else -> showActionError(result)
                 }
             }
@@ -378,15 +379,15 @@ class PipelinesPanel(
     }
 
     private fun onRetryPipeline() {
-        val iid = currentIid ?: return
+        val ref = currentRef ?: return
         val pipeline = pipelineCombo.selectedItem as? GitLabPipeline ?: return
         actionJob?.cancel()
         actionJob = service.coroutineScope.launch {
-            val result = service.retryPipeline(pipeline.id)
+            val result = service.retryPipeline(ref.projectId, pipeline.id)
             withContext(Dispatchers.EDT) {
-                if (currentIid != iid) return@withContext
+                if (currentRef != ref) return@withContext
                 when (result) {
-                    is GitLabResult.Success -> loadPipelines(iid, preservePipelineId = pipeline.id)
+                    is GitLabResult.Success -> loadPipelines(ref, preservePipelineId = pipeline.id)
                     else -> showActionError(result)
                 }
             }
@@ -394,35 +395,44 @@ class PipelinesPanel(
     }
 
     private fun onCancelPipeline() {
-        val iid = currentIid ?: return
+        val ref = currentRef ?: return
         val pipeline = pipelineCombo.selectedItem as? GitLabPipeline ?: return
         actionJob?.cancel()
         actionJob = service.coroutineScope.launch {
-            val result = service.cancelPipeline(pipeline.id)
+            val result = service.cancelPipeline(ref.projectId, pipeline.id)
             withContext(Dispatchers.EDT) {
-                if (currentIid != iid) return@withContext
+                if (currentRef != ref) return@withContext
                 when (result) {
-                    is GitLabResult.Success -> loadPipelines(iid, preservePipelineId = pipeline.id)
+                    is GitLabResult.Success -> loadPipelines(ref, preservePipelineId = pipeline.id)
                     else -> showActionError(result)
                 }
             }
         }
     }
 
-    private fun onRetryJob(job: GitLabJob) = runJobAction { service.retryJob(job.id) }
+    private fun onRetryJob(job: GitLabJob) {
+        val ref = currentRef ?: return
+        runJobAction { service.retryJob(ref.projectId, job.id) }
+    }
 
-    private fun onCancelJob(job: GitLabJob) = runJobAction { service.cancelJob(job.id) }
+    private fun onCancelJob(job: GitLabJob) {
+        val ref = currentRef ?: return
+        runJobAction { service.cancelJob(ref.projectId, job.id) }
+    }
 
-    private fun onPlayJob(job: GitLabJob) = runJobAction { service.playJob(job.id) }
+    private fun onPlayJob(job: GitLabJob) {
+        val ref = currentRef ?: return
+        runJobAction { service.playJob(ref.projectId, job.id) }
+    }
 
     /** Runs a single-job action, then reloads the current pipeline's jobs on success. */
     private fun runJobAction(action: suspend () -> GitLabResult<Unit>) {
-        val iid = currentIid ?: return
+        val ref = currentRef ?: return
         actionJob?.cancel()
         actionJob = service.coroutineScope.launch {
             val result = action()
             withContext(Dispatchers.EDT) {
-                if (currentIid != iid) return@withContext
+                if (currentRef != ref) return@withContext
                 when (result) {
                     is GitLabResult.Success -> reloadJobs()
                     else -> showActionError(result)
@@ -432,13 +442,13 @@ class PipelinesPanel(
     }
 
     private fun onRetryStage(stage: StageGroup) {
-        val iid = currentIid ?: return
+        val ref = currentRef ?: return
         val pipelineId = selectedPipelineId ?: return
         actionJob?.cancel()
         actionJob = service.coroutineScope.launch {
-            val result = service.retryStage(pipelineId, stage)
+            val result = service.retryStage(ref.projectId, pipelineId, stage)
             withContext(Dispatchers.EDT) {
-                if (currentIid != iid) return@withContext
+                if (currentRef != ref) return@withContext
                 val message = when {
                     result.retried == 0 && result.firstError == null ->
                         CockpitBundle.message("pipelines.retryStage.none", stage.name)
@@ -473,7 +483,8 @@ class PipelinesPanel(
 
     /** Opens the non-modal streaming log viewer for [job]. */
     private fun openJobLog(job: GitLabJob) {
-        JobLogDialog(project, service, job).show()
+        val ref = currentRef ?: return
+        JobLogDialog(project, service, ref.projectId, job).show()
     }
 
     /**
@@ -481,9 +492,10 @@ class PipelinesPanel(
      * stage opens the tabbed [StageLogsDialog]. An empty stage does nothing.
      */
     private fun openStageLogs(stage: StageGroup) {
+        val ref = currentRef ?: return
         when {
             stage.jobs.size == 1 -> openJobLog(stage.jobs.first())
-            stage.jobs.isNotEmpty() -> StageLogsDialog(project, service, stage).show()
+            stage.jobs.isNotEmpty() -> StageLogsDialog(project, service, ref.projectId, stage).show()
         }
     }
 

@@ -26,6 +26,7 @@ import javax.swing.JPanel
 class StageLogsDialog(
     project: Project,
     service: CockpitProjectService,
+    projectId: Long,
     private val stage: StageGroup,
 ) : DialogWrapper(project, false, IdeModalityType.MODELESS) {
 
@@ -36,7 +37,7 @@ class StageLogsDialog(
         title = CockpitBundle.message("log.stage.title", stage.name)
         cancelAction.putValue(Action.NAME, CockpitBundle.message("log.close"))
         stage.jobs.forEachIndexed { index, job ->
-            val console = JobLogConsole(project, service, job, disposable) { status ->
+            val console = JobLogConsole(project, service, projectId, job, disposable) { status ->
                 tabbedPane.setTitleAt(index, CockpitBundle.message("log.tab.title", job.name, status))
             }
             consoles.add(console)

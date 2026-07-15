@@ -67,6 +67,7 @@ class GitLabDiffModelSerializationTest {
             """
             {
               "iid": 42,
+              "project_id": 7,
               "title": "With refs",
               "state": "opened",
               "source_branch": "s",
@@ -86,6 +87,7 @@ class GitLabDiffModelSerializationTest {
             """
             {
               "iid": 7,
+              "project_id": 7,
               "title": "No refs",
               "state": "opened",
               "source_branch": "s",

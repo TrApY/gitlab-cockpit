@@ -22,6 +22,9 @@ class GitLabMergeRequestsApiTest {
     @Volatile
     private var receivedQuery: String? = null
 
+    @Volatile
+    private var receivedPath: String? = null
+
     private fun startServer(status: Int, body: String) {
         val srv = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
         srv.createContext("/api/v4/projects/123/merge_requests") { exchange: HttpExchange ->
@@ -30,6 +33,26 @@ class GitLabMergeRequestsApiTest {
             exchange.sendResponseHeaders(status, bytes.size.toLong())
             exchange.responseBody.use { it.write(bytes) }
         }
+        srv.start()
+        server = srv
+    }
+
+    /**
+     * Registers *both* the single-project (`/projects/:id/merge_requests`) and the instance-wide
+     * (`/merge_requests`) endpoints so a test can assert which one [GitLabApiClient.getMergeRequests]
+     * picks (and with which query) depending on `allProjects`.
+     */
+    private fun startDualServer(status: Int, body: String) {
+        val srv = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
+        val handler = com.sun.net.httpserver.HttpHandler { exchange: HttpExchange ->
+            receivedPath = exchange.requestURI.path
+            receivedQuery = exchange.requestURI.rawQuery
+            val bytes = body.toByteArray(StandardCharsets.UTF_8)
+            exchange.sendResponseHeaders(status, bytes.size.toLong())
+            exchange.responseBody.use { it.write(bytes) }
+        }
+        srv.createContext("/api/v4/projects/123/merge_requests", handler)
+        srv.createContext("/api/v4/merge_requests", handler)
         srv.start()
         server = srv
     }
@@ -48,6 +71,7 @@ class GitLabMergeRequestsApiTest {
             [
               {
                 "iid": 10,
+                "project_id": 123,
                 "title": "First",
                 "state": "opened",
                 "source_branch": "f1",
@@ -59,6 +83,7 @@ class GitLabMergeRequestsApiTest {
               },
               {
                 "iid": 11,
+                "project_id": 123,
                 "title": "Second",
                 "state": "opened",
                 "source_branch": "f2",
@@ -104,5 +129,33 @@ class GitLabMergeRequestsApiTest {
         assertTrue("no author_username, was: $query", !query.contains("author_username"))
         assertTrue("no reviewer_username, was: $query", !query.contains("reviewer_username"))
         assertTrue("no assignee_username, was: $query", !query.contains("assignee_username"))
+    }
+
+    @Test
+    fun `allProjects true hits the instance-wide endpoint with scope=all`() {
+        startDualServer(200, "[]")
+
+        val filter = MergeRequestQuery(state = "opened", authorUsername = "jota", allProjects = true)
+        val result = runBlocking { GitLabApiClient(baseUrl()) { "t" }.getMergeRequests(123, filter) }
+
+        assertTrue("expected Success but was $result", result is GitLabResult.Success)
+        assertEquals("/api/v4/merge_requests", receivedPath)
+        val query = receivedQuery ?: ""
+        assertTrue("scope=all param, was: $query", query.contains("scope=all"))
+        assertTrue("author_username param, was: $query", query.contains("author_username=jota"))
+        assertTrue("state param, was: $query", query.contains("state=opened"))
+    }
+
+    @Test
+    fun `allProjects false hits the single-project endpoint without scope`() {
+        startDualServer(200, "[]")
+
+        val filter = MergeRequestQuery(state = "opened", allProjects = false)
+        val result = runBlocking { GitLabApiClient(baseUrl()) { "t" }.getMergeRequests(123, filter) }
+
+        assertTrue("expected Success but was $result", result is GitLabResult.Success)
+        assertEquals("/api/v4/projects/123/merge_requests", receivedPath)
+        val query = receivedQuery ?: ""
+        assertTrue("no scope param, was: $query", !query.contains("scope"))
     }
 }

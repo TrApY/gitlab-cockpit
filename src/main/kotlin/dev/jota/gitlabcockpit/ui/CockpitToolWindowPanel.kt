@@ -17,6 +17,7 @@ import com.intellij.ui.SimpleListCellRenderer
 import com.intellij.ui.SimpleTextAttributes
 import com.intellij.ui.TextFieldWithAutoCompletion
 import com.intellij.ui.components.ActionLink
+import com.intellij.ui.components.JBCheckBox
 import com.intellij.ui.components.JBLabel
 import com.intellij.ui.components.JBList
 import com.intellij.ui.components.JBPanel
@@ -30,8 +31,10 @@ import dev.jota.gitlabcockpit.core.CockpitProjectService
 import dev.jota.gitlabcockpit.core.CockpitState
 import dev.jota.gitlabcockpit.core.MergeRequestState
 import dev.jota.gitlabcockpit.core.MrFilterSelection
+import dev.jota.gitlabcockpit.core.MrRef
 import dev.jota.gitlabcockpit.core.PipelineWatcher
 import dev.jota.gitlabcockpit.core.RoleFilter
+import dev.jota.gitlabcockpit.core.projectLabelOf
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -93,6 +96,14 @@ class CockpitToolWindowPanel(
         selectedItem = MergeRequestState.OPENED
     }
 
+    /**
+     * "All projects" toggle: when checked, the list shows the current user's (or the filtered user's)
+     * MRs across the whole GitLab instance instead of only the git-resolved project. The role [ALL] is
+     * not meaningful instance-wide, so enabling this with [RoleFilter.ALL] selected flips the role to
+     * [RoleFilter.I_AM_AUTHOR] (see the listeners below).
+     */
+    private val allProjectsCheckBox = JBCheckBox(CockpitBundle.message("toolwindow.filter.allProjects"))
+
     private val refreshButton = JButton(AllIcons.Actions.Refresh).apply {
         toolTipText = CockpitBundle.message("toolwindow.refresh")
     }
@@ -110,9 +121,12 @@ class CockpitToolWindowPanel(
 
     private val listModel = CollectionListModel<GitLabMergeRequest>()
 
+    /** Shared row renderer; its [MrCellRenderer.showProject] is toggled by [render] per loaded mode. */
+    private val mrCellRenderer = MrCellRenderer()
+
     private val mrList = JBList(listModel).apply {
         selectionMode = ListSelectionModel.SINGLE_SELECTION
-        cellRenderer = MrCellRenderer()
+        cellRenderer = mrCellRenderer
     }
 
     private val detailPanel = MrDetailPanel(project, service, onListReloadRequested = { reloadSilently() })
@@ -134,7 +148,7 @@ class CockpitToolWindowPanel(
             if (!visible) continue
             val selection = withContext(Dispatchers.EDT) { currentSelection() }
             val state = service.loadMergeRequests(selection)
-            withContext(Dispatchers.EDT) { render(state) }
+            withContext(Dispatchers.EDT) { render(state, selection.allProjects) }
             maybeWatch(state)
         }
     }
@@ -149,11 +163,26 @@ class CockpitToolWindowPanel(
         }
 
         roleCombo.addActionListener {
+            // In "All projects" mode the ALL role is not valid; bounce it to I_AM_AUTHOR. Setting the
+            // combo re-enters this listener with the new role, which performs the actual reload.
+            if (allProjectsCheckBox.isSelected && roleCombo.selectedItem == RoleFilter.ALL) {
+                roleCombo.selectedItem = RoleFilter.I_AM_AUTHOR
+                return@addActionListener
+            }
             val byUser = roleCombo.selectedItem == RoleFilter.BY_USER
             userField.isVisible = byUser
             userField.parent?.revalidate()
             if (byUser) ensureUserCandidatesLoaded()
             reload(invalidateCache = false)
+        }
+        allProjectsCheckBox.addActionListener {
+            // Enabling global mode while ALL is selected switches the role (its own listener reloads);
+            // any other toggle reloads directly.
+            if (allProjectsCheckBox.isSelected && roleCombo.selectedItem == RoleFilter.ALL) {
+                roleCombo.selectedItem = RoleFilter.I_AM_AUTHOR
+            } else {
+                reload(invalidateCache = false)
+            }
         }
         stateCombo.addActionListener { reload(invalidateCache = false) }
         userField.addDocumentListener(object : DocumentListener {
@@ -177,6 +206,7 @@ class CockpitToolWindowPanel(
         toolbar.add(userField)
         toolbar.add(JBLabel(CockpitBundle.message("toolwindow.filter.state.label")))
         toolbar.add(stateCombo)
+        toolbar.add(allProjectsCheckBox)
         toolbar.add(refreshButton)
         toolbar.add(projectLink)
         return toolbar
@@ -205,6 +235,7 @@ class CockpitToolWindowPanel(
         role = roleCombo.selectedItem as? RoleFilter ?: RoleFilter.ALL,
         state = stateCombo.selectedItem as? MergeRequestState ?: MergeRequestState.OPENED,
         username = userField.text,
+        allProjects = allProjectsCheckBox.isSelected,
     )
 
     /** Runs on the EDT (event handlers / init). Shows Loading, then loads off the EDT. */
@@ -215,12 +246,12 @@ class CockpitToolWindowPanel(
             userCandidatesLoaded = false
             if (userField.isVisible) ensureUserCandidatesLoaded()
         }
-        render(CockpitState.Loading)
         val selection = currentSelection()
+        render(CockpitState.Loading, selection.allProjects)
         loadJob?.cancel()
         loadJob = service.coroutineScope.launch {
             val state = service.loadMergeRequests(selection)
-            withContext(Dispatchers.EDT) { render(state) }
+            withContext(Dispatchers.EDT) { render(state, selection.allProjects) }
             maybeWatch(state)
         }
     }
@@ -234,7 +265,7 @@ class CockpitToolWindowPanel(
         loadJob?.cancel()
         loadJob = service.coroutineScope.launch {
             val state = service.loadMergeRequests(selection)
-            withContext(Dispatchers.EDT) { render(state) }
+            withContext(Dispatchers.EDT) { render(state, selection.allProjects) }
             maybeWatch(state)
         }
     }
@@ -258,7 +289,7 @@ class CockpitToolWindowPanel(
         if (userCandidatesLoaded) return
         userCandidatesLoaded = true
         service.coroutineScope.launch {
-            val result = service.getMembers()
+            val result = service.getResolvedMembers()
             withContext(Dispatchers.EDT) {
                 if (result is GitLabResult.Success) {
                     userField.setVariants(result.data)
@@ -274,13 +305,15 @@ class CockpitToolWindowPanel(
         val selected = mrList.selectedValue
         when {
             selected == null -> detailPanel.showPlaceholder()
-            selected.iid != detailPanel.currentIid -> detailPanel.loadDetail(selected.iid)
+            MrRef(selected.projectId, selected.iid) != detailPanel.currentRef ->
+                detailPanel.loadDetail(MrRef(selected.projectId, selected.iid))
             // Same MR already shown → leave the detail untouched.
         }
     }
 
-    /** Must be called on the EDT. */
-    private fun render(state: CockpitState) {
+    /** Must be called on the EDT. [showProject] mirrors the load's "All projects" mode for the rows. */
+    private fun render(state: CockpitState, showProject: Boolean) {
+        mrCellRenderer.showProject = showProject
         if (state is CockpitState.Ready) renderProjectLink(state.glProject.pathWithNamespace, state.glProject.webUrl)
         else hideProjectLink()
         when (state) {
@@ -293,11 +326,13 @@ class CockpitToolWindowPanel(
             is CockpitState.Error ->
                 showMessage(state.message)
             is CockpitState.Ready -> {
-                val previousIid = mrList.selectedValue?.iid
+                val previousRef = mrList.selectedValue?.let { MrRef(it.projectId, it.iid) }
                 mrList.emptyText.text = CockpitBundle.message("toolwindow.empty.noMrs")
                 suppressSelectionEvents = true
                 listModel.replaceAll(state.mrs)
-                val restoreIndex = previousIid?.let { iid -> state.mrs.indexOfFirst { it.iid == iid } } ?: -1
+                val restoreIndex = previousRef?.let { ref ->
+                    state.mrs.indexOfFirst { MrRef(it.projectId, it.iid) == ref }
+                } ?: -1
                 if (restoreIndex >= 0) mrList.selectedIndex = restoreIndex
                 suppressSelectionEvents = false
                 reconcileDetailWithSelection()
@@ -331,6 +366,10 @@ class CockpitToolWindowPanel(
     }
 
     private class MrCellRenderer : ColoredListCellRenderer<GitLabMergeRequest>() {
+
+        /** When true (the "All projects" mode), each row is prefixed with its `group/project` label. */
+        var showProject: Boolean = false
+
         override fun customizeCellRenderer(
             list: javax.swing.JList<out GitLabMergeRequest>,
             value: GitLabMergeRequest,
@@ -343,6 +382,11 @@ class CockpitToolWindowPanel(
                     CockpitBundle.message("toolwindow.mr.draft") + " ",
                     SimpleTextAttributes.GRAYED_ATTRIBUTES,
                 )
+            }
+            if (showProject) {
+                projectLabelOf(value)?.let { label ->
+                    append("$label  ", SimpleTextAttributes.GRAYED_ATTRIBUTES)
+                }
             }
             append(value.title)
             append("  !${value.iid} ", SimpleTextAttributes.GRAYED_ATTRIBUTES)

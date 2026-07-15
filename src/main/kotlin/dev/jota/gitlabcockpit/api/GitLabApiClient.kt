@@ -46,6 +46,12 @@ data class GitLabProject(
 @Serializable
 data class GitLabMergeRequest(
     val iid: Long,
+    /**
+     * The id of the project the MR lives in. Both the list and the detail endpoints return it; it is
+     * the missing half of an MR's identity in the "All projects" mode, where MRs from many projects
+     * share the same [iid] space (see [dev.jota.gitlabcockpit.core.MrRef]).
+     */
+    @SerialName("project_id") val projectId: Long,
     val title: String,
     val state: String,
     @SerialName("source_branch") val sourceBranch: String,
@@ -72,6 +78,22 @@ data class GitLabMergeRequest(
      * [dev.jota.gitlabcockpit.core.mergeHeadPipeline]).
      */
     @SerialName("head_pipeline") val headPipeline: GitLabPipeline? = null,
+    /**
+     * The MR's reference block. Its [GitLabReferences.full] (`group/project!iid`) is the primary
+     * source for the "All projects" row label; it is nullable because older GitLab versions (or a
+     * trimmed payload) may omit it, in which case the label is derived from [webUrl] instead (see
+     * [dev.jota.gitlabcockpit.core.projectLabelOf]).
+     */
+    val references: GitLabReferences? = null,
+)
+
+/**
+ * The `references` block of a merge request. Only [full] (the fully-qualified reference,
+ * `group/project!iid`) is modeled — the short/relative variants are ignored by the configured [Json].
+ */
+@Serializable
+data class GitLabReferences(
+    @SerialName("full") val full: String,
 )
 
 /**
@@ -289,13 +311,15 @@ private data class DiscussionResolveBody(val resolved: Boolean)
 /**
  * Server-side query for [GitLabApiClient.getMergeRequests]. `state` is one of
  * `opened` / `merged` / `closed` / `all`; the username filters are optional and only added to
- * the request when non-null.
+ * the request when non-null. When [allProjects] is set the query targets the instance-wide
+ * `/merge_requests` endpoint (with `scope=all`) instead of a single project's list.
  */
 data class MergeRequestQuery(
     val state: String = "opened",
     val authorUsername: String? = null,
     val reviewerUsername: String? = null,
     val assigneeUsername: String? = null,
+    val allProjects: Boolean = false,
 )
 
 /**
@@ -363,7 +387,13 @@ class GitLabApiClient(
         return get("/projects/$encoded", emptyList(), GitLabProject.serializer())
     }
 
-    /** Calls `GET /projects/:id/merge_requests` with the [filter] mapped to query params. */
+    /**
+     * Lists merge requests. When [filter] has `allProjects = false` this calls
+     * `GET /projects/:id/merge_requests` for the single [projectId]; when it is set it calls the
+     * instance-wide `GET /merge_requests` with `scope=all` (so it is not limited to the current
+     * user's own MRs), still narrowed by the same state/username params. [projectId] is ignored in
+     * the global case.
+     */
     suspend fun getMergeRequests(
         projectId: Long,
         filter: MergeRequestQuery,
@@ -372,12 +402,14 @@ class GitLabApiClient(
             add("state" to filter.state)
             add("per_page" to "50")
             add("order_by" to "updated_at")
+            if (filter.allProjects) add("scope" to "all")
             filter.authorUsername?.let { add("author_username" to it) }
             filter.reviewerUsername?.let { add("reviewer_username" to it) }
             filter.assigneeUsername?.let { add("assignee_username" to it) }
         }
+        val path = if (filter.allProjects) "/merge_requests" else "/projects/$projectId/merge_requests"
         return get(
-            "/projects/$projectId/merge_requests",
+            path,
             query,
             ListSerializer(GitLabMergeRequest.serializer()),
         )

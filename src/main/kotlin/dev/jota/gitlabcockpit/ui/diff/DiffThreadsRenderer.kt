@@ -53,7 +53,7 @@ internal class DiffThreadsRenderer(
                 document.getLineStartOffset((anchor.line - 1).coerceIn(0, document.lineCount - 1))
             }
 
-            val panels = discussions.map { DiffThreadPanel(project, service, diffContext.mrIid, it) }
+            val panels = discussions.map { DiffThreadPanel(project, service, diffContext.mrRef, it) }
             val group = JPanel(VerticalLayout(JBUI.scale(4))).apply {
                 isOpaque = false
                 border = JBUI.Borders.empty(2, 10)

@@ -43,6 +43,7 @@ import javax.swing.JComponent
 class JobLogConsole(
     private val project: Project,
     private val service: CockpitProjectService,
+    private val projectId: Long,
     private val job: GitLabJob,
     parentDisposable: Disposable,
     private val onStatusChange: ((String) -> Unit)? = null,
@@ -65,7 +66,7 @@ class JobLogConsole(
     fun start() {
         streamJob = service.coroutineScope.launch {
             var offset = 0L
-            when (val first = service.getJobTrace(job.id, 0L)) {
+            when (val first = service.getJobTrace(projectId, job.id, 0L)) {
                 is GitLabResult.Success -> {
                     printNormal(first.data.content)
                     offset = first.data.nextOffset
@@ -84,7 +85,7 @@ class JobLogConsole(
             while (isActive) {
                 delay(POLL_INTERVAL_MS)
                 iteration++
-                when (val chunk = service.getJobTrace(job.id, offset)) {
+                when (val chunk = service.getJobTrace(projectId, job.id, offset)) {
                     is GitLabResult.Success -> {
                         consecutiveFailures = 0
                         if (chunk.data.content.isNotEmpty()) printNormal(chunk.data.content)
@@ -101,10 +102,10 @@ class JobLogConsole(
                     }
                 }
                 if (iteration % STATUS_POLL_EVERY == 0) {
-                    val jobResult = service.getJob(job.id)
+                    val jobResult = service.getJob(projectId, job.id)
                     if (jobResult is GitLabResult.Success && !isJobCancelable(jobResult.data.status)) {
                         // Final trace pass to capture the tail written after the last poll, then stop.
-                        val tail = service.getJobTrace(job.id, offset)
+                        val tail = service.getJobTrace(projectId, job.id, offset)
                         if (tail is GitLabResult.Success && tail.data.content.isNotEmpty()) {
                             printNormal(tail.data.content)
                         }

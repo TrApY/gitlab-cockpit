@@ -57,6 +57,7 @@ import dev.jota.gitlabcockpit.core.CockpitProjectService
 import dev.jota.gitlabcockpit.core.DiffLineMap
 import dev.jota.gitlabcockpit.core.FileNode
 import dev.jota.gitlabcockpit.core.LinePosition
+import dev.jota.gitlabcockpit.core.MrRef
 import dev.jota.gitlabcockpit.core.buildLineMap
 import dev.jota.gitlabcockpit.core.changeTypeOf
 import dev.jota.gitlabcockpit.core.buildFileTree
@@ -95,7 +96,7 @@ import javax.swing.tree.TreeSelectionModel
  * Diffs and discussions load lazily the first time the tab is shown for an MR ([onTabSelected]) and
  * are re-fetched after every detail refresh ([setMr]). Every network call runs on the service's
  * coroutine scope (never the EDT); results are marshaled with [Dispatchers.EDT] and dropped when
- * stale (re-checking [currentIid]).
+ * stale (re-checking [currentRef]).
  *
  * The bottom half also hosts the F4b "Pending review" section (the MR's unpublished draft notes,
  * with per-row delete plus Submit review / Refresh) and a per-thread Resolve/Unresolve action.
@@ -112,15 +113,15 @@ class ChangesPanel(
     private val onReviewSubmitted: () -> Unit,
 ) : JPanel(BorderLayout()) {
 
-    /** iid of the MR currently displayed; null when cleared. */
-    var currentIid: Long? = null
+    /** Ref of the MR currently displayed; null when cleared. */
+    var currentRef: MrRef? = null
         private set
 
     /** The MR's diff SHAs; needed to open a diff. Null until the detail is bound (or if absent). */
     private var diffRefs: DiffRefs? = null
 
-    /** The iid whose changes have been loaded, so the tab only reloads when it changes. */
-    private var loadedForIid: Long? = null
+    /** The ref whose changes have been loaded, so the tab only reloads when it changes. */
+    private var loadedForRef: MrRef? = null
 
     /** Diff discussions grouped by file path; read by the tree renderer and the comments panel. */
     private var discussionsByFilePath: Map<String, List<GitLabDiscussion>> = emptyMap()
@@ -184,7 +185,7 @@ class ChangesPanel(
     private val draftsRowsPanel = JPanel(VerticalLayout(JBUI.scale(2)))
     private val submitButton = JButton().apply { addActionListener { onSubmitReview() } }
     private val refreshButton = JButton(CockpitBundle.message("changes.pending.refresh")).apply {
-        addActionListener { currentIid?.let { reloadDrafts(it) } }
+        addActionListener { currentRef?.let { reloadDrafts(it) } }
     }
     private val pendingReviewPanel = JPanel(BorderLayout())
 
@@ -292,11 +293,11 @@ class ChangesPanel(
 
     // --- Lifecycle called by MrDetailPanel ----------------------------------------------------
 
-    /** Binds this tab to [iid] / [refs] and marks the changes as needing a (re)load. */
-    fun setMr(iid: Long, refs: DiffRefs?) {
-        currentIid = iid
+    /** Binds this tab to [ref] / [refs] and marks the changes as needing a (re)load. */
+    fun setMr(ref: MrRef, refs: DiffRefs?) {
+        currentRef = ref
         diffRefs = refs
-        loadedForIid = null
+        loadedForRef = null
         cancelJobs()
         clearContent()
         onFileCountChanged(null)
@@ -305,9 +306,9 @@ class ChangesPanel(
 
     /** Resets to the empty placeholder (no MR selected). */
     fun clear() {
-        currentIid = null
+        currentRef = null
         diffRefs = null
-        loadedForIid = null
+        loadedForRef = null
         cancelJobs()
         clearContent()
         onFileCountChanged(null)
@@ -316,8 +317,8 @@ class ChangesPanel(
 
     /** Called when the Changes tab becomes visible; loads the changes the first time per MR. */
     fun onTabSelected() {
-        val iid = currentIid ?: return
-        if (loadedForIid != iid) load(iid)
+        val ref = currentRef ?: return
+        if (loadedForRef != ref) load(ref)
     }
 
     private fun cancelJobs() {
@@ -353,21 +354,21 @@ class ChangesPanel(
     // --- Loading ------------------------------------------------------------------------------
 
     /** Loads the MR's diffs and discussions in parallel, then renders the tree. */
-    private fun load(iid: Long) {
-        loadedForIid = iid
+    private fun load(ref: MrRef) {
+        loadedForRef = ref
         clearContent()
         onFileCountChanged(null)
         tree.emptyText.text = CockpitBundle.message("changes.loading")
         loadJob?.cancel()
         loadJob = service.coroutineScope.launch {
             val (diffsResult, discussionsResult, draftsResult) = coroutineScope {
-                val diffs = async { service.getMrDiffs(iid) }
-                val discussions = async { service.getMrDiscussions(iid) }
-                val drafts = async { service.getDraftNotes(iid) }
+                val diffs = async { service.getMrDiffs(ref) }
+                val discussions = async { service.getMrDiscussions(ref) }
+                val drafts = async { service.getDraftNotes(ref) }
                 Triple(diffs.await(), discussions.await(), drafts.await())
             }
             withContext(Dispatchers.EDT) {
-                if (currentIid != iid) return@withContext
+                if (currentRef != ref) return@withContext
                 // Drafts are non-fatal too: an error just hides the "Pending review" section.
                 renderDrafts((draftsResult as? GitLabResult.Success)?.data ?: emptyList())
                 when (diffsResult) {
@@ -378,7 +379,7 @@ class ChangesPanel(
                         renderFiles(diffsResult.data)
                     }
                     else -> {
-                        loadedForIid = null
+                        loadedForRef = null
                         tree.emptyText.text = CockpitBundle.message("changes.error.diffs", describe(diffsResult))
                         onFileCountChanged(null)
                     }
@@ -416,7 +417,7 @@ class ChangesPanel(
      * assembled and shown on the EDT. A missing `diff_refs` is a hard error (nothing to anchor to).
      */
     private fun openDiff(file: GitLabDiffFile) {
-        val iid = currentIid ?: return
+        val ref = currentRef ?: return
         val refs = diffRefs
         if (refs == null) {
             Messages.showErrorDialog(
@@ -428,10 +429,10 @@ class ChangesPanel(
         }
         diffJob?.cancel()
         diffJob = service.coroutineScope.launch {
-            val oldSide = if (file.newFile) SideText("") else loadSide(file.oldPath, refs.baseSha)
-            val newSide = if (file.deletedFile) SideText("") else loadSide(file.newPath, refs.headSha)
+            val oldSide = if (file.newFile) SideText("") else loadSide(ref.projectId, file.oldPath, refs.baseSha)
+            val newSide = if (file.deletedFile) SideText("") else loadSide(ref.projectId, file.newPath, refs.headSha)
             withContext(Dispatchers.EDT) {
-                if (currentIid != iid) return@withContext
+                if (currentRef != ref) return@withContext
                 if (oldSide == null || newSide == null) {
                     Messages.showErrorDialog(
                         project,
@@ -440,7 +441,7 @@ class ChangesPanel(
                     )
                     return@withContext
                 }
-                showDiff(iid, file, refs, oldSide.text, newSide.text)
+                showDiff(ref, file, refs, oldSide.text, newSide.text)
             }
         }
     }
@@ -449,12 +450,12 @@ class ChangesPanel(
     private class SideText(val text: String)
 
     /**
-     * Fetches one diff side. A `404` (or any HTTP error — e.g. the old side of a renamed file that
-     * did not exist under that path) resolves to empty text so the diff still opens; a transport
-     * failure returns null so the caller can report it.
+     * Fetches one diff side from [projectId]'s repository. A `404` (or any HTTP error — e.g. the old
+     * side of a renamed file that did not exist under that path) resolves to empty text so the diff
+     * still opens; a transport failure returns null so the caller can report it.
      */
-    private suspend fun loadSide(path: String, ref: String): SideText? =
-        when (val result = service.getRawFile(path, ref)) {
+    private suspend fun loadSide(projectId: Long, path: String, ref: String): SideText? =
+        when (val result = service.getRawFile(projectId, path, ref)) {
             is GitLabResult.Success -> SideText(result.data)
             is GitLabResult.HttpError -> SideText("")
             is GitLabResult.NetworkError -> null
@@ -471,13 +472,13 @@ class ChangesPanel(
      * threads inline in the diff editors. Threads created via "Comment on line…" show up the next
      * time the diff is opened (the discussions are reloaded after posting).
      */
-    private fun showDiff(iid: Long, file: GitLabDiffFile, refs: DiffRefs, oldText: String, newText: String) {
+    private fun showDiff(ref: MrRef, file: GitLabDiffFile, refs: DiffRefs, oldText: String, newText: String) {
         val displayPath = if (file.deletedFile) file.oldPath else file.newPath
         val fileName = displayPath.substringAfterLast('/')
         val fileType = FileTypeManager.getInstance().getFileTypeByFileName(fileName)
         val factory = DiffContentFactory.getInstance()
         val request = SimpleDiffRequest(
-            CockpitBundle.message("changes.diff.title", iid, displayPath),
+            CockpitBundle.message("changes.diff.title", ref.iid, displayPath),
             factory.create(project, oldText, fileType),
             factory.create(project, newText, fileType),
             CockpitBundle.message("changes.diff.base"),
@@ -497,7 +498,7 @@ class ChangesPanel(
         val fileDiscussions =
             (discussionsByFilePath[file.newPath].orEmpty() + discussionsByFilePath[file.oldPath].orEmpty())
                 .distinctBy { it.id }
-        request.putUserData(CockpitDiffContext.KEY, CockpitDiffContext(iid, file, refs, fileDiscussions))
+        request.putUserData(CockpitDiffContext.KEY, CockpitDiffContext(ref, file, refs, fileDiscussions))
         DiffManager.getInstance().showDiff(project, request)
     }
 
@@ -544,20 +545,20 @@ class ChangesPanel(
 
     /** Posts the reply-box text to the selected thread, then reloads the MR's discussions. */
     private fun onReply() {
-        val iid = currentIid ?: return
+        val ref = currentRef ?: return
         val discussion = discussionList.selectedValue ?: return
         val text = replyArea.text.trim()
         if (text.isEmpty()) return
         replyButton.isEnabled = false
         replyJob?.cancel()
         replyJob = service.coroutineScope.launch {
-            val result = service.replyToDiscussion(iid, discussion.id, text)
+            val result = service.replyToDiscussion(ref, discussion.id, text)
             withContext(Dispatchers.EDT) {
-                if (currentIid != iid) return@withContext
+                if (currentRef != ref) return@withContext
                 when (result) {
                     is GitLabResult.Success -> {
                         replyArea.text = ""
-                        reloadDiscussions(iid, selectedFilePath, discussion.id)
+                        reloadDiscussions(ref, selectedFilePath, discussion.id)
                     }
                     else -> {
                         replyButton.isEnabled = discussionList.selectedValue != null
@@ -573,12 +574,12 @@ class ChangesPanel(
     }
 
     /** Re-fetches the MR's discussions (diffs unchanged), refreshing tree badges and the panel. */
-    private fun reloadDiscussions(iid: Long, keepFilePath: String?, keepDiscussionId: String?) {
+    private fun reloadDiscussions(ref: MrRef, keepFilePath: String?, keepDiscussionId: String?) {
         discussionsJob?.cancel()
         discussionsJob = service.coroutineScope.launch {
-            val result = service.getMrDiscussions(iid)
+            val result = service.getMrDiscussions(ref)
             withContext(Dispatchers.EDT) {
-                if (currentIid != iid) return@withContext
+                if (currentRef != ref) return@withContext
                 val discussions = (result as? GitLabResult.Success)?.data ?: emptyList()
                 discussionsByFilePath = discussionsByFile(discussions)
                 tree.repaint()
@@ -649,7 +650,7 @@ class ChangesPanel(
 
     /** Parses [file]'s diff into a line-map and shows the [NewThreadDialog]; posts on OK. */
     private fun openNewThreadDialog(file: GitLabDiffFile, refs: DiffRefs, side: ThreadSide, line: Int?) {
-        val iid = currentIid ?: return
+        val ref = currentRef ?: return
         val lineMap = buildLineMap(file.diff)
         val dialog = NewThreadDialog(project, file, lineMap, side, line)
         if (!dialog.showAndGet()) return
@@ -657,21 +658,21 @@ class ChangesPanel(
         val body = dialog.body()
         if (body.isBlank()) return
         if (dialog.saveAsDraft()) {
-            submitNewDraftThread(iid, file, refs, pos, body)
+            submitNewDraftThread(ref, file, refs, pos, body)
         } else {
-            submitNewThread(iid, file, refs, pos, body)
+            submitNewThread(ref, file, refs, pos, body)
         }
     }
 
     /** Posts a new diff thread off the EDT, then reloads discussions and re-selects the new thread. */
-    private fun submitNewThread(iid: Long, file: GitLabDiffFile, refs: DiffRefs, pos: LinePosition, body: String) {
+    private fun submitNewThread(ref: MrRef, file: GitLabDiffFile, refs: DiffRefs, pos: LinePosition, body: String) {
         newThreadJob?.cancel()
         newThreadJob = service.coroutineScope.launch {
-            val result = service.createDiffThread(iid, file, refs, pos, body)
+            val result = service.createDiffThread(ref, file, refs, pos, body)
             withContext(Dispatchers.EDT) {
-                if (currentIid != iid) return@withContext
+                if (currentRef != ref) return@withContext
                 when (result) {
-                    is GitLabResult.Success -> reloadDiscussions(iid, file.newPath, result.data.id)
+                    is GitLabResult.Success -> reloadDiscussions(ref, file.newPath, result.data.id)
                     else -> Messages.showErrorDialog(
                         project,
                         CockpitBundle.message("changes.error.createThread", describe(result)),
@@ -686,14 +687,14 @@ class ChangesPanel(
      * Posts a new *draft* diff thread off the EDT, then reloads the "Pending review" section. A draft
      * is not a published discussion, so the discussions tree is left untouched.
      */
-    private fun submitNewDraftThread(iid: Long, file: GitLabDiffFile, refs: DiffRefs, pos: LinePosition, body: String) {
+    private fun submitNewDraftThread(ref: MrRef, file: GitLabDiffFile, refs: DiffRefs, pos: LinePosition, body: String) {
         newThreadJob?.cancel()
         newThreadJob = service.coroutineScope.launch {
-            val result = service.createDraftThread(iid, file, refs, pos, body)
+            val result = service.createDraftThread(ref, file, refs, pos, body)
             withContext(Dispatchers.EDT) {
-                if (currentIid != iid) return@withContext
+                if (currentRef != ref) return@withContext
                 when (result) {
-                    is GitLabResult.Success -> reloadDrafts(iid)
+                    is GitLabResult.Success -> reloadDrafts(ref)
                     else -> Messages.showErrorDialog(
                         project,
                         CockpitBundle.message("changes.error.drafts", describe(result)),
@@ -741,14 +742,14 @@ class ChangesPanel(
 
     /** Deletes a single draft off the EDT, then reloads the "Pending review" section. */
     private fun onDeleteDraft(draftId: Long) {
-        val iid = currentIid ?: return
+        val ref = currentRef ?: return
         deleteJob?.cancel()
         deleteJob = service.coroutineScope.launch {
-            val result = service.deleteDraftNote(iid, draftId)
+            val result = service.deleteDraftNote(ref, draftId)
             withContext(Dispatchers.EDT) {
-                if (currentIid != iid) return@withContext
+                if (currentRef != ref) return@withContext
                 when (result) {
-                    is GitLabResult.Success -> reloadDrafts(iid)
+                    is GitLabResult.Success -> reloadDrafts(ref)
                     else -> Messages.showErrorDialog(
                         project,
                         CockpitBundle.message("changes.error.drafts", describe(result)),
@@ -760,12 +761,12 @@ class ChangesPanel(
     }
 
     /** Re-fetches the MR's draft notes and re-renders the "Pending review" section. */
-    private fun reloadDrafts(iid: Long) {
+    private fun reloadDrafts(ref: MrRef) {
         draftsJob?.cancel()
         draftsJob = service.coroutineScope.launch {
-            val result = service.getDraftNotes(iid)
+            val result = service.getDraftNotes(ref)
             withContext(Dispatchers.EDT) {
-                if (currentIid != iid) return@withContext
+                if (currentRef != ref) return@withContext
                 renderDrafts((result as? GitLabResult.Success)?.data ?: emptyList())
             }
         }
@@ -777,20 +778,20 @@ class ChangesPanel(
      * tab, and fires a balloon notification.
      */
     private fun onSubmitReview() {
-        val iid = currentIid ?: return
+        val ref = currentRef ?: return
         val count = currentDrafts.size
         if (count == 0) return
         submitButton.isEnabled = false
         publishJob?.cancel()
         publishJob = service.coroutineScope.launch {
-            val result = service.publishDrafts(iid)
+            val result = service.publishDrafts(ref)
             withContext(Dispatchers.EDT) {
-                if (currentIid != iid) return@withContext
+                if (currentRef != ref) return@withContext
                 when (result) {
                     is GitLabResult.Success -> {
                         notifyReviewSubmitted(count)
-                        reloadDrafts(iid)
-                        reloadDiscussions(iid, selectedFilePath, null)
+                        reloadDrafts(ref)
+                        reloadDiscussions(ref, selectedFilePath, null)
                         onReviewSubmitted()
                     }
                     else -> {
@@ -832,7 +833,7 @@ class ChangesPanel(
 
     /** Toggles the selected thread's resolution off the EDT, then reloads the discussions. */
     private fun onToggleResolve() {
-        val iid = currentIid ?: return
+        val ref = currentRef ?: return
         val discussion = discussionList.selectedValue ?: return
         val firstNote = discussion.notes.firstOrNull { !it.system } ?: return
         if (!firstNote.resolvable) return
@@ -840,11 +841,11 @@ class ChangesPanel(
         resolveButton.isEnabled = false
         resolveJob?.cancel()
         resolveJob = service.coroutineScope.launch {
-            val result = service.setDiscussionResolved(iid, discussion.id, newResolved)
+            val result = service.setDiscussionResolved(ref, discussion.id, newResolved)
             withContext(Dispatchers.EDT) {
-                if (currentIid != iid) return@withContext
+                if (currentRef != ref) return@withContext
                 when (result) {
-                    is GitLabResult.Success -> reloadDiscussions(iid, selectedFilePath, discussion.id)
+                    is GitLabResult.Success -> reloadDiscussions(ref, selectedFilePath, discussion.id)
                     else -> {
                         resolveButton.isEnabled = true
                         Messages.showErrorDialog(

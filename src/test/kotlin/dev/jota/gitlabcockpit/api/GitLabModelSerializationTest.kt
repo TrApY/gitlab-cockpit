@@ -31,6 +31,7 @@ class GitLabModelSerializationTest {
               "merge_status": "can_be_merged",
               "labels": ["frontend", "ci"],
               "author": {"id": 1, "username": "jota", "name": "Jo Ta", "state": "active"},
+              "references": {"short": "!42", "relative": "!42", "full": "group/project!42"},
               "reviewers": [
                 {"id": 2, "username": "rev1", "name": "Reviewer One"},
                 {"id": 3, "username": "rev2", "name": "Reviewer Two"}
@@ -44,6 +45,8 @@ class GitLabModelSerializationTest {
         val mr = json.decodeFromString<GitLabMergeRequest>(payload)
 
         assertEquals(42L, mr.iid)
+        assertEquals(100L, mr.projectId)
+        assertEquals("group/project!42", mr.references?.full)
         assertEquals("Add cockpit tool window", mr.title)
         assertEquals("opened", mr.state)
         assertEquals("feature/h2", mr.sourceBranch)
@@ -61,6 +64,7 @@ class GitLabModelSerializationTest {
         val payload = """
             {
               "iid": 7,
+              "project_id": 55,
               "title": "Minimal",
               "state": "merged",
               "source_branch": "s",
@@ -73,11 +77,13 @@ class GitLabModelSerializationTest {
 
         val mr = json.decodeFromString<GitLabMergeRequest>(payload)
 
+        assertEquals(55L, mr.projectId)
         assertFalse(mr.draft)
         assertFalse(mr.hasConflicts)
         assertTrue(mr.reviewers.isEmpty())
         assertTrue(mr.assignees.isEmpty())
         assertNull(mr.headPipeline)
+        assertNull(mr.references)
     }
 
     @Test
@@ -85,6 +91,7 @@ class GitLabModelSerializationTest {
         val payload = """
             {
               "iid": 42,
+              "project_id": 77,
               "title": "External CI",
               "state": "opened",
               "source_branch": "feature",

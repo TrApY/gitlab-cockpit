@@ -88,12 +88,11 @@ class CockpitProjectService(
     @Volatile
     private var cachedUser: GitLabUser? = null
 
-    /** Project members, loaded lazily by [getMembers] and dropped on [refresh]. */
-    @Volatile
-    private var cachedMembers: List<GitLabUser>? = null
+    /** Project members, keyed by project id (loaded lazily by [getMembers] / [getResolvedMembers]). */
+    private val cachedMembers = ConcurrentHashMap<Long, List<GitLabUser>>()
 
-    /** Keyed by MR iid; invalidated per-MR when its `updated_at` changes. */
-    private val approvalsCache = ConcurrentHashMap<Long, CachedApprovals>()
+    /** Keyed by [MrRef] (project + iid); invalidated per-MR when its `updated_at` changes. */
+    private val approvalsCache = ConcurrentHashMap<MrRef, CachedApprovals>()
 
     /**
      * The user the configured token belongs to, populated by the first list load. Exposed read-only
@@ -107,7 +106,7 @@ class CockpitProjectService(
     fun refresh() {
         cachedProject = null
         cachedUser = null
-        cachedMembers = null
+        cachedMembers.clear()
         approvalsCache.clear()
     }
 
@@ -126,6 +125,11 @@ class CockpitProjectService(
             is GitLabResult.NetworkError -> return networkError(r)
         }
 
+        // A global "By user" filter with no username would query the whole instance — short-circuit it.
+        if (isGlobalByUserWithoutUser(selection)) {
+            return CockpitState.Ready(emptyList(), currentUser, glProject)
+        }
+
         val query = buildQuery(selection, currentUser)
         val mrs = when (val r = client.getMergeRequests(glProject.id, query)) {
             is GitLabResult.Success -> r.data
@@ -134,7 +138,7 @@ class CockpitProjectService(
         }
 
         val finalMrs = if (selection.role == RoleFilter.REVIEWER_NOT_APPROVED) {
-            val approvals = loadApprovals(client, glProject.id, mrs)
+            val approvals = loadApprovals(client, mrs)
             filterNotApproved(mrs, approvals, currentUser.id)
         } else {
             mrs
@@ -144,30 +148,44 @@ class CockpitProjectService(
     }
 
     /** Fetches the fresh detail of a single MR. Used by the detail panel on selection. */
-    suspend fun getMrDetail(iid: Long): GitLabResult<GitLabMergeRequest> =
-        withClientAndProject { client, glProject -> client.getMergeRequest(glProject.id, iid) }
+    suspend fun getMrDetail(ref: MrRef): GitLabResult<GitLabMergeRequest> =
+        withClientAndProject { client, _ -> client.getMergeRequest(ref.projectId, ref.iid) }
 
     /**
-     * Returns the project's members, cached in memory (invalidated by [refresh]). Only the first
-     * successful load hits the network; subsequent calls reuse the cache.
+     * Returns the members of [projectId], cached in memory per project (invalidated by [refresh]).
+     * Only the first successful load of a given project hits the network; the edit dialogs pass the
+     * MR's own project id so they list the right project's members in the "All projects" mode.
      */
-    suspend fun getMembers(): GitLabResult<List<GitLabUser>> {
-        cachedMembers?.let { return GitLabResult.Success(it) }
-        return withClientAndProject { client, glProject ->
-            client.getProjectMembers(glProject.id).also {
-                if (it is GitLabResult.Success) cachedMembers = it.data
+    suspend fun getMembers(projectId: Long): GitLabResult<List<GitLabUser>> {
+        cachedMembers[projectId]?.let { return GitLabResult.Success(it) }
+        return withClientAndProject { client, _ ->
+            client.getProjectMembers(projectId).also {
+                if (it is GitLabResult.Success) cachedMembers[projectId] = it.data
             }
         }
     }
 
+    /**
+     * Members of the git-resolved project, used by the "By user" filter autocomplete (which completes
+     * against the resolved project even in the "All projects" mode). Shares the per-project
+     * [cachedMembers] with [getMembers].
+     */
+    suspend fun getResolvedMembers(): GitLabResult<List<GitLabUser>> =
+        withClientAndProject { client, glProject ->
+            cachedMembers[glProject.id]?.let { return@withClientAndProject GitLabResult.Success(it) }
+            client.getProjectMembers(glProject.id).also {
+                if (it is GitLabResult.Success) cachedMembers[glProject.id] = it.data
+            }
+        }
+
     /** Applies a partial update to an MR and returns the updated MR. */
-    suspend fun updateMr(iid: Long, update: MergeRequestUpdate): GitLabResult<GitLabMergeRequest> =
-        withClientAndProject { client, glProject -> client.updateMergeRequest(glProject.id, iid, update) }
+    suspend fun updateMr(ref: MrRef, update: MergeRequestUpdate): GitLabResult<GitLabMergeRequest> =
+        withClientAndProject { client, _ -> client.updateMergeRequest(ref.projectId, ref.iid, update) }
 
     /** Fetches an MR's comment thread, already filtered to human notes (system notes dropped). */
-    suspend fun getNotes(iid: Long): GitLabResult<List<GitLabNote>> =
-        withClientAndProject { client, glProject ->
-            when (val r = client.getMrNotes(glProject.id, iid)) {
+    suspend fun getNotes(ref: MrRef): GitLabResult<List<GitLabNote>> =
+        withClientAndProject { client, _ ->
+            when (val r = client.getMrNotes(ref.projectId, ref.iid)) {
                 is GitLabResult.Success -> GitLabResult.Success(userNotes(r.data))
                 is GitLabResult.HttpError -> r
                 is GitLabResult.NetworkError -> r
@@ -175,22 +193,22 @@ class CockpitProjectService(
         }
 
     /** Posts a general comment on an MR and returns the created note. */
-    suspend fun addNote(iid: Long, body: String): GitLabResult<GitLabNote> =
-        withClientAndProject { client, glProject -> client.createMrNote(glProject.id, iid, body) }
+    suspend fun addNote(ref: MrRef, body: String): GitLabResult<GitLabNote> =
+        withClientAndProject { client, _ -> client.createMrNote(ref.projectId, ref.iid, body) }
 
     /**
      * Approves an MR as the current user. On success the MR's approvals cache entry is dropped so
      * the "reviewer, not approved" list filter re-fetches instead of serving a stale approval state.
      */
-    suspend fun approve(iid: Long): GitLabResult<Unit> =
-        withClientAndProject { client, glProject ->
-            client.approveMr(glProject.id, iid).also { if (it is GitLabResult.Success) approvalsCache.remove(iid) }
+    suspend fun approve(ref: MrRef): GitLabResult<Unit> =
+        withClientAndProject { client, _ ->
+            client.approveMr(ref.projectId, ref.iid).also { if (it is GitLabResult.Success) approvalsCache.remove(ref) }
         }
 
     /** Revokes the current user's approval. Invalidates the approvals cache like [approve]. */
-    suspend fun unapprove(iid: Long): GitLabResult<Unit> =
-        withClientAndProject { client, glProject ->
-            client.unapproveMr(glProject.id, iid).also { if (it is GitLabResult.Success) approvalsCache.remove(iid) }
+    suspend fun unapprove(ref: MrRef): GitLabResult<Unit> =
+        withClientAndProject { client, _ ->
+            client.unapproveMr(ref.projectId, ref.iid).also { if (it is GitLabResult.Success) approvalsCache.remove(ref) }
         }
 
     /**
@@ -198,30 +216,33 @@ class CockpitProjectService(
      * [approvalsCache] used by the list filter so the overview always reflects the latest approve /
      * revoke.
      */
-    suspend fun getApprovalsFor(iid: Long): GitLabResult<GitLabApprovals> =
-        withClientAndProject { client, glProject -> client.getApprovals(glProject.id, iid) }
+    suspend fun getApprovalsFor(ref: MrRef): GitLabResult<GitLabApprovals> =
+        withClientAndProject { client, _ -> client.getApprovals(ref.projectId, ref.iid) }
 
     // --- Changed files & diff (F3) ------------------------------------------------------------
 
     /** The MR's changed files, for the file tree and the editor diff. */
-    suspend fun getMrDiffs(iid: Long): GitLabResult<List<GitLabDiffFile>> =
-        withClientAndProject { client, glProject -> client.getMrDiffs(glProject.id, iid) }
+    suspend fun getMrDiffs(ref: MrRef): GitLabResult<List<GitLabDiffFile>> =
+        withClientAndProject { client, _ -> client.getMrDiffs(ref.projectId, ref.iid) }
 
-    /** Raw contents of [path] at [ref] (a SHA from the MR's `diff_refs`), for the diff sides. */
-    suspend fun getRawFile(path: String, ref: String): GitLabResult<String> =
-        withClientAndProject { client, glProject -> client.getRawFile(glProject.id, path, ref) }
+    /**
+     * Raw contents of [path] at [ref] (a SHA from the MR's `diff_refs`), for the diff sides. Takes the
+     * MR's [projectId] explicitly so it fetches from the MR's own repository in the "All projects" mode.
+     */
+    suspend fun getRawFile(projectId: Long, path: String, ref: String): GitLabResult<String> =
+        withClientAndProject { client, _ -> client.getRawFile(projectId, path, ref) }
 
     /** The MR's discussion threads (diff comments + general comments), for the comments panel. */
-    suspend fun getMrDiscussions(iid: Long): GitLabResult<List<GitLabDiscussion>> =
-        withClientAndProject { client, glProject -> client.getMrDiscussions(glProject.id, iid) }
+    suspend fun getMrDiscussions(ref: MrRef): GitLabResult<List<GitLabDiscussion>> =
+        withClientAndProject { client, _ -> client.getMrDiscussions(ref.projectId, ref.iid) }
 
     /** Replies to an existing discussion thread and returns the created note. */
     suspend fun replyToDiscussion(
-        iid: Long,
+        ref: MrRef,
         discussionId: String,
         body: String,
     ): GitLabResult<GitLabDiscussionNote> =
-        withClientAndProject { client, glProject -> client.addDiscussionNote(glProject.id, iid, discussionId, body) }
+        withClientAndProject { client, _ -> client.addDiscussionNote(ref.projectId, ref.iid, discussionId, body) }
 
     /**
      * Opens a new diff-anchored discussion on [file] at [pos]. Builds the [PositionPayload] from the
@@ -230,13 +251,13 @@ class CockpitProjectService(
      * sent (from [file]); the old/new line come from [pos]. Returns the created discussion.
      */
     suspend fun createDiffThread(
-        iid: Long,
+        ref: MrRef,
         file: GitLabDiffFile,
         refs: DiffRefs,
         pos: LinePosition,
         body: String,
     ): GitLabResult<GitLabDiscussion> =
-        withClientAndProject { client, glProject ->
+        withClientAndProject { client, _ ->
             val position = PositionPayload(
                 baseSha = refs.baseSha,
                 startSha = refs.startSha,
@@ -246,22 +267,22 @@ class CockpitProjectService(
                 oldLine = pos.oldLine,
                 newLine = pos.newLine,
             )
-            client.createDiffDiscussion(glProject.id, iid, body, position)
+            client.createDiffDiscussion(ref.projectId, ref.iid, body, position)
         }
 
     // --- Draft notes, review submission & resolution (F4b) ------------------------------------
 
     /** The MR's pending draft notes (the current user's unpublished review comments). */
-    suspend fun getDraftNotes(iid: Long): GitLabResult<List<GitLabDraftNote>> =
-        withClientAndProject { client, glProject -> client.getDraftNotes(glProject.id, iid) }
+    suspend fun getDraftNotes(ref: MrRef): GitLabResult<List<GitLabDraftNote>> =
+        withClientAndProject { client, _ -> client.getDraftNotes(ref.projectId, ref.iid) }
 
     /** Adds a draft note; a null [position] posts a general draft, otherwise a diff-anchored one. */
     suspend fun createDraftNote(
-        iid: Long,
+        ref: MrRef,
         note: String,
         position: PositionPayload? = null,
     ): GitLabResult<GitLabDraftNote> =
-        withClientAndProject { client, glProject -> client.createDraftNote(glProject.id, iid, note, position) }
+        withClientAndProject { client, _ -> client.createDraftNote(ref.projectId, ref.iid, note, position) }
 
     /**
      * Opens a diff-anchored draft on [file] at [pos] — the draft analogue of [createDiffThread].
@@ -269,13 +290,13 @@ class CockpitProjectService(
      * `old_path` and `new_path` from [file] with the old/new line from [pos]. Returns the created draft.
      */
     suspend fun createDraftThread(
-        iid: Long,
+        ref: MrRef,
         file: GitLabDiffFile,
         refs: DiffRefs,
         pos: LinePosition,
         note: String,
     ): GitLabResult<GitLabDraftNote> =
-        withClientAndProject { client, glProject ->
+        withClientAndProject { client, _ ->
             val position = PositionPayload(
                 baseSha = refs.baseSha,
                 startSha = refs.startSha,
@@ -285,58 +306,58 @@ class CockpitProjectService(
                 oldLine = pos.oldLine,
                 newLine = pos.newLine,
             )
-            client.createDraftNote(glProject.id, iid, note, position)
+            client.createDraftNote(ref.projectId, ref.iid, note, position)
         }
 
     /** Discards a single pending draft note. */
-    suspend fun deleteDraftNote(iid: Long, draftId: Long): GitLabResult<Unit> =
-        withClientAndProject { client, glProject -> client.deleteDraftNote(glProject.id, iid, draftId) }
+    suspend fun deleteDraftNote(ref: MrRef, draftId: Long): GitLabResult<Unit> =
+        withClientAndProject { client, _ -> client.deleteDraftNote(ref.projectId, ref.iid, draftId) }
 
     /** Publishes every pending draft as the review submission (bulk publish). */
-    suspend fun publishDrafts(iid: Long): GitLabResult<Unit> =
-        withClientAndProject { client, glProject -> client.publishAllDraftNotes(glProject.id, iid) }
+    suspend fun publishDrafts(ref: MrRef): GitLabResult<Unit> =
+        withClientAndProject { client, _ -> client.publishAllDraftNotes(ref.projectId, ref.iid) }
 
     /** Resolves ([resolved] true) or reopens ([resolved] false) a discussion thread. */
     suspend fun setDiscussionResolved(
-        iid: Long,
+        ref: MrRef,
         discussionId: String,
         resolved: Boolean,
     ): GitLabResult<Unit> =
-        withClientAndProject { client, glProject -> client.resolveDiscussion(glProject.id, iid, discussionId, resolved) }
+        withClientAndProject { client, _ -> client.resolveDiscussion(ref.projectId, ref.iid, discussionId, resolved) }
 
     // --- Pipelines (F2a) ----------------------------------------------------------------------
 
     /** Pipelines the given MR has triggered, newest-first (as GitLab returns them). */
-    suspend fun getMrPipelines(iid: Long): GitLabResult<List<GitLabPipeline>> =
-        withClientAndProject { client, glProject -> client.getMrPipelines(glProject.id, iid) }
+    suspend fun getMrPipelines(ref: MrRef): GitLabResult<List<GitLabPipeline>> =
+        withClientAndProject { client, _ -> client.getMrPipelines(ref.projectId, ref.iid) }
 
     /** All jobs of a pipeline (stage-ordered), for the stage → job tree. */
-    suspend fun getPipelineJobs(pipelineId: Long): GitLabResult<List<GitLabJob>> =
-        withClientAndProject { client, glProject -> client.getPipelineJobs(glProject.id, pipelineId) }
+    suspend fun getPipelineJobs(projectId: Long, pipelineId: Long): GitLabResult<List<GitLabJob>> =
+        withClientAndProject { client, _ -> client.getPipelineJobs(projectId, pipelineId) }
 
     /** Retries a whole pipeline. */
-    suspend fun retryPipeline(pipelineId: Long): GitLabResult<Unit> =
-        withClientAndProject { client, glProject -> client.retryPipeline(glProject.id, pipelineId) }
+    suspend fun retryPipeline(projectId: Long, pipelineId: Long): GitLabResult<Unit> =
+        withClientAndProject { client, _ -> client.retryPipeline(projectId, pipelineId) }
 
     /** Cancels a whole pipeline. */
-    suspend fun cancelPipeline(pipelineId: Long): GitLabResult<Unit> =
-        withClientAndProject { client, glProject -> client.cancelPipeline(glProject.id, pipelineId) }
+    suspend fun cancelPipeline(projectId: Long, pipelineId: Long): GitLabResult<Unit> =
+        withClientAndProject { client, _ -> client.cancelPipeline(projectId, pipelineId) }
 
     /** Retries a single job. */
-    suspend fun retryJob(jobId: Long): GitLabResult<Unit> =
-        withClientAndProject { client, glProject -> client.retryJob(glProject.id, jobId) }
+    suspend fun retryJob(projectId: Long, jobId: Long): GitLabResult<Unit> =
+        withClientAndProject { client, _ -> client.retryJob(projectId, jobId) }
 
     /** Cancels a single job. */
-    suspend fun cancelJob(jobId: Long): GitLabResult<Unit> =
-        withClientAndProject { client, glProject -> client.cancelJob(glProject.id, jobId) }
+    suspend fun cancelJob(projectId: Long, jobId: Long): GitLabResult<Unit> =
+        withClientAndProject { client, _ -> client.cancelJob(projectId, jobId) }
 
     /** Plays (starts) a manual job. */
-    suspend fun playJob(jobId: Long): GitLabResult<Unit> =
-        withClientAndProject { client, glProject -> client.playJob(glProject.id, jobId) }
+    suspend fun playJob(projectId: Long, jobId: Long): GitLabResult<Unit> =
+        withClientAndProject { client, _ -> client.playJob(projectId, jobId) }
 
-    /** Creates a new pipeline on [ref] (the MR's source branch). */
-    suspend fun createPipeline(ref: String): GitLabResult<Unit> =
-        withClientAndProject { client, glProject -> client.createPipeline(glProject.id, ref) }
+    /** Creates a new pipeline on [ref] (the MR's source branch) in [projectId]. */
+    suspend fun createPipeline(projectId: Long, ref: String): GitLabResult<Unit> =
+        withClientAndProject { client, _ -> client.createPipeline(projectId, ref) }
 
     /**
      * "Retry stage": GitLab has no stage-retry endpoint, so this retries each retryable job of the
@@ -345,13 +366,13 @@ class CockpitProjectService(
      * is reported. [pipelineId] is accepted for call-site symmetry with the other pipeline actions.
      */
     @Suppress("UNUSED_PARAMETER")
-    suspend fun retryStage(pipelineId: Long, stage: StageGroup): RetryStageResult {
-        val result = withClientAndProject { client, glProject ->
+    suspend fun retryStage(projectId: Long, pipelineId: Long, stage: StageGroup): RetryStageResult {
+        val result = withClientAndProject { client, _ ->
             var retried = 0
             var firstError: String? = null
             val targets = stage.jobs.filter { isJobRetryable(it.status) && it.status in RETRY_STAGE_STATUSES }
             for (job in targets) {
-                when (val r = client.retryJob(glProject.id, job.id)) {
+                when (val r = client.retryJob(projectId, job.id)) {
                     is GitLabResult.Success -> retried++
                     else -> if (firstError == null) firstError = describeError(r)
                 }
@@ -367,17 +388,17 @@ class CockpitProjectService(
     // --- Job logs (F2b) -----------------------------------------------------------------------
 
     /** A slice of a job's trace starting at [offset], for the streaming log viewer. */
-    suspend fun getJobTrace(jobId: Long, offset: Long): GitLabResult<TraceChunk> =
-        withClientAndProject { client, glProject -> client.getJobTrace(glProject.id, jobId, offset) }
+    suspend fun getJobTrace(projectId: Long, jobId: Long, offset: Long): GitLabResult<TraceChunk> =
+        withClientAndProject { client, _ -> client.getJobTrace(projectId, jobId, offset) }
 
     /** Fresh detail of a single job; the log viewer polls it to learn when the job leaves running. */
-    suspend fun getJob(jobId: Long): GitLabResult<GitLabJob> =
-        withClientAndProject { client, glProject -> client.getJob(glProject.id, jobId) }
+    suspend fun getJob(projectId: Long, jobId: Long): GitLabResult<GitLabJob> =
+        withClientAndProject { client, _ -> client.getJob(projectId, jobId) }
 
     // --- Pipeline notifications (F2b) ----------------------------------------------------------
 
-    /** Last known status of each MR's latest pipeline, keyed by MR iid; the watcher compares against it. */
-    private val lastPipelineStatus = ConcurrentHashMap<Long, String>()
+    /** Last known status of each MR's latest pipeline, keyed by [MrRef]; the watcher compares against it. */
+    private val lastPipelineStatus = ConcurrentHashMap<MrRef, String>()
 
     /**
      * One watcher pass: for the (at most [MAX_WATCHED_MRS] most recent) MRs the current user authored
@@ -396,11 +417,12 @@ class CockpitProjectService(
         return coroutineScope {
             candidates.map { mr ->
                 async {
-                    val status = when (val r = getMrPipelines(mr.iid)) {
+                    val ref = MrRef(mr.projectId, mr.iid)
+                    val status = when (val r = getMrPipelines(ref)) {
                         is GitLabResult.Success -> r.data.firstOrNull()?.status
                         else -> null
                     } ?: return@async null
-                    val prev = lastPipelineStatus.put(mr.iid, status)
+                    val prev = lastPipelineStatus.put(ref, status)
                     if (shouldNotify(prev, status)) PipelineStatusChange(mr, status) else null
                 }
             }.awaitAll().filterNotNull()
@@ -467,47 +489,54 @@ class CockpitProjectService(
      */
     private fun buildQuery(selection: MrFilterSelection, currentUser: GitLabUser): MergeRequestQuery {
         val state = selection.state.apiValue
+        val allProjects = selection.allProjects
         return when (selection.role) {
             RoleFilter.ALL ->
-                MergeRequestQuery(state = state)
+                MergeRequestQuery(state = state, allProjects = allProjects)
             RoleFilter.I_AM_AUTHOR ->
-                MergeRequestQuery(state = state, authorUsername = currentUser.username)
+                MergeRequestQuery(state = state, authorUsername = currentUser.username, allProjects = allProjects)
             RoleFilter.I_AM_REVIEWER ->
-                MergeRequestQuery(state = state, reviewerUsername = currentUser.username)
+                MergeRequestQuery(state = state, reviewerUsername = currentUser.username, allProjects = allProjects)
             RoleFilter.REVIEWER_NOT_APPROVED ->
-                MergeRequestQuery(state = state, reviewerUsername = currentUser.username)
+                MergeRequestQuery(state = state, reviewerUsername = currentUser.username, allProjects = allProjects)
             RoleFilter.BY_USER ->
-                MergeRequestQuery(state = state, authorUsername = selection.username?.trim()?.ifEmpty { null })
+                MergeRequestQuery(
+                    state = state,
+                    authorUsername = selection.username?.trim()?.ifEmpty { null },
+                    allProjects = allProjects,
+                )
         }
     }
 
     /**
      * Fetches approvals for the (max 50) returned MRs in parallel, reusing cached approvals whose
-     * MR `updated_at` is unchanged. MRs whose approvals could not be fetched are simply absent
+     * MR `updated_at` is unchanged. Each MR's approvals are fetched against its own `project_id` (not
+     * the git-resolved project) so the "reviewer, not approved" filter works in the "All projects"
+     * mode; the cache is keyed by [MrRef]. MRs whose approvals could not be fetched are simply absent
      * from the returned map, which [filterNotApproved] treats as "not approved by me".
      */
     private suspend fun loadApprovals(
         client: GitLabApiClient,
-        projectId: Long,
         mrs: List<GitLabMergeRequest>,
-    ): Map<Long, GitLabApprovals> = coroutineScope {
+    ): Map<MrRef, GitLabApprovals> = coroutineScope {
         mrs.map { mr ->
             async {
-                val cached = approvalsCache[mr.iid]
+                val ref = MrRef(mr.projectId, mr.iid)
+                val cached = approvalsCache[ref]
                 if (cached != null && cached.updatedAt == mr.updatedAt) {
-                    mr.iid to cached.approvals
+                    ref to cached.approvals
                 } else {
-                    when (val r = client.getApprovals(projectId, mr.iid)) {
+                    when (val r = client.getApprovals(mr.projectId, mr.iid)) {
                         is GitLabResult.Success -> {
-                            approvalsCache[mr.iid] = CachedApprovals(mr.updatedAt, r.data)
-                            mr.iid to r.data
+                            approvalsCache[ref] = CachedApprovals(mr.updatedAt, r.data)
+                            ref to r.data
                         }
-                        else -> mr.iid to null
+                        else -> ref to null
                     }
                 }
             }
         }.awaitAll()
-            .mapNotNull { (iid, approvals) -> approvals?.let { iid to it } }
+            .mapNotNull { (ref, approvals) -> approvals?.let { ref to it } }
             .toMap()
     }
 

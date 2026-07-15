@@ -23,10 +23,11 @@ import javax.swing.JPanel
 class JobLogDialog(
     project: Project,
     service: CockpitProjectService,
+    projectId: Long,
     private val job: GitLabJob,
 ) : DialogWrapper(project, false, IdeModalityType.MODELESS) {
 
-    private val logConsole = JobLogConsole(project, service, job, disposable) { status ->
+    private val logConsole = JobLogConsole(project, service, projectId, job, disposable) { status ->
         title = CockpitBundle.message("log.title", job.name, status)
     }
 

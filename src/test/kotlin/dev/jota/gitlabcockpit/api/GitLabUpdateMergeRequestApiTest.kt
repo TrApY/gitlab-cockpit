@@ -56,6 +56,7 @@ class GitLabUpdateMergeRequestApiTest {
         val response = """
             {
               "iid": 42,
+              "project_id": 123,
               "title": "Renamed",
               "state": "opened",
               "source_branch": "feature",
@@ -99,6 +100,7 @@ class GitLabUpdateMergeRequestApiTest {
             """
             {
               "iid": 42,
+              "project_id": 123,
               "title": "T",
               "state": "opened",
               "source_branch": "s",

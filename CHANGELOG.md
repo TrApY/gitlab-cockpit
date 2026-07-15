@@ -4,6 +4,12 @@
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-07-15
+
+### Added
+
+- "All projects" filter: a toolbar checkbox that lists merge requests across the whole GitLab instance where you are author or reviewer (or the filtered user), not just the git-resolved project. Each row is prefixed with its `group/project`, and the full detail (comments, changes, pipelines, approve, edit) keeps working on merge requests from any project
+
 ## [0.4.1] - 2026-07-15
 
 ### Added

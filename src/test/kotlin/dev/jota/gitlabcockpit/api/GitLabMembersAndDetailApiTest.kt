@@ -70,6 +70,7 @@ class GitLabMembersAndDetailApiTest {
         val body = """
             {
               "iid": 42,
+              "project_id": 123,
               "title": "Detail title",
               "state": "opened",
               "source_branch": "feature",
@@ -90,6 +91,7 @@ class GitLabMembersAndDetailApiTest {
         assertTrue("expected Success but was $result", result is GitLabResult.Success)
         val mr = (result as GitLabResult.Success).data
         assertEquals(42L, mr.iid)
+        assertEquals(123L, mr.projectId)
         assertEquals("Detail title", mr.title)
         assertEquals("A **markdown** body", mr.description)
         assertTrue(mr.draft)
