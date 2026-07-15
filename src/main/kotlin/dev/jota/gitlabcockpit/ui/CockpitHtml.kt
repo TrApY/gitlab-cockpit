@@ -43,18 +43,22 @@ object CockpitHtml {
 
     /**
      * Creates a read-only, transparent [JEditorPane] configured with the platform HTML editor kit
-     * (word wrap) and a hyperlink listener that opens links in the external browser.
+     * (word wrap) and a hyperlink listener. On click the optional [linkHandler] is offered the
+     * textual href first ([HyperlinkEvent.getDescription], which survives non-URL schemes such as
+     * `cockpit:reply:<id>`); if it returns `true` the click is consumed, otherwise the link opens in
+     * the external browser as before. Panes created without a handler keep the plain browse behavior.
      */
-    fun createHtmlPane(): JEditorPane = JEditorPane().apply {
+    fun createHtmlPane(linkHandler: ((String) -> Boolean)? = null): JEditorPane = JEditorPane().apply {
         editorKit = HTMLEditorKitBuilder().withWordWrapViewFactory().build()
         isEditable = false
         isOpaque = false
         border = JBUI.Borders.empty(4, 8)
         addHyperlinkListener { event ->
-            if (event.eventType == HyperlinkEvent.EventType.ACTIVATED) {
-                val href = event.url?.toExternalForm() ?: event.description
-                if (!href.isNullOrBlank()) BrowserUtil.browse(href)
-            }
+            if (event.eventType != HyperlinkEvent.EventType.ACTIVATED) return@addHyperlinkListener
+            val description = event.description
+            if (linkHandler != null && !description.isNullOrBlank() && linkHandler(description)) return@addHyperlinkListener
+            val href = event.url?.toExternalForm() ?: description
+            if (!href.isNullOrBlank()) BrowserUtil.browse(href)
         }
     }
 }

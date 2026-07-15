@@ -27,15 +27,17 @@ import com.intellij.util.ui.UIUtil
 import dev.jota.gitlabcockpit.CockpitBundle
 import dev.jota.gitlabcockpit.api.GitLabApprovals
 import dev.jota.gitlabcockpit.api.GitLabMergeRequest
-import dev.jota.gitlabcockpit.api.GitLabNote
 import dev.jota.gitlabcockpit.api.GitLabResult
 import dev.jota.gitlabcockpit.api.GitLabUser
 import dev.jota.gitlabcockpit.api.MergeRequestUpdate
 import dev.jota.gitlabcockpit.core.CockpitProjectService
+import dev.jota.gitlabcockpit.core.CommentThread
 import dev.jota.gitlabcockpit.core.MrRef
 import dev.jota.gitlabcockpit.core.ReviewerSelectionModel
+import dev.jota.gitlabcockpit.core.commentThreads
 import dev.jota.gitlabcockpit.core.filterMembers
 import dev.jota.gitlabcockpit.core.projectWebUrlOf
+import dev.jota.gitlabcockpit.core.threadAnchorLabel
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.async
@@ -61,9 +63,11 @@ import javax.swing.event.DocumentEvent
  * - **Overview**: header (`!iid title` + DRAFT/conflicts badges + edit-title/description button),
  *   author/assignee row, reviewers row, an approvals row ("Approved by: …" + an Approve/Revoke
  *   button that reflects whether the current user already approved) and the markdown description.
- * - **Comments**: the MR's human notes (system notes filtered out) rendered as themed HTML, plus a
- *   text area + Comment button to post a new general comment. Notes load lazily the first time the
- *   tab is shown for each MR and again on every detail refresh; the tab title carries the count.
+ * - **Comments**: the MR's discussion threads (system notes filtered out) rendered as themed HTML —
+ *   each thread's first note at root level, replies indented, with "Resolved" and diff-anchor tags —
+ *   plus a text area whose button posts a new general comment or, in reply mode (entered from a
+ *   thread's Reply link), a reply to that thread. Threads load lazily the first time the tab is shown
+ *   for each MR and again on every detail refresh; the tab title carries the total note count.
  *
  * Editing is done through modal dialogs; every network call (detail load, member load, update,
  * approvals, notes, approve/unapprove, comment) runs on the service's coroutine scope and only
@@ -107,7 +111,7 @@ class MrDetailPanel(
     private val headerContainer = JPanel(BorderLayout()).apply { isOpaque = false }
     private val overviewPanel = JPanel(BorderLayout())
 
-    private val notesPane = CockpitHtml.createHtmlPane()
+    private val notesPane = CockpitHtml.createHtmlPane { handleNotesLink(it) }
     private val notesScroll = JBScrollPane(notesPane)
     private val commentArea = JBTextArea(3, 0).apply {
         lineWrap = true
@@ -115,6 +119,23 @@ class MrDetailPanel(
         emptyText.text = CockpitBundle.message("detail.comment.placeholder")
     }
     private val commentButton = JButton(CockpitBundle.message("detail.comment.button"))
+
+    /** The threads currently rendered in the Comments tab; used to resolve a Reply link to its author. */
+    private var loadedThreads: List<CommentThread> = emptyList()
+
+    /** The discussion id being replied to, or null in the general-comment mode. */
+    private var replyingToDiscussionId: String? = null
+
+    /** Label of the reply-context row ("Replying to <author>"), filled by [enterReplyMode]. */
+    private val replyContextLabel = JBLabel()
+
+    /** Row shown above the comment box while replying to a thread; hidden in general-comment mode. */
+    private val replyContextPanel = JPanel(FlowLayout(FlowLayout.LEFT, JBUI.scale(6), 0)).apply {
+        isOpaque = false
+        isVisible = false
+        add(replyContextLabel)
+        add(ActionLink(CockpitBundle.message("detail.comment.reply.cancel")) { exitReplyMode() })
+    }
 
     /** Banner shown atop the Comments tab when the MR has pending draft notes; hidden otherwise. */
     private val draftBanner = JBLabel().apply {
@@ -203,6 +224,8 @@ class MrDetailPanel(
         notesJob?.cancel()
         notesEpoch++
         notesLoadedForRef = null
+        loadedThreads = emptyList()
+        exitReplyMode()
         notesPane.text = CockpitHtml.wrapHtml("")
         draftBanner.isVisible = false
         setCommentsTabTitle(null)
@@ -361,6 +384,7 @@ class MrDetailPanel(
         val panel = JPanel(BorderLayout(0, JBUI.scale(4)))
         panel.isOpaque = false
         panel.border = JBUI.Borders.empty(6, 8)
+        panel.add(replyContextPanel, BorderLayout.NORTH)
         panel.add(JBScrollPane(commentArea), BorderLayout.CENTER)
         val buttons = JPanel(FlowLayout(FlowLayout.RIGHT, 0, 0)).apply { isOpaque = false }
         buttons.add(commentButton)
@@ -382,21 +406,24 @@ class MrDetailPanel(
         setCommentsTabTitle(null)
         notesJob?.cancel()
         notesJob = service.coroutineScope.launch {
-            val (notesResult, draftsResult) = coroutineScope {
-                val notes = async { service.getNotes(ref) }
+            val (discussionsResult, draftsResult) = coroutineScope {
+                val discussions = async { service.getMrDiscussions(ref) }
                 val drafts = async { service.getDraftNotes(ref) }
-                notes.await() to drafts.await()
+                discussions.await() to drafts.await()
             }
             withContext(Dispatchers.EDT) {
                 if (currentRef != ref) return@withContext
                 renderDraftBanner((draftsResult as? GitLabResult.Success)?.data?.size ?: 0)
-                when (notesResult) {
-                    is GitLabResult.Success -> renderNotes(notesResult.data)
+                when (discussionsResult) {
+                    is GitLabResult.Success -> renderThreads(commentThreads(discussionsResult.data))
                     else -> {
                         notesLoadedForRef = null
+                        loadedThreads = emptyList()
                         notesPane.text = CockpitHtml.wrapHtml(
                             "<p><i>" +
-                                CockpitHtml.escapeHtml(CockpitBundle.message("detail.error.notes", describe(notesResult))) +
+                                CockpitHtml.escapeHtml(
+                                    CockpitBundle.message("detail.error.notes", describe(discussionsResult)),
+                                ) +
                                 "</i></p>",
                         )
                         setCommentsTabTitle(null)
@@ -428,26 +455,28 @@ class MrDetailPanel(
         if (tabbedPane.selectedIndex == COMMENTS_TAB_INDEX) loadNotes(ref)
     }
 
-    /** EDT. Renders the human notes as one themed HTML document and updates the tab counter. */
-    private fun renderNotes(notes: List<GitLabNote>) {
-        if (notes.isEmpty()) {
+    /**
+     * EDT. Renders the MR's discussion [threads] as one themed HTML document and updates the tab
+     * counter (total number of notes across every thread). Each thread shows its first note at root
+     * level and its replies indented; the thread's meta line carries a "Resolved" tag when resolved
+     * and a `file:line` tag when diff-anchored, and every thread ends with a `Reply` link.
+     */
+    private fun renderThreads(threads: List<CommentThread>) {
+        loadedThreads = threads
+        val noteCount = threads.sumOf { it.notes.size }
+        if (threads.isEmpty()) {
             notesPane.text = CockpitHtml.wrapHtml(
                 "<p><i>" + CockpitHtml.escapeHtml(CockpitBundle.message("detail.comment.empty")) + "</i></p>",
             )
             notesPane.caretPosition = 0
-            setCommentsTabTitle(notes.size)
+            setCommentsTabTitle(noteCount)
             return
         }
         val metaColor = ColorUtil.toHtmlColor(UIUtil.getContextHelpForeground())
         val body = buildString {
-            notes.forEachIndexed { index, note ->
-                append("<div style=\"color:").append(metaColor).append(";\">")
-                append(CockpitHtml.escapeHtml(displayName(note.author)))
-                append(" &middot; ")
-                append(CockpitHtml.escapeHtml(formatRelative(note.createdAt)))
-                append("</div>")
-                append(CockpitHtml.stripBody(MarkdownRenderer.toHtml(note.body)))
-                if (index < notes.lastIndex) append("<hr>")
+            threads.forEachIndexed { index, thread ->
+                appendThread(thread, metaColor)
+                if (index < threads.lastIndex) append("<hr>")
             }
         }
         val ref = currentRef
@@ -460,29 +489,109 @@ class MrDetailPanel(
             projectWebUrl = currentMr?.let(::projectWebUrlOf),
             isCurrent = { currentRef == ref && notesEpoch == epoch },
         )
-        setCommentsTabTitle(notes.size)
+        setCommentsTabTitle(noteCount)
     }
 
-    /** Posts the text area's content as a new comment, then clears it and reloads the thread. */
+    /** Appends one thread's HTML: root note, indented replies, resolved/anchor tags and Reply link. */
+    private fun StringBuilder.appendThread(thread: CommentThread, metaColor: String) {
+        val notes = thread.notes
+        val first = notes.first()
+        append("<div style=\"color:").append(metaColor).append(";\">")
+        append(CockpitHtml.escapeHtml(displayName(first.author)))
+        append(" &middot; ")
+        append(CockpitHtml.escapeHtml(formatRelative(first.createdAt)))
+        if (thread.resolved) {
+            append("&nbsp;&nbsp;[")
+                .append(CockpitHtml.escapeHtml(CockpitBundle.message("detail.comment.thread.resolved")))
+                .append("]")
+        }
+        threadAnchorLabel(thread)?.let { anchor ->
+            append("&nbsp;&nbsp;[").append(CockpitHtml.escapeHtml(anchor)).append("]")
+        }
+        append("</div>")
+        append(CockpitHtml.stripBody(MarkdownRenderer.toHtml(first.body)))
+        if (notes.size > 1) {
+            append("<blockquote>")
+            for (reply in notes.drop(1)) {
+                append("<div style=\"color:").append(metaColor).append(";\">")
+                append(CockpitHtml.escapeHtml(displayName(reply.author)))
+                append(" &middot; ")
+                append(CockpitHtml.escapeHtml(formatRelative(reply.createdAt)))
+                append("</div>")
+                append(CockpitHtml.stripBody(MarkdownRenderer.toHtml(reply.body)))
+            }
+            append("</blockquote>")
+        }
+        append("<p><a href=\"").append(REPLY_LINK_PREFIX).append(thread.discussionId).append("\">")
+        append(CockpitHtml.escapeHtml(CockpitBundle.message("detail.comment.thread.reply")))
+        append("</a></p>")
+    }
+
+    /**
+     * Posts the comment box's content: a reply to the active thread when in reply mode
+     * ([replyingToDiscussionId] set), otherwise a new general note. On success the box is cleared,
+     * reply mode is left and the thread is reloaded.
+     */
     private fun onSubmitComment() {
         val ref = currentRef ?: return
         val text = commentArea.text.trim()
         if (text.isEmpty()) return
+        val discussionId = replyingToDiscussionId
         commentButton.isEnabled = false
         service.coroutineScope.launch {
-            val result = service.addNote(ref, text)
+            val result: GitLabResult<*> =
+                if (discussionId != null) service.replyToDiscussion(ref, discussionId, text)
+                else service.addNote(ref, text)
             withContext(Dispatchers.EDT) {
                 commentButton.isEnabled = true
                 if (currentRef != ref) return@withContext
                 when (result) {
                     is GitLabResult.Success -> {
                         commentArea.text = ""
+                        exitReplyMode()
                         loadNotes(ref)
                     }
                     else -> showError("detail.error.comment", result)
                 }
             }
         }
+    }
+
+    // --- Reply mode ---------------------------------------------------------------------------
+
+    /**
+     * Notes-pane hyperlink handler: a `cockpit:reply:<id>` link switches the comment box into reply
+     * mode for that thread (consumed, returns true); any other href is left to the default browser
+     * handling (returns false).
+     */
+    private fun handleNotesLink(href: String): Boolean {
+        if (!href.startsWith(REPLY_LINK_PREFIX)) return false
+        enterReplyMode(href.removePrefix(REPLY_LINK_PREFIX))
+        return true
+    }
+
+    /** EDT. Switches the shared comment box to reply-to-thread mode for [discussionId]. */
+    private fun enterReplyMode(discussionId: String) {
+        val thread = loadedThreads.firstOrNull { it.discussionId == discussionId } ?: return
+        replyingToDiscussionId = discussionId
+        val author = thread.notes.firstOrNull()?.author?.let(::displayName).orEmpty()
+        replyContextLabel.text = CockpitBundle.message("detail.comment.replyingTo", author)
+        replyContextPanel.isVisible = true
+        commentButton.text = CockpitBundle.message("detail.comment.reply.button")
+        commentArea.emptyText.text = CockpitBundle.message("detail.comment.reply.placeholder")
+        commentArea.requestFocusInWindow()
+        revalidate()
+        repaint()
+    }
+
+    /** EDT. Returns the comment box to general-comment mode (banner hidden, button back to Comment). */
+    private fun exitReplyMode() {
+        replyingToDiscussionId = null
+        replyContextPanel.isVisible = false
+        commentButton.text = CockpitBundle.message("detail.comment.button")
+        commentArea.emptyText.text = CockpitBundle.message("detail.comment.placeholder")
+        revalidate()
+        repaint()
     }
 
     private fun setCommentsTabTitle(count: Int?) {
@@ -762,6 +871,9 @@ class MrDetailPanel(
         private const val COMMENTS_TAB_INDEX = 1
         private const val PIPELINES_TAB_INDEX = 2
         private const val CHANGES_TAB_INDEX = 3
+
+        /** Href scheme of a thread's Reply link; the discussion id follows the prefix. */
+        private const val REPLY_LINK_PREFIX = "cockpit:reply:"
 
         /** For header rows: prefer the display name, fall back to the username. */
         private fun displayName(user: GitLabUser): String = user.name.ifBlank { user.username }

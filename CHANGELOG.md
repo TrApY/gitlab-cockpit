@@ -4,6 +4,12 @@
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-07-15
+
+### Added
+
+- Comments tab shows real discussion threads (replies indented, resolved and diff-anchor badges) and lets you reply to a thread
+
 ## [0.6.0] - 2026-07-15
 
 ### Added
