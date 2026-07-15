@@ -43,6 +43,29 @@ fun mrScope(mrs: List<GitLabMergeRequest>, meId: Long): List<GitLabMergeRequest>
     }
 
 /**
+ * The effective notification scope (GLC-28) over the loaded [mrs]:
+ * - when [includeAllFiltered] is true, every MR of [mrs] (the whole current filter) is in scope;
+ * - otherwise the union of the role scope ([mrScope] for user [meId]) and every MR of [mrs] whose
+ *   [MrRef] is [watched] — a per-MR opt-in that overrides the role criteria.
+ *
+ * The result preserves the order of [mrs] and never contains duplicates. Pure and platform-free;
+ * fetching watched MRs that fall outside [mrs] is a separate concern handled in the service.
+ */
+fun notificationScope(
+    mrs: List<GitLabMergeRequest>,
+    meId: Long,
+    watched: Set<MrRef>,
+    includeAllFiltered: Boolean,
+): List<GitLabMergeRequest> {
+    if (includeAllFiltered) return mrs
+    val roleRefs = mrScope(mrs, meId).mapTo(HashSet()) { MrRef(it.projectId, it.iid) }
+    return mrs.filter { mr ->
+        val ref = MrRef(mr.projectId, mr.iid)
+        ref in roleRefs || ref in watched
+    }
+}
+
+/**
  * Diffs the current scoped [mrs] against the [previous] snapshot and returns the detected [MrEvent]s
  * together with the fresh snapshot to remember for the next pass (keyed by [MrRef]).
  *

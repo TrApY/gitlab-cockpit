@@ -59,6 +59,19 @@ class GitLabCockpitSettings : PersistentStateComponent<GitLabCockpitSettings.Sta
 
         /** Raise a balloon when new comments are added to a watched MR (its note count grows). */
         var notifyComments: Boolean = false
+
+        /**
+         * How often (minutes) the background poller checks for events while the tool window is closed
+         * (GLC-28). Only 1/2/5 are offered in the UI; re-read every tick so a change takes effect
+         * without restarting the loop. Defaults to 2.
+         */
+        var backgroundPollMinutes: Int = 2
+
+        /**
+         * When `true`, the notification scope widens to every MR of the current filter instead of only
+         * the user's role scope (+ watched MRs). Defaults to `false` (GLC-28).
+         */
+        var notifyScopeAllFiltered: Boolean = false
     }
 
     private var state = State()
@@ -115,6 +128,16 @@ class GitLabCockpitSettings : PersistentStateComponent<GitLabCockpitSettings.Sta
     var notifyComments: Boolean
         get() = state.notifyComments
         set(value) { state.notifyComments = value }
+
+    /** Background poll interval in minutes; see [State.backgroundPollMinutes]. */
+    var backgroundPollMinutes: Int
+        get() = state.backgroundPollMinutes
+        set(value) { state.backgroundPollMinutes = value }
+
+    /** Widen the notification scope to every MR of the current filter; see [State.notifyScopeAllFiltered]. */
+    var notifyScopeAllFiltered: Boolean
+        get() = state.notifyScopeAllFiltered
+        set(value) { state.notifyScopeAllFiltered = value }
 
     private fun decodeTriState(raw: String): Boolean? = when (raw) {
         TRUE -> true

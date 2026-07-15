@@ -501,18 +501,70 @@ class CockpitProjectService(
     }
 
     /**
-     * One MR-events watcher pass (no network): narrows [ready.mrs] to the current user's scope
-     * ([mrScope]) and diffs it against [lastMrSnapshot] via [detectMrEvents], returning the detected
-     * events and atomically advancing the stored snapshot. Synchronized so overlapping passes never
-     * emit the same event twice. The snapshot always advances (even for event types the user has
-     * muted) so toggling a checkbox on never replays historical changes.
+     * One MR-events watcher pass: narrows [ready.mrs] to the effective notification scope
+     * ([notificationScope]: role scope ∪ watched, or the whole filter when the "all filtered" setting
+     * is on), fetches any watched MR that fell outside [ready.mrs] so its events are detected too, and
+     * diffs the combined list against [lastMrSnapshot] via [detectMrEvents], returning the detected
+     * events and atomically advancing the stored snapshot (see [advanceMrSnapshot]). The snapshot
+     * always advances (even for event types the user has muted) so toggling a checkbox on never
+     * replays historical changes. The individual fetches (capped at [MAX_WATCHED_FETCH], in parallel,
+     * failures ignored) are the only network cost; both the visible-panel and the background poller go
+     * through here, so watched-out-of-list detection is inherited by both.
+     */
+    suspend fun detectScopeMrEvents(ready: CockpitState.Ready): List<MrEvent> {
+        val settings = GitLabCockpitSettings.getInstance()
+        val watched = watchedRefs()
+        val scoped = notificationScope(ready.mrs, ready.currentUser.id, watched, settings.notifyScopeAllFiltered)
+
+        // Watched MRs the current filter did not return: fetch each on its own so it can still fire
+        // events. They are disjoint from `scoped` (which only holds MRs present in `ready.mrs`), so
+        // concatenating cannot introduce duplicates.
+        val present = ready.mrs.mapTo(HashSet()) { MrRef(it.projectId, it.iid) }
+        val missing = watched.filterNot { it in present }.take(MAX_WATCHED_FETCH)
+        val fetched = if (missing.isEmpty()) {
+            emptyList()
+        } else {
+            coroutineScope {
+                missing.map { ref -> async { (getMrDetail(ref) as? GitLabResult.Success)?.data } }
+                    .awaitAll()
+                    .filterNotNull()
+            }
+        }
+
+        return advanceMrSnapshot(scoped + fetched)
+    }
+
+    /**
+     * Atomically diffs [mrs] against [lastMrSnapshot] and advances it. Synchronized (not `suspend`) so
+     * overlapping passes never emit the same event twice, keeping the read-modify-write of the shared
+     * snapshot indivisible while the network fetches in [detectScopeMrEvents] stay outside the lock.
      */
     @Synchronized
-    fun detectScopeMrEvents(ready: CockpitState.Ready): List<MrEvent> {
-        val scoped = mrScope(ready.mrs, ready.currentUser.id)
-        val (events, snapshot) = detectMrEvents(lastMrSnapshot, scoped)
+    private fun advanceMrSnapshot(mrs: List<GitLabMergeRequest>): List<MrEvent> {
+        val (events, snapshot) = detectMrEvents(lastMrSnapshot, mrs)
         lastMrSnapshot = snapshot
         return events
+    }
+
+    // --- Watched merge requests (GLC-28) -------------------------------------------------------
+
+    /** The set of MRs the user explicitly watches in this project, decoded from [WATCHED_MRS_KEY]. */
+    fun watchedRefs(): Set<MrRef> =
+        decodeWatchedRefs(PropertiesComponent.getInstance(project).getValue(WATCHED_MRS_KEY))
+
+    /** Whether [ref] is in this project's watch list. */
+    fun isWatched(ref: MrRef): Boolean = ref in watchedRefs()
+
+    /**
+     * Adds ([watched] true) or removes ([watched] false) [ref] from this project's watch list and
+     * persists it. Local only (no network); the change is picked up by the next watcher pass. The
+     * value is unset when the list becomes empty so no stale empty entry lingers in the store.
+     */
+    fun setWatched(ref: MrRef, watched: Boolean) {
+        val updated = watchedRefs().toMutableSet().apply { if (watched) add(ref) else remove(ref) }
+        val props = PropertiesComponent.getInstance(project)
+        val encoded = encodeWatchedRefs(updated)
+        if (encoded.isEmpty()) props.unsetValue(WATCHED_MRS_KEY) else props.setValue(WATCHED_MRS_KEY, encoded)
     }
 
     /**
@@ -679,10 +731,16 @@ class CockpitProjectService(
         /** Project-level [PropertiesComponent] key storing the chosen git root's `pathWithNamespace`. */
         private const val SELECTED_REMOTE_PATH_KEY = "dev.jota.gitlabcockpit.selectedRemotePath"
 
+        /** Project-level [PropertiesComponent] key storing the encoded watched MRs (GLC-28). */
+        private const val WATCHED_MRS_KEY = "dev.jota.gitlabcockpit.watchedMrs"
+
         /** Job statuses [retryStage] will actually retry (a subset of [isJobRetryable]). */
         private val RETRY_STAGE_STATUSES = setOf("failed", "canceled")
 
         /** Cap on how many of the current user's MRs the pipeline watcher inspects per pass. */
         private const val MAX_WATCHED_MRS = 10
+
+        /** Cap on how many out-of-list watched MRs [detectScopeMrEvents] fetches individually per pass. */
+        private const val MAX_WATCHED_FETCH = 10
     }
 }

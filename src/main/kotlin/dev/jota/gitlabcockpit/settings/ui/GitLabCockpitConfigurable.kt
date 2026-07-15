@@ -48,14 +48,18 @@ class GitLabCockpitConfigurable : Configurable {
     private val notifyMrStateCheck = JBCheckBox(CockpitBundle.message("settings.notifications.mrState"))
     private val notifyPushCheck = JBCheckBox(CockpitBundle.message("settings.notifications.push"))
     private val notifyCommentsCheck = JBCheckBox(CockpitBundle.message("settings.notifications.comments"))
+    private val notifyScopeAllFilteredCheck =
+        JBCheckBox(CockpitBundle.message("settings.notifications.scopeAllFiltered"))
+    private val backgroundIntervalCombo = ComboBox(PollInterval.values())
 
-    /** The five per-event checkboxes, greyed out together while the master switch is off. */
+    /** The per-event checkboxes plus the scope/interval controls, greyed out while the master is off. */
     private val eventChecks = listOf(
         notifyPipelineCheck,
         notifyNewMrCheck,
         notifyMrStateCheck,
         notifyPushCheck,
         notifyCommentsCheck,
+        notifyScopeAllFilteredCheck,
     )
 
     override fun getDisplayName(): String = CockpitBundle.message("settings.displayName")
@@ -90,16 +94,21 @@ class GitLabCockpitConfigurable : Configurable {
                 row { cell(notifyMrStateCheck) }
                 row { cell(notifyPushCheck) }
                 row { cell(notifyCommentsCheck) }
+                row { cell(notifyScopeAllFilteredCheck) }
+                row(CockpitBundle.message("settings.notifications.backgroundInterval")) {
+                    cell(backgroundIntervalCombo)
+                }
             }
         }
         reset()
         return dialogPanel
     }
 
-    /** Greys out the per-event checkboxes when the master notifications switch is off. */
+    /** Greys out the per-event checkboxes and the interval combo when the master switch is off. */
     private fun syncNotificationChecks() {
         val enabled = notificationsEnabledCheck.isSelected
         eventChecks.forEach { it.isEnabled = enabled }
+        backgroundIntervalCombo.isEnabled = enabled
     }
 
     private fun firstInstance(): InstanceState? = settings.instances.firstOrNull()
@@ -118,7 +127,9 @@ class GitLabCockpitConfigurable : Configurable {
                 notifyNewMrCheck.isSelected != settings.notifyNewMr ||
                 notifyMrStateCheck.isSelected != settings.notifyMrState ||
                 notifyPushCheck.isSelected != settings.notifyPush ||
-                notifyCommentsCheck.isSelected != settings.notifyComments
+                notifyCommentsCheck.isSelected != settings.notifyComments ||
+                notifyScopeAllFilteredCheck.isSelected != settings.notifyScopeAllFiltered ||
+                selectedInterval().minutes != settings.backgroundPollMinutes
         return nameChanged || urlChanged || tokenChanged || squashChanged || deleteChanged ||
             notificationsChanged
     }
@@ -152,6 +163,8 @@ class GitLabCockpitConfigurable : Configurable {
         settings.notifyMrState = notifyMrStateCheck.isSelected
         settings.notifyPush = notifyPushCheck.isSelected
         settings.notifyComments = notifyCommentsCheck.isSelected
+        settings.notifyScopeAllFiltered = notifyScopeAllFilteredCheck.isSelected
+        settings.backgroundPollMinutes = selectedInterval().minutes
 
         resultLabel.text = ""
     }
@@ -171,6 +184,8 @@ class GitLabCockpitConfigurable : Configurable {
         notifyMrStateCheck.isSelected = settings.notifyMrState
         notifyPushCheck.isSelected = settings.notifyPush
         notifyCommentsCheck.isSelected = settings.notifyComments
+        notifyScopeAllFilteredCheck.isSelected = settings.notifyScopeAllFiltered
+        backgroundIntervalCombo.selectedItem = PollInterval.of(settings.backgroundPollMinutes)
         syncNotificationChecks()
 
         resultLabel.text = ""
@@ -178,6 +193,9 @@ class GitLabCockpitConfigurable : Configurable {
 
     private fun selectedMerge(combo: ComboBox<MergeDefault>): MergeDefault =
         combo.selectedItem as? MergeDefault ?: MergeDefault.GITLAB_DEFAULT
+
+    private fun selectedInterval(): PollInterval =
+        backgroundIntervalCombo.selectedItem as? PollInterval ?: PollInterval.TWO
 
     private fun resetTokenField(baseUrl: String) {
         tokenField.text = ""
@@ -242,6 +260,23 @@ class GitLabCockpitConfigurable : Configurable {
 
         companion object {
             fun of(value: Boolean?): MergeDefault = values().first { it.value == value }
+        }
+    }
+
+    /**
+     * The offered background-poll intervals, mapped to their [minutes]. [toString] renders the
+     * localized label the combo shows; [of] resolves a persisted value to a choice, falling back to
+     * [TWO] for any value outside the offered set.
+     */
+    private enum class PollInterval(val minutes: Int, private val labelKey: String) {
+        ONE(1, "settings.notifications.interval.one"),
+        TWO(2, "settings.notifications.interval.two"),
+        FIVE(5, "settings.notifications.interval.five");
+
+        override fun toString(): String = CockpitBundle.message(labelKey)
+
+        companion object {
+            fun of(minutes: Int): PollInterval = values().firstOrNull { it.minutes == minutes } ?: TWO
         }
     }
 }

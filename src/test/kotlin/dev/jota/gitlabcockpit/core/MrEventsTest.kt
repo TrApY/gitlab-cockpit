@@ -59,6 +59,70 @@ class MrEventsTest {
         assertEquals(listOf(mine, assigned, reviewing), scope)
     }
 
+    // --- notificationScope --------------------------------------------------------------------
+
+    @Test
+    fun `notificationScope keeps the role scope when nothing is watched`() {
+        val mine = mr(1, authorId = me)
+        val reviewing = mr(2, reviewerIds = listOf(me))
+        val notMine = mr(3, authorId = other)
+
+        val scope = notificationScope(
+            listOf(mine, reviewing, notMine),
+            me,
+            watched = emptySet(),
+            includeAllFiltered = false,
+        )
+
+        assertEquals(listOf(mine, reviewing), scope)
+    }
+
+    @Test
+    fun `notificationScope adds a watched MR that is outside the role scope`() {
+        val mine = mr(1, authorId = me)
+        val watchedOutOfRole = mr(2, authorId = other)
+        val ignored = mr(3, authorId = other)
+
+        val scope = notificationScope(
+            listOf(mine, watchedOutOfRole, ignored),
+            me,
+            watched = setOf(ref(2)),
+            includeAllFiltered = false,
+        )
+
+        assertEquals(listOf(mine, watchedOutOfRole), scope)
+    }
+
+    @Test
+    fun `notificationScope with includeAllFiltered returns every MR of the filter`() {
+        val a = mr(1, authorId = other)
+        val b = mr(2, authorId = other)
+
+        val scope = notificationScope(
+            listOf(a, b),
+            me,
+            watched = emptySet(),
+            includeAllFiltered = true,
+        )
+
+        assertEquals(listOf(a, b), scope)
+    }
+
+    @Test
+    fun `notificationScope does not duplicate an MR that is both in role scope and watched`() {
+        val mineAndWatched = mr(1, authorId = me)
+        val watchedOutOfRole = mr(2, authorId = other)
+
+        val scope = notificationScope(
+            listOf(mineAndWatched, watchedOutOfRole),
+            me,
+            watched = setOf(ref(1), ref(2)),
+            includeAllFiltered = false,
+        )
+
+        assertEquals(listOf(mineAndWatched, watchedOutOfRole), scope)
+    }
+
     // --- detectMrEvents: first pass -----------------------------------------------------------
 
     @Test

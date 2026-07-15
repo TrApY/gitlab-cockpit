@@ -28,5 +28,7 @@
             displayType="BALLOON"/>
         <diff.DiffExtension
             implementation="dev.jota.gitlabcockpit.ui.diff.CockpitDiffExtension"/>
+        <postStartupActivity
+            implementation="dev.jota.gitlabcockpit.core.BackgroundNotificationsPoller"/>
     </extensions>
 </idea-plugin>

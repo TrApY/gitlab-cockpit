@@ -4,6 +4,12 @@
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-07-15
+
+### Added
+
+- Notifications keep working with the tool window closed (configurable background poll interval), a per-MR Watch toggle adds any merge request to the notification scope, and an option widens the scope to every merge request of the current filter
+
 ## [0.10.0] - 2026-07-15
 
 ### Added

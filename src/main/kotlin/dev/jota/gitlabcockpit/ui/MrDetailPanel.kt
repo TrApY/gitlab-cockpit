@@ -326,9 +326,32 @@ class MrDetailPanel(
         approvalsLabel = label
         approvalButton = button
         approvalsLine.add(buildMergeButton(mr))
+        approvalsLine.add(buildWatchButton(mr))
         header.add(approvalsLine)
 
         return header
+    }
+
+    /**
+     * Builds the Watch / Unwatch toggle (GLC-28). Clicking flips this MR's membership of the project's
+     * watch list — a purely local, synchronous persistence (no network) — so a watched MR joins the
+     * notification scope even when it is outside the user's role scope. The label reflects the current
+     * state both when the header is built and after each toggle.
+     */
+    private fun buildWatchButton(mr: GitLabMergeRequest): JButton {
+        val ref = MrRef(mr.projectId, mr.iid)
+        val button = JButton().apply { toolTipText = CockpitBundle.message("detail.watch.tooltip") }
+        fun refreshText() {
+            button.text = CockpitBundle.message(
+                if (service.isWatched(ref)) "detail.unwatch" else "detail.watch",
+            )
+        }
+        refreshText()
+        button.addActionListener {
+            service.setWatched(ref, !service.isWatched(ref))
+            refreshText()
+        }
+        return button
     }
 
     /**
