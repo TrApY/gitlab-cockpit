@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cockpit for GitLab - icon proposals</title>
+<style>
+  :root { font-family: -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; }
+  body { margin: 0; padding: 24px; color: #222; background: #fafafa; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  p.sub { margin: 0 0 24px; color: #666; font-size: 13px; }
+  .panels { display: flex; gap: 20px; flex-wrap: wrap; }
+  .panel { flex: 1 1 340px; border-radius: 10px; padding: 20px; }
+  .light { background: #ffffff; border: 1px solid #e3e3e3; color: #222; }
+  .dark  { background: #1e1f22; border: 1px solid #35363a; color: #ddd; }
+  .panel h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; margin: 0 0 16px; opacity: .7; }
+  table { border-collapse: collapse; width: 100%; }
+  th, td { padding: 10px 8px; text-align: center; font-size: 12px; }
+  .light th, .light td { border-bottom: 1px solid #eee; }
+  .dark th, .dark td  { border-bottom: 1px solid #333; }
+  th.name { text-align: left; }
+  td.name { text-align: left; font-weight: 600; font-size: 13px; }
+  td.name small { display: block; font-weight: 400; opacity: .6; }
+  img { display: block; margin: 0 auto; image-rendering: -webkit-optimize-contrast; }
+  .cell { display: flex; align-items: center; justify-content: center; height: 88px; }
+</style>
+</head>
+<body>
+  <h1>Cockpit for GitLab &mdash; plugin icon proposals</h1>
+  <p class="sub">Three square 40&times;40 SVG concepts shown at 16 / 40 / 80 px on light and dark backgrounds. Proposal 1 is the one currently installed as <code>pluginIcon.svg</code>.</p>
+
+  <div class="panels">
+    <div class="panel light">
+      <h2>Light background</h2>
+      <table>
+        <tr><th class="name">Proposal</th><th>16px</th><th>40px</th><th>80px</th></tr>
+        <tr>
+          <td class="name">1. Cockpit gauge <small>gauge dome + git-branch needle (installed)</small></td>
+          <td><div class="cell"><img src="proposal-1.svg" width="16" height="16"></div></td>
+          <td><div class="cell"><img src="proposal-1.svg" width="40" height="40"></div></td>
+          <td><div class="cell"><img src="proposal-1.svg" width="80" height="80"></div></td>
+        </tr>
+        <tr>
+          <td class="name">2. Hexagon merge <small>two branches converging on a merge node</small></td>
+          <td><div class="cell"><img src="proposal-2.svg" width="16" height="16"></div></td>
+          <td><div class="cell"><img src="proposal-2.svg" width="40" height="40"></div></td>
+          <td><div class="cell"><img src="proposal-2.svg" width="80" height="80"></div></td>
+        </tr>
+        <tr>
+          <td class="name">3. Review panel <small>panel window with diff lines + check</small></td>
+          <td><div class="cell"><img src="proposal-3.svg" width="16" height="16"></div></td>
+          <td><div class="cell"><img src="proposal-3.svg" width="40" height="40"></div></td>
+          <td><div class="cell"><img src="proposal-3.svg" width="80" height="80"></div></td>
+        </tr>
+      </table>
+    </div>
+
+    <div class="panel dark">
+      <h2>Dark background</h2>
+      <table>
+        <tr><th class="name">Proposal</th><th>16px</th><th>40px</th><th>80px</th></tr>
+        <tr>
+          <td class="name">1. Cockpit gauge <small>gauge dome + git-branch needle (installed)</small></td>
+          <td><div class="cell"><img src="proposal-1.svg" width="16" height="16"></div></td>
+          <td><div class="cell"><img src="proposal-1.svg" width="40" height="40"></div></td>
+          <td><div class="cell"><img src="proposal-1.svg" width="80" height="80"></div></td>
+        </tr>
+        <tr>
+          <td class="name">2. Hexagon merge <small>two branches converging on a merge node</small></td>
+          <td><div class="cell"><img src="proposal-2.svg" width="16" height="16"></div></td>
+          <td><div class="cell"><img src="proposal-2.svg" width="40" height="40"></div></td>
+          <td><div class="cell"><img src="proposal-2.svg" width="80" height="80"></div></td>
+        </tr>
+        <tr>
+          <td class="name">3. Review panel <small>panel window with diff lines + check</small></td>
+          <td><div class="cell"><img src="proposal-3.svg" width="16" height="16"></div></td>
+          <td><div class="cell"><img src="proposal-3.svg" width="40" height="40"></div></td>
+          <td><div class="cell"><img src="proposal-3.svg" width="80" height="80"></div></td>
+        </tr>
+      </table>
+    </div>
+  </div>
+</body>
+</html>

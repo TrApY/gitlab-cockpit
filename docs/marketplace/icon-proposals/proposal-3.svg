@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 40 40" width="40" height="40" role="img" aria-label="Review panel with diff lines and a check mark">
+  <!-- panel window -->
+  <rect x="6" y="8" width="28" height="24" rx="3" ry="3" fill="none" stroke="#E8833A" stroke-width="2.4"/>
+  <!-- title bar divider -->
+  <line x1="6" y1="14.5" x2="34" y2="14.5" stroke="#E8833A" stroke-width="1.8"/>
+  <!-- diff lines -->
+  <line x1="10" y1="20" x2="22" y2="20" stroke="#46A65C" stroke-width="2.4" stroke-linecap="round"/>
+  <line x1="10" y1="24" x2="25" y2="24" stroke="#4C86C6" stroke-width="2.4" stroke-linecap="round"/>
+  <line x1="10" y1="28" x2="18" y2="28" stroke="#CC6B2E" stroke-width="2.4" stroke-linecap="round"/>
+  <!-- approval check -->
+  <path d="M26.5 26.8 l2.4 2.4 l4.4 -5.4" fill="none" stroke="#46A65C" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

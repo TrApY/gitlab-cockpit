@@ -2,10 +2,9 @@
 <idea-plugin>
     <id>dev.jota.gitlabcockpit</id>
     <name>Cockpit for GitLab</name>
-    <vendor email="j.t.m.s.89@gmail.com" url="https://github.com/TrApY">JoTa</vendor>
-    <description><![CDATA[
-        <p>Manage GitLab merge requests without leaving your IDE: edit reviewers and assignees, comment, review diffs, and control the merge request's pipelines — view live logs, retry or cancel jobs.</p>
-    ]]></description>
+    <!-- Vendor por defecto del bootstrap; pendiente de confirmar/cambiar por el usuario antes de la primera subida -->
+    <vendor email="j.t.m.s.89@gmail.com" url="https://github.com/TrApY/gitlab-cockpit">JoTa</vendor>
+    <!-- The <description> is injected at build time from the README.md "Plugin description" section (see build.gradle.kts). -->
 
     <depends>com.intellij.modules.platform</depends>
     <depends>Git4Idea</depends>
