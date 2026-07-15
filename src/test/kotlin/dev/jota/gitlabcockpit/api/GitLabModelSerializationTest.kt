@@ -91,6 +91,33 @@ class GitLabModelSerializationTest {
         assertNull(mr.closedAt)
         assertFalse(mr.squash)
         assertNull(mr.forceRemoveSourceBranch)
+        // Notification fields (GLC-27) default to null when absent.
+        assertNull(mr.sha)
+        assertNull(mr.userNotesCount)
+    }
+
+    @Test
+    fun `merge request parses sha and user_notes_count from the list endpoint`() {
+        val payload = """
+            {
+              "iid": 42,
+              "project_id": 100,
+              "title": "Watched MR",
+              "state": "opened",
+              "source_branch": "feature",
+              "target_branch": "main",
+              "web_url": "https://gitlab.com/g/r/-/merge_requests/42",
+              "updated_at": "2026-07-15T10:00:00Z",
+              "sha": "abc123def456",
+              "user_notes_count": 7,
+              "author": {"id": 1, "username": "jota", "name": "Jo Ta"}
+            }
+        """.trimIndent()
+
+        val mr = json.decodeFromString<GitLabMergeRequest>(payload)
+
+        assertEquals("abc123def456", mr.sha)
+        assertEquals(7, mr.userNotesCount)
     }
 
     @Test

@@ -106,6 +106,18 @@ data class GitLabMergeRequest(
      * GitLab omits it when unset; the merge dialog treats a null as `false`.
      */
     @SerialName("force_remove_source_branch") val forceRemoveSourceBranch: Boolean? = null,
+    /**
+     * The MR's current head SHA (`sha`), returned by the list endpoint. The notifications watcher
+     * diffs it across passes to detect a new push (see [dev.jota.gitlabcockpit.core.detectMrEvents]);
+     * nullable because a trimmed payload may omit it.
+     */
+    val sha: String? = null,
+    /**
+     * How many user (non-system) notes the MR has (`user_notes_count`), returned by the list endpoint.
+     * The notifications watcher diffs it across passes to detect new comments; nullable because a
+     * trimmed payload may omit it.
+     */
+    @SerialName("user_notes_count") val userNotesCount: Int? = null,
 )
 
 /**

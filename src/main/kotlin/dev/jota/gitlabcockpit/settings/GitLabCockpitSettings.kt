@@ -38,6 +38,27 @@ class GitLabCockpitSettings : PersistentStateComponent<GitLabCockpitSettings.Sta
 
         /** Remembered "Delete source branch" merge option; same tri-state encoding as [mergeSquash]. */
         var mergeDeleteSourceBranch: String = UNSET
+
+        /**
+         * Master switch for IDE notifications. When `false` no balloon is ever raised, whatever the
+         * per-event flags below say. Defaults to `true` so existing users keep the pipeline balloons.
+         */
+        var notificationsEnabled: Boolean = true
+
+        /** Raise a balloon when a watched MR's pipeline finishes (success/failed). Status-quo default. */
+        var notifyPipeline: Boolean = true
+
+        /** Raise a balloon when a new MR appears in the current user's scope (author/assignee/reviewer). */
+        var notifyNewMr: Boolean = false
+
+        /** Raise a balloon when a watched MR changes state (merged/closed/reopened). */
+        var notifyMrState: Boolean = false
+
+        /** Raise a balloon when new commits are pushed to a watched MR (its head SHA changes). */
+        var notifyPush: Boolean = false
+
+        /** Raise a balloon when new comments are added to a watched MR (its note count grows). */
+        var notifyComments: Boolean = false
     }
 
     private var state = State()
@@ -64,6 +85,36 @@ class GitLabCockpitSettings : PersistentStateComponent<GitLabCockpitSettings.Sta
     var mergeDeleteSourceBranch: Boolean?
         get() = decodeTriState(state.mergeDeleteSourceBranch)
         set(value) { state.mergeDeleteSourceBranch = encodeTriState(value) }
+
+    /** Master switch for IDE notifications; see [State.notificationsEnabled]. */
+    var notificationsEnabled: Boolean
+        get() = state.notificationsEnabled
+        set(value) { state.notificationsEnabled = value }
+
+    /** Notify on pipeline finished (success/failed); see [State.notifyPipeline]. */
+    var notifyPipeline: Boolean
+        get() = state.notifyPipeline
+        set(value) { state.notifyPipeline = value }
+
+    /** Notify on a new MR in scope; see [State.notifyNewMr]. */
+    var notifyNewMr: Boolean
+        get() = state.notifyNewMr
+        set(value) { state.notifyNewMr = value }
+
+    /** Notify on MR state changes; see [State.notifyMrState]. */
+    var notifyMrState: Boolean
+        get() = state.notifyMrState
+        set(value) { state.notifyMrState = value }
+
+    /** Notify on new commits pushed; see [State.notifyPush]. */
+    var notifyPush: Boolean
+        get() = state.notifyPush
+        set(value) { state.notifyPush = value }
+
+    /** Notify on new comments; see [State.notifyComments]. */
+    var notifyComments: Boolean
+        get() = state.notifyComments
+        set(value) { state.notifyComments = value }
 
     private fun decodeTriState(raw: String): Boolean? = when (raw) {
         TRUE -> true

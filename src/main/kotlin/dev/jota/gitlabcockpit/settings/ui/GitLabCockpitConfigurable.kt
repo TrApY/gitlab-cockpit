@@ -7,6 +7,7 @@ import com.intellij.openapi.progress.ProgressIndicator
 import com.intellij.openapi.progress.ProgressManager
 import com.intellij.openapi.progress.Task
 import com.intellij.openapi.ui.ComboBox
+import com.intellij.ui.components.JBCheckBox
 import com.intellij.ui.components.JBLabel
 import com.intellij.ui.components.JBPasswordField
 import com.intellij.ui.components.JBTextField
@@ -38,6 +39,25 @@ class GitLabCockpitConfigurable : Configurable {
     private val squashCombo = ComboBox(MergeDefault.values())
     private val deleteSourceCombo = ComboBox(MergeDefault.values())
 
+    private val notificationsEnabledCheck =
+        JBCheckBox(CockpitBundle.message("settings.notifications.enabled")).apply {
+            addActionListener { syncNotificationChecks() }
+        }
+    private val notifyPipelineCheck = JBCheckBox(CockpitBundle.message("settings.notifications.pipeline"))
+    private val notifyNewMrCheck = JBCheckBox(CockpitBundle.message("settings.notifications.newMr"))
+    private val notifyMrStateCheck = JBCheckBox(CockpitBundle.message("settings.notifications.mrState"))
+    private val notifyPushCheck = JBCheckBox(CockpitBundle.message("settings.notifications.push"))
+    private val notifyCommentsCheck = JBCheckBox(CockpitBundle.message("settings.notifications.comments"))
+
+    /** The five per-event checkboxes, greyed out together while the master switch is off. */
+    private val eventChecks = listOf(
+        notifyPipelineCheck,
+        notifyNewMrCheck,
+        notifyMrStateCheck,
+        notifyPushCheck,
+        notifyCommentsCheck,
+    )
+
     override fun getDisplayName(): String = CockpitBundle.message("settings.displayName")
 
     override fun createComponent(): JComponent {
@@ -63,9 +83,23 @@ class GitLabCockpitConfigurable : Configurable {
                     cell(deleteSourceCombo)
                 }
             }
+            group(CockpitBundle.message("settings.notifications.title")) {
+                row { cell(notificationsEnabledCheck) }
+                row { cell(notifyPipelineCheck) }
+                row { cell(notifyNewMrCheck) }
+                row { cell(notifyMrStateCheck) }
+                row { cell(notifyPushCheck) }
+                row { cell(notifyCommentsCheck) }
+            }
         }
         reset()
         return dialogPanel
+    }
+
+    /** Greys out the per-event checkboxes when the master notifications switch is off. */
+    private fun syncNotificationChecks() {
+        val enabled = notificationsEnabledCheck.isSelected
+        eventChecks.forEach { it.isEnabled = enabled }
     }
 
     private fun firstInstance(): InstanceState? = settings.instances.firstOrNull()
@@ -78,7 +112,15 @@ class GitLabCockpitConfigurable : Configurable {
         val tokenChanged = tokenField.password.isNotEmpty()
         val squashChanged = selectedMerge(squashCombo).value != settings.mergeSquash
         val deleteChanged = selectedMerge(deleteSourceCombo).value != settings.mergeDeleteSourceBranch
-        return nameChanged || urlChanged || tokenChanged || squashChanged || deleteChanged
+        val notificationsChanged =
+            notificationsEnabledCheck.isSelected != settings.notificationsEnabled ||
+                notifyPipelineCheck.isSelected != settings.notifyPipeline ||
+                notifyNewMrCheck.isSelected != settings.notifyNewMr ||
+                notifyMrStateCheck.isSelected != settings.notifyMrState ||
+                notifyPushCheck.isSelected != settings.notifyPush ||
+                notifyCommentsCheck.isSelected != settings.notifyComments
+        return nameChanged || urlChanged || tokenChanged || squashChanged || deleteChanged ||
+            notificationsChanged
     }
 
     override fun apply() {
@@ -104,6 +146,13 @@ class GitLabCockpitConfigurable : Configurable {
         settings.mergeSquash = selectedMerge(squashCombo).value
         settings.mergeDeleteSourceBranch = selectedMerge(deleteSourceCombo).value
 
+        settings.notificationsEnabled = notificationsEnabledCheck.isSelected
+        settings.notifyPipeline = notifyPipelineCheck.isSelected
+        settings.notifyNewMr = notifyNewMrCheck.isSelected
+        settings.notifyMrState = notifyMrStateCheck.isSelected
+        settings.notifyPush = notifyPushCheck.isSelected
+        settings.notifyComments = notifyCommentsCheck.isSelected
+
         resultLabel.text = ""
     }
 
@@ -115,6 +164,14 @@ class GitLabCockpitConfigurable : Configurable {
 
         squashCombo.selectedItem = MergeDefault.of(settings.mergeSquash)
         deleteSourceCombo.selectedItem = MergeDefault.of(settings.mergeDeleteSourceBranch)
+
+        notificationsEnabledCheck.isSelected = settings.notificationsEnabled
+        notifyPipelineCheck.isSelected = settings.notifyPipeline
+        notifyNewMrCheck.isSelected = settings.notifyNewMr
+        notifyMrStateCheck.isSelected = settings.notifyMrState
+        notifyPushCheck.isSelected = settings.notifyPush
+        notifyCommentsCheck.isSelected = settings.notifyComments
+        syncNotificationChecks()
 
         resultLabel.text = ""
     }

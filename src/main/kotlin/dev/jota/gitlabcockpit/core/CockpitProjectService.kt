@@ -463,6 +463,15 @@ class CockpitProjectService(
     private val lastPipelineStatus = ConcurrentHashMap<MrRef, String>()
 
     /**
+     * Last known [MrSnapshot] of every MR in the current user's notification scope, keyed by [MrRef].
+     * `null` until the first watcher pass has run — the null vs. empty-map distinction is what makes
+     * the first pass memorize silently (see [detectMrEvents]). Deliberately **not** reset by [refresh]
+     * (mirroring [lastPipelineStatus]) so a manual refresh does not drop a round of events.
+     */
+    @Volatile
+    private var lastMrSnapshot: Map<MrRef, MrSnapshot>? = null
+
+    /**
      * One watcher pass: for the (at most [MAX_WATCHED_MRS] most recent) MRs the current user authored
      * or is assigned to, fetches each MR's latest pipeline status in parallel and compares it to the
      * last known one, returning the transitions worth notifying ([shouldNotify]). The status cache is
@@ -489,6 +498,21 @@ class CockpitProjectService(
                 }
             }.awaitAll().filterNotNull()
         }
+    }
+
+    /**
+     * One MR-events watcher pass (no network): narrows [ready.mrs] to the current user's scope
+     * ([mrScope]) and diffs it against [lastMrSnapshot] via [detectMrEvents], returning the detected
+     * events and atomically advancing the stored snapshot. Synchronized so overlapping passes never
+     * emit the same event twice. The snapshot always advances (even for event types the user has
+     * muted) so toggling a checkbox on never replays historical changes.
+     */
+    @Synchronized
+    fun detectScopeMrEvents(ready: CockpitState.Ready): List<MrEvent> {
+        val scoped = mrScope(ready.mrs, ready.currentUser.id)
+        val (events, snapshot) = detectMrEvents(lastMrSnapshot, scoped)
+        lastMrSnapshot = snapshot
+        return events
     }
 
     /**

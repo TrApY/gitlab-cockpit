@@ -31,8 +31,8 @@ import dev.jota.gitlabcockpit.core.CockpitProjectService
 import dev.jota.gitlabcockpit.core.CockpitState
 import dev.jota.gitlabcockpit.core.MergeRequestState
 import dev.jota.gitlabcockpit.core.MrFilterSelection
+import dev.jota.gitlabcockpit.core.MrNotificationsWatcher
 import dev.jota.gitlabcockpit.core.MrRef
-import dev.jota.gitlabcockpit.core.PipelineWatcher
 import dev.jota.gitlabcockpit.core.RoleFilter
 import dev.jota.gitlabcockpit.core.projectLabelOf
 import kotlinx.coroutines.Dispatchers
@@ -64,8 +64,8 @@ class CockpitToolWindowPanel(
 
     private val service = CockpitProjectService.getInstance(project)
 
-    /** Fires IDE balloons when the current user's MR pipelines flip to success / failed. */
-    private val pipelineWatcher = PipelineWatcher(project, service)
+    /** Fires the configurable IDE balloons (pipelines, new MRs, state changes, pushes, comments). */
+    private val mrNotificationsWatcher = MrNotificationsWatcher(project, service)
 
     private val roleCombo = ComboBox(RoleFilter.entries.toTypedArray()).apply {
         renderer = SimpleListCellRenderer.create<RoleFilter>("") { roleLabel(it) }
@@ -293,12 +293,12 @@ class CockpitToolWindowPanel(
     }
 
     /**
-     * Runs the lightweight pipeline-notification watcher for a freshly loaded list, on its own root
+     * Runs the lightweight notifications watcher for a freshly loaded list, on its own root
      * coroutine so it neither blocks the render nor is cancelled by the next [reload]. Off the EDT.
      */
     private fun maybeWatch(state: CockpitState) {
         if (state is CockpitState.Ready) {
-            service.coroutineScope.launch { pipelineWatcher.onReady(state) }
+            service.coroutineScope.launch { mrNotificationsWatcher.onReady(state) }
         }
     }
 

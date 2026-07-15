@@ -4,6 +4,12 @@
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-07-15
+
+### Added
+
+- Configurable notifications: choose which events raise a balloon (pipeline result, new MRs in your scope, state changes, new pushes, new comments) from Settings
+
 ## [0.9.0] - 2026-07-15
 
 ### Added
