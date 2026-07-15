@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 40 40" width="40" height="40">
+  <!-- Proposal 4: JoTa's concept, trademark-safe — a DevOps infinity loop drawn as two git
+       branches (blue + orange) merging on a green commit node. No GitLab tanuki. -->
+  <path d="M 20 20 C 15 9, 3 11, 3 20 C 3 29, 15 31, 20 20"
+        fill="none" stroke="#4A90D9" stroke-width="4.5" stroke-linecap="round"/>
+  <path d="M 20 20 C 25 9, 37 11, 37 20 C 37 29, 25 31, 20 20"
+        fill="none" stroke="#E8763A" stroke-width="4.5" stroke-linecap="round"/>
+  <circle cx="6.5" cy="15.5" r="2.6" fill="#2E5F94"/>
+  <circle cx="33.5" cy="15.5" r="2.6" fill="#A84E1F"/>
+  <circle cx="20" cy="20" r="4.2" fill="#4CAF50"/>
+</svg>
