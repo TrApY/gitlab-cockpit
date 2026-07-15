@@ -1,6 +1,8 @@
 package dev.jota.gitlabcockpit.ui
 
 import com.intellij.execution.filters.TextConsoleBuilderFactory
+import com.intellij.execution.process.AnsiEscapeDecoder
+import com.intellij.execution.process.ProcessOutputTypes
 import com.intellij.execution.ui.ConsoleView
 import com.intellij.execution.ui.ConsoleViewContentType
 import com.intellij.openapi.Disposable
@@ -11,6 +13,7 @@ import dev.jota.gitlabcockpit.CockpitBundle
 import dev.jota.gitlabcockpit.api.GitLabJob
 import dev.jota.gitlabcockpit.api.GitLabResult
 import dev.jota.gitlabcockpit.core.CockpitProjectService
+import dev.jota.gitlabcockpit.core.JobTraceProcessor
 import dev.jota.gitlabcockpit.core.isJobCancelable
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -21,16 +24,22 @@ import kotlinx.coroutines.withContext
 import javax.swing.JComponent
 
 /**
- * A reusable "one console + streaming of one job" component built on the IDE [ConsoleView] (which
- * renders ANSI color escapes on its own). Owners embed [component] wherever they need it and call
- * [start] once to begin loading and streaming the job's trace.
+ * A reusable "one console + streaming of one job" component built on the IDE [ConsoleView]. GitLab's
+ * raw trace is not printed directly: it is first run through a per-console [JobTraceProcessor] (which
+ * strips GitLab 17+ timestamped prefixes, joins continuation lines, drops section markers and removes
+ * non-SGR ANSI while keeping color escapes), and the cleaned text is then colorized by a per-console
+ * [AnsiEscapeDecoder] that maps each SGR run to a [ConsoleViewContentType] before printing — the plain
+ * [ConsoleView] does not interpret ANSI on its own. Owners embed [component] wherever they need it and
+ * call [start] once to begin loading and streaming the job's trace.
  *
  * On [start] it loads the full trace (offset 0) and prints it. If the job is not yet terminal
  * ([isJobCancelable] — created / pending / running) it then **streams**: every [POLL_INTERVAL_MS] ms
  * it polls the trace from the current offset and prints only the new fragment, and every
  * [STATUS_POLL_EVERY] iterations it polls the job's status; once the job leaves the cancelable set it
  * does one last trace pass, reports the final status through [onStatusChange] and stops. Repeated
- * network failures ([MAX_CONSECUTIVE_FAILURES] in a row) print a notice and stop streaming.
+ * network failures ([MAX_CONSECUTIVE_FAILURES] in a row) print a notice and stop streaming. The trace
+ * processor buffers the last (still-incomplete) logical line, so streaming ends with a [flushLog] to
+ * emit whatever it was holding.
  *
  * All network work runs on the service's coroutine scope (never the EDT); the console and the
  * streaming [Job] are registered on [parentDisposable], so both are cleaned up when the owner is
@@ -51,6 +60,12 @@ class JobLogConsole(
 
     private val console: ConsoleView =
         TextConsoleBuilderFactory.getInstance().createBuilder(project).console
+
+    /** Stateful cleaner for this console's trace; instantiated per console so its buffers stay isolated. */
+    private val processor = JobTraceProcessor()
+
+    /** Turns the processor's SGR-bearing text into colored [ConsoleView] prints; also per console. */
+    private val ansiDecoder = AnsiEscapeDecoder()
 
     private var streamJob: Job? = null
 
@@ -78,7 +93,10 @@ class JobLogConsole(
             }
 
             // Already finished when opened: show the full log and stop, no streaming.
-            if (!isJobCancelable(job.status)) return@launch
+            if (!isJobCancelable(job.status)) {
+                flushLog()
+                return@launch
+            }
 
             var consecutiveFailures = 0
             var iteration = 0
@@ -95,6 +113,7 @@ class JobLogConsole(
                         consecutiveFailures++
                         printError(CockpitBundle.message("log.streaming.error", describe(chunk)))
                         if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+                            flushLog()
                             printError(CockpitBundle.message("log.streaming.stopped"))
                             return@launch
                         }
@@ -109,6 +128,7 @@ class JobLogConsole(
                         if (tail is GitLabResult.Success && tail.data.content.isNotEmpty()) {
                             printNormal(tail.data.content)
                         }
+                        flushLog()
                         notifyStatus(jobResult.data.status)
                         return@launch
                     }
@@ -117,8 +137,24 @@ class JobLogConsole(
         }
     }
 
-    private suspend fun printNormal(text: String) = withContext(Dispatchers.EDT) {
-        console.print(text, ConsoleViewContentType.NORMAL_OUTPUT)
+    /** Feeds a raw trace chunk through the processor and prints whatever complete lines it emits. */
+    private suspend fun printNormal(text: String) = emitProcessed(processor.feed(text))
+
+    /** Emits the last logical line the processor is still holding; call once the stream ends. */
+    private suspend fun flushLog() = emitProcessed(processor.flush())
+
+    /**
+     * Colorizes the processor's SGR-bearing output with [ansiDecoder] and prints each run on the EDT
+     * under the [ConsoleViewContentType] its ANSI attributes map to. Empty text is a no-op so a chunk
+     * that produced only buffered (not-yet-complete) lines prints nothing.
+     */
+    private suspend fun emitProcessed(text: String) {
+        if (text.isEmpty()) return
+        withContext(Dispatchers.EDT) {
+            ansiDecoder.escapeText(text, ProcessOutputTypes.STDOUT) { chunk, key ->
+                console.print(chunk, ConsoleViewContentType.getConsoleViewType(key))
+            }
+        }
     }
 
     private suspend fun printError(text: String) = withContext(Dispatchers.EDT) {

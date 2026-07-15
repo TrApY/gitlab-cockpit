@@ -4,6 +4,12 @@
 
 ## [Unreleased]
 
+## [0.5.2] - 2026-07-15
+
+### Fixed
+
+- Job logs render clean on GitLab 17+ timestamped traces: the per-line timestamp prefixes are stripped, continuation lines are joined back into their logical line, `section_start`/`section_end` markers and non-color terminal escapes (line clears, cursor moves) are dropped, and real ANSI colors are shown instead of literal escape codes
+
 ## [0.5.1] - 2026-07-15
 
 ### Fixed
