@@ -8,11 +8,27 @@
     ]]></description>
 
     <depends>com.intellij.modules.platform</depends>
+    <depends>Git4Idea</depends>
 
-    <resource-bundle>messages.MyBundle</resource-bundle>
+    <resource-bundle>messages.CockpitBundle</resource-bundle>
 
     <extensions defaultExtensionNs="com.intellij">
-        <toolWindow factoryClass="dev.jota.gitlabcockpit.toolWindow.MyToolWindowFactory" id="MyToolWindow"/>
-        <postStartupActivity implementation="dev.jota.gitlabcockpit.startup.MyProjectActivity" />
+        <applicationConfigurable
+            parentId="tools"
+            instance="dev.jota.gitlabcockpit.settings.ui.GitLabCockpitConfigurable"
+            id="dev.jota.gitlabcockpit.settings"
+            displayName="Cockpit for GitLab"/>
+        <toolWindow
+            id="GitLab Cockpit"
+            anchor="right"
+            factoryClass="dev.jota.gitlabcockpit.ui.CockpitToolWindowFactory"
+            icon="AllIcons.Vcs.Vendors.Github"/>
+        <notificationGroup
+            id="Cockpit for GitLab"
+            displayType="BALLOON"/>
+        <diff.DiffExtension
+            implementation="dev.jota.gitlabcockpit.ui.diff.CockpitDiffExtension"/>
+        <postStartupActivity
+            implementation="dev.jota.gitlabcockpit.core.BackgroundNotificationsPoller"/>
     </extensions>
 </idea-plugin>
