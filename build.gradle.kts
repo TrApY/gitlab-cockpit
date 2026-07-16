@@ -30,6 +30,20 @@ intellijPlatform {
             untilBuild = provider { null }
         }
     }
+
+    // Firma del plugin: exigida por el Marketplace para publicar vía publishPlugin (release.yml).
+    // Los tres valores llegan como secrets del repo; en local estas env no existen y la firma
+    // simplemente no se ejecuta (buildPlugin no la necesita).
+    signing {
+        certificateChain = providers.environmentVariable("CERTIFICATE_CHAIN")
+        privateKey = providers.environmentVariable("PRIVATE_KEY")
+        password = providers.environmentVariable("PRIVATE_KEY_PASSWORD")
+    }
+
+    // Publicación en el Marketplace (canal Stable por defecto), disparada por release.yml.
+    publishing {
+        token = providers.environmentVariable("PUBLISH_TOKEN")
+    }
 }
 
 dependencies {
