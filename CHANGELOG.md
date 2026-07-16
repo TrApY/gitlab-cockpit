@@ -4,6 +4,12 @@
 
 ## [Unreleased]
 
+## [0.11.1] - 2026-07-16
+
+### Fixed
+
+- Address Marketplace verification warnings: stop bundling the IDE's markdown library and drop usages of an API scheduled for removal
+
 ## [0.11.0] - 2026-07-15
 
 ### Added

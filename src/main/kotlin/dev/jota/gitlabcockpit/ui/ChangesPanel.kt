@@ -28,7 +28,6 @@ import com.intellij.ui.ColoredTreeCellRenderer
 import com.intellij.ui.DoubleClickListener
 import com.intellij.ui.JBColor
 import com.intellij.ui.OnePixelSplitter
-import com.intellij.ui.SimpleListCellRenderer
 import com.intellij.ui.SimpleTextAttributes
 import com.intellij.ui.components.ActionLink
 import com.intellij.ui.components.JBCheckBox
@@ -169,7 +168,7 @@ class ChangesPanel(
     private val discussionListModel = CollectionListModel<GitLabDiscussion>()
     private val discussionList = JBList(discussionListModel).apply {
         selectionMode = ListSelectionModel.SINGLE_SELECTION
-        cellRenderer = SimpleListCellRenderer.create("") { discussionLabel(it) }
+        cellRenderer = textCellRenderer<GitLabDiscussion>("") { discussionLabel(it) }
     }
 
     private val discussionPane = CockpitHtml.createHtmlPane()
@@ -1010,11 +1009,10 @@ class ChangesPanel(
         private val sideCombo = ComboBox<ThreadSide>().apply {
             addItem(ThreadSide.NEW)
             addItem(ThreadSide.OLD)
-            renderer = SimpleListCellRenderer.create("") { side ->
+            renderer = textCellRenderer<ThreadSide>("") { side ->
                 when (side) {
                     ThreadSide.NEW -> CockpitBundle.message("dialog.newThread.side.new")
                     ThreadSide.OLD -> CockpitBundle.message("dialog.newThread.side.old")
-                    null -> ""
                 }
             }
             selectedItem = initialSide
@@ -1022,8 +1020,8 @@ class ChangesPanel(
         }
 
         private val lineCombo = ComboBox<Int>().apply {
-            renderer = SimpleListCellRenderer.create("") { line ->
-                line?.let { CockpitBundle.message("dialog.newThread.line.label", it) } ?: ""
+            renderer = textCellRenderer<Int>("") { line ->
+                CockpitBundle.message("dialog.newThread.line.label", line)
             }
         }
 

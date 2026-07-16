@@ -12,7 +12,6 @@ import com.intellij.ui.DocumentAdapter
 import com.intellij.ui.DoubleClickListener
 import com.intellij.ui.JBColor
 import com.intellij.ui.SearchTextField
-import com.intellij.ui.SimpleListCellRenderer
 import com.intellij.ui.components.ActionLink
 import com.intellij.ui.components.JBCheckBox
 import com.intellij.ui.components.JBLabel
@@ -969,7 +968,7 @@ class MrDetailPanel(
         private val listModel = CollectionListModel<GitLabUser?>()
         private val userList = JBList(listModel).apply {
             selectionMode = ListSelectionModel.SINGLE_SELECTION
-            cellRenderer = SimpleListCellRenderer.create(noneLabel) { user -> user?.let(::memberLabel) ?: noneLabel }
+            cellRenderer = textCellRenderer<GitLabUser>(noneLabel) { user -> memberLabel(user) }
         }
 
         init {

@@ -37,7 +37,12 @@ dependencies {
     // Coroutines are provided by the IntelliJ Platform classpath, so they are not declared here.
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.8.1")
     // Markdown → HTML rendering for the MR description (pure JetBrains parser, no Swing).
-    implementation("org.jetbrains:markdown:0.7.3")
+    // compileOnly: the IntelliJ Platform bundles this exact library (lib/lib-client.jar), so it is
+    // provided at runtime — declaring it as a full dependency would package a copy of the IDE's own
+    // classes into the plugin ZIP (Marketplace verification warning). Tests run outside the IDE, so
+    // they need it on the test classpath explicitly.
+    compileOnly("org.jetbrains:markdown:0.7.3")
+    testImplementation("org.jetbrains:markdown:0.7.3")
 
     testImplementation("junit:junit:4.13.2")
 

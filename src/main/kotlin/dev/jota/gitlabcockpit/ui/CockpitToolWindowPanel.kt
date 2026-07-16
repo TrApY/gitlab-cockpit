@@ -13,7 +13,6 @@ import com.intellij.ui.CollectionListModel
 import com.intellij.ui.ColoredListCellRenderer
 import com.intellij.ui.DoubleClickListener
 import com.intellij.ui.OnePixelSplitter
-import com.intellij.ui.SimpleListCellRenderer
 import com.intellij.ui.SimpleTextAttributes
 import com.intellij.ui.TextFieldWithAutoCompletion
 import com.intellij.ui.components.ActionLink
@@ -68,7 +67,7 @@ class CockpitToolWindowPanel(
     private val mrNotificationsWatcher = MrNotificationsWatcher(project, service)
 
     private val roleCombo = ComboBox(RoleFilter.entries.toTypedArray()).apply {
-        renderer = SimpleListCellRenderer.create<RoleFilter>("") { roleLabel(it) }
+        renderer = textCellRenderer<RoleFilter>("") { roleLabel(it) }
         selectedItem = RoleFilter.ALL
     }
 
@@ -93,7 +92,7 @@ class CockpitToolWindowPanel(
     private var userCandidatesLoaded = false
 
     private val stateCombo = ComboBox(MergeRequestState.entries.toTypedArray()).apply {
-        renderer = SimpleListCellRenderer.create<MergeRequestState>("") { stateLabel(it) }
+        renderer = textCellRenderer<MergeRequestState>("") { stateLabel(it) }
         selectedItem = MergeRequestState.OPENED
     }
 

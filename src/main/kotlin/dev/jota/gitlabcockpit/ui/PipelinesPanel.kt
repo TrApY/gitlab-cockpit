@@ -11,7 +11,6 @@ import com.intellij.ui.ColoredTreeCellRenderer
 import com.intellij.ui.DoubleClickListener
 import com.intellij.ui.JBColor
 import com.intellij.ui.PopupHandler
-import com.intellij.ui.SimpleListCellRenderer
 import com.intellij.ui.SimpleTextAttributes
 import com.intellij.ui.components.JBLabel
 import com.intellij.ui.components.JBScrollPane
@@ -107,7 +106,7 @@ class PipelinesPanel(
     private var actionJob: Job? = null
 
     private val pipelineCombo = ComboBox<GitLabPipeline>().apply {
-        renderer = SimpleListCellRenderer.create("") { pipelineLabel(it) }
+        renderer = textCellRenderer<GitLabPipeline>("") { pipelineLabel(it) }
     }
 
     private val refreshButton = JButton(AllIcons.Actions.Refresh).apply {
