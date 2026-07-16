@@ -114,3 +114,21 @@
 ### Added
 
 - Initial scaffolding from IntelliJ Platform Plugin Template
+
+[Unreleased]: https://github.com/TrApY/gitlab-cockpit/compare/0.12.0...HEAD
+[0.12.0]: https://github.com/TrApY/gitlab-cockpit/compare/0.11.1...0.12.0
+[0.11.1]: https://github.com/TrApY/gitlab-cockpit/compare/0.11.0...0.11.1
+[0.11.0]: https://github.com/TrApY/gitlab-cockpit/compare/0.10.0...0.11.0
+[0.10.0]: https://github.com/TrApY/gitlab-cockpit/compare/0.9.0...0.10.0
+[0.9.0]: https://github.com/TrApY/gitlab-cockpit/compare/0.8.0...0.9.0
+[0.8.0]: https://github.com/TrApY/gitlab-cockpit/compare/0.7.0...0.8.0
+[0.7.0]: https://github.com/TrApY/gitlab-cockpit/compare/0.6.0...0.7.0
+[0.6.0]: https://github.com/TrApY/gitlab-cockpit/compare/0.5.2...0.6.0
+[0.5.2]: https://github.com/TrApY/gitlab-cockpit/compare/0.5.1...0.5.2
+[0.5.1]: https://github.com/TrApY/gitlab-cockpit/compare/0.5.0...0.5.1
+[0.5.0]: https://github.com/TrApY/gitlab-cockpit/compare/0.4.1...0.5.0
+[0.4.1]: https://github.com/TrApY/gitlab-cockpit/compare/0.4.0...0.4.1
+[0.4.0]: https://github.com/TrApY/gitlab-cockpit/compare/0.3.0...0.4.0
+[0.3.0]: https://github.com/TrApY/gitlab-cockpit/compare/0.2.0...0.3.0
+[0.2.0]: https://github.com/TrApY/gitlab-cockpit/compare/0.0.1...0.2.0
+[0.0.1]: https://github.com/TrApY/gitlab-cockpit/commits/0.0.1
