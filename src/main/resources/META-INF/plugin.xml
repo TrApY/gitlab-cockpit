@@ -11,6 +11,32 @@
 
     <resource-bundle>messages.CockpitBundle</resource-bundle>
 
+    <!-- Keyboard-first diff review (GLC-29). All remappable and added to the diff editor's context
+         menu; each borrows a platform gesture via use-shortcut-of (no keystrokes of our own):
+         New comment at caret -> Code.Review.Editor.New.Comment (Ctrl+Shift+X); thread navigation ->
+         Next/PreviousOccurence (Ctrl+Alt+Down/Up), matching the bundled GitHub review actions.
+         Texts/descriptions come from the resource-bundle (action.<id>.text/.description). -->
+    <actions>
+        <action id="Cockpit.Diff.NewComment"
+                class="dev.jota.gitlabcockpit.ui.diff.CockpitNewCommentAction"
+                icon="AllIcons.General.Balloon"
+                use-shortcut-of="Code.Review.Editor.New.Comment">
+            <add-to-group group-id="Diff.EditorPopupMenu" anchor="last"/>
+        </action>
+        <action id="Cockpit.Diff.PreviousThread"
+                class="dev.jota.gitlabcockpit.ui.diff.CockpitPreviousThreadAction"
+                icon="AllIcons.Actions.PreviousOccurence"
+                use-shortcut-of="PreviousOccurence">
+            <add-to-group group-id="Diff.EditorPopupMenu" anchor="last"/>
+        </action>
+        <action id="Cockpit.Diff.NextThread"
+                class="dev.jota.gitlabcockpit.ui.diff.CockpitNextThreadAction"
+                icon="AllIcons.Actions.NextOccurence"
+                use-shortcut-of="NextOccurence">
+            <add-to-group group-id="Diff.EditorPopupMenu" anchor="last"/>
+        </action>
+    </actions>
+
     <extensions defaultExtensionNs="com.intellij">
         <applicationConfigurable
             parentId="tools"

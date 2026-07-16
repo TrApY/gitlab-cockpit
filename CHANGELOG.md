@@ -4,6 +4,12 @@
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-07-16
+
+### Added
+
+- Keyboard-first diff review: MR files open as a diff chain (Alt+Shift+Left/Right to move between files), Ctrl+Shift+X comments on the caret line, and Ctrl+Alt+Up/Down jumps between review threads; all actions are remappable and available in the diff context menu
+
 ## [0.11.1] - 2026-07-16
 
 ### Fixed

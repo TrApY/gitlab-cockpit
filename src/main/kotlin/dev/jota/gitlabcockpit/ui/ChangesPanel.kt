@@ -1,7 +1,13 @@
 package dev.jota.gitlabcockpit.ui
 
 import com.intellij.diff.DiffContentFactory
+import com.intellij.diff.DiffDialogHints
 import com.intellij.diff.DiffManager
+import com.intellij.diff.chains.DiffRequestProducer
+import com.intellij.diff.chains.DiffRequestProducerException
+import com.intellij.diff.chains.SimpleDiffRequestChain
+import com.intellij.diff.chains.SimpleDiffRequestProducer
+import com.intellij.diff.requests.DiffRequest
 import com.intellij.diff.requests.SimpleDiffRequest
 import com.intellij.diff.tools.util.DiffDataKeys
 import com.intellij.diff.tools.util.side.TwosideTextDiffViewer
@@ -17,6 +23,7 @@ import com.intellij.openapi.actionSystem.CommonDataKeys
 import com.intellij.openapi.application.EDT
 import com.intellij.openapi.editor.Editor
 import com.intellij.openapi.fileTypes.FileTypeManager
+import com.intellij.openapi.progress.runBlockingCancellable
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.ui.ComboBox
 import com.intellij.openapi.ui.DialogWrapper
@@ -57,7 +64,9 @@ import dev.jota.gitlabcockpit.core.DiffLineMap
 import dev.jota.gitlabcockpit.core.FileNode
 import dev.jota.gitlabcockpit.core.LinePosition
 import dev.jota.gitlabcockpit.core.MrRef
+import dev.jota.gitlabcockpit.core.ThreadSide
 import dev.jota.gitlabcockpit.core.buildLineMap
+import dev.jota.gitlabcockpit.core.chainIndex
 import dev.jota.gitlabcockpit.core.changeTypeOf
 import dev.jota.gitlabcockpit.core.buildFileTree
 import dev.jota.gitlabcockpit.core.discussionsByFile
@@ -148,7 +157,6 @@ class ChangesPanel(
 
     private var loadJob: Job? = null
     private var discussionsJob: Job? = null
-    private var diffJob: Job? = null
     private var replyJob: Job? = null
     private var newThreadJob: Job? = null
     private var draftsJob: Job? = null
@@ -348,7 +356,6 @@ class ChangesPanel(
     private fun cancelJobs() {
         loadJob?.cancel()
         discussionsJob?.cancel()
-        diffJob?.cancel()
         replyJob?.cancel()
         newThreadJob?.cancel()
         draftsJob?.cancel()
@@ -442,9 +449,15 @@ class ChangesPanel(
     // --- Diff in the editor -------------------------------------------------------------------
 
     /**
-     * Opens [file]'s base/head diff in the editor. The two sides are fetched raw off the EDT at the
-     * MR's `diff_refs` base/head SHAs (the missing side of an add/delete is empty); the diff is then
-     * assembled and shown on the EDT. A missing `diff_refs` is a hard error (nothing to anchor to).
+     * Opens the MR's files as a single diff *chain* — every changed file, in tree order — positioned on
+     * [file], so the platform's next/previous-file navigation (Alt+Shift+Right/Left) and the
+     * "go to changed file" popup walk the whole MR without reopening a diff per file. Each file's two
+     * sides are fetched lazily (only when its slide is shown) off the EDT in the producer's [process],
+     * so opening is instant and the other files cost nothing until visited. A missing `diff_refs` is a
+     * hard error (nothing to anchor to).
+     *
+     * [revealDiscussionId] is handed only to [file]'s producer (the Comments-tab "jump to thread" path),
+     * so just the file the user landed on scrolls to its thread.
      */
     private fun openDiff(file: GitLabDiffFile, revealDiscussionId: String? = null) {
         val ref = currentRef ?: return
@@ -457,23 +470,24 @@ class ChangesPanel(
             )
             return
         }
-        diffJob?.cancel()
-        diffJob = service.coroutineScope.launch {
-            val oldSide = if (file.newFile) SideText("") else loadSide(ref.projectId, file.oldPath, refs.baseSha)
-            val newSide = if (file.deletedFile) SideText("") else loadSide(ref.projectId, file.newPath, refs.headSha)
-            withContext(Dispatchers.EDT) {
-                if (currentRef != ref) return@withContext
-                if (oldSide == null || newSide == null) {
-                    Messages.showErrorDialog(
-                        project,
-                        CockpitBundle.message("changes.diff.error"),
-                        CockpitBundle.message("detail.error.title"),
-                    )
-                    return@withContext
-                }
-                showDiff(ref, file, refs, oldSide.text, newSide.text, revealDiscussionId)
-            }
+        val files = loadedFiles
+        if (files.isEmpty()) return
+        // Snapshot the panel state the (background) producers read, so the whole chain is consistent
+        // and no field is touched off the EDT.
+        val discussionsByPath = discussionsByFilePath
+        val webUrl = projectWebUrl
+        val producers = files.map { changed ->
+            diffProducerFor(
+                ref,
+                changed,
+                refs,
+                discussionsByPath,
+                webUrl,
+                revealDiscussionId.takeIf { changed === file },
+            )
         }
+        val chain = SimpleDiffRequestChain.fromProducers(producers, chainIndex(files, file))
+        DiffManager.getInstance().showDiff(project, chain, DiffDialogHints.DEFAULT)
     }
 
     /** Marker for a successfully resolved diff side (an HTTP error resolves to empty text). */
@@ -492,35 +506,67 @@ class ChangesPanel(
         }
 
     /**
-     * EDT. Assembles a [SimpleDiffRequest] with the file's type and shows it in the editor. A
-     * "Comment on line…" context action ([DiffUserDataKeys.CONTEXT_ACTIONS]) is attached so the user
-     * can start a review thread from the caret line without leaving the diff. The two editors show the
-     * whole base/head file, so an editor line number equals that side's GitLab line number.
-     *
-     * The request also carries a [CockpitDiffContext] (F4c) with the file's currently loaded
-     * discussions, so [dev.jota.gitlabcockpit.ui.diff.CockpitDiffExtension] can render the review
-     * threads inline in the diff editors. Threads created via "Comment on line…" show up the next
-     * time the diff is opened (the discussions are reloaded after posting).
-     *
-     * [revealDiscussionId], when set, is carried on the [CockpitDiffContext] so the renderer scrolls
-     * the freshly opened diff to that thread (the Comments-tab "jump to thread" path).
+     * One chain entry: a lazy [DiffRequestProducer] whose name is [file]'s display path. Its [process]
+     * runs off the EDT (the chain processor drives it with a progress indicator) and builds the same
+     * [SimpleDiffRequest] the old direct-open path did — via [buildDiffRequest] — so nothing about a
+     * single file's diff changes; only *when* it is assembled does.
      */
-    private fun showDiff(
+    private fun diffProducerFor(
         ref: MrRef,
         file: GitLabDiffFile,
         refs: DiffRefs,
-        oldText: String,
-        newText: String,
-        revealDiscussionId: String? = null,
-    ) {
+        discussionsByPath: Map<String, List<GitLabDiscussion>>,
+        webUrl: String?,
+        revealDiscussionId: String?,
+    ): DiffRequestProducer {
+        val displayPath = if (file.deletedFile) file.oldPath else file.newPath
+        return SimpleDiffRequestProducer.create(displayPath) {
+            buildDiffRequest(ref, file, refs, discussionsByPath, webUrl, revealDiscussionId)
+        }
+    }
+
+    /**
+     * Background (producer [process] thread). Fetches [file]'s two sides raw at the MR's `diff_refs`
+     * base/head SHAs (the missing side of an add/delete is empty), blocking with
+     * [runBlockingCancellable] so the suspend service calls run under the indicator's cancellation, and
+     * assembles a [SimpleDiffRequest] with the file's type. A transport failure on either side aborts
+     * the producer with a [DiffRequestProducerException] carrying the localized error.
+     *
+     * A "Comment on line…" toolbar action ([DiffUserDataKeys.CONTEXT_ACTIONS]) is attached so the user
+     * can start a review thread from the caret without leaving the diff. The request also carries a
+     * [CockpitDiffContext] (F4c) with [file]'s loaded discussions ([discussionsByPath]) so
+     * [dev.jota.gitlabcockpit.ui.diff.CockpitDiffExtension] renders the review threads inline, stamps
+     * the "New comment at caret" handle ([openNewThread]) and — when there are threads — the
+     * thread-navigation handle. [revealDiscussionId], when set, tells the renderer to scroll to that
+     * thread. The two editors show the whole base/head file, so an editor line equals that side's
+     * GitLab line number.
+     */
+    @Throws(DiffRequestProducerException::class)
+    private fun buildDiffRequest(
+        ref: MrRef,
+        file: GitLabDiffFile,
+        refs: DiffRefs,
+        discussionsByPath: Map<String, List<GitLabDiscussion>>,
+        webUrl: String?,
+        revealDiscussionId: String?,
+    ): DiffRequest {
+        val sides = runBlockingCancellable {
+            val old = if (file.newFile) SideText("") else loadSide(ref.projectId, file.oldPath, refs.baseSha)
+            val new = if (file.deletedFile) SideText("") else loadSide(ref.projectId, file.newPath, refs.headSha)
+            old to new
+        }
+        val (oldSide, newSide) = sides
+        if (oldSide == null || newSide == null) {
+            throw DiffRequestProducerException(CockpitBundle.message("changes.diff.error"))
+        }
         val displayPath = if (file.deletedFile) file.oldPath else file.newPath
         val fileName = displayPath.substringAfterLast('/')
         val fileType = FileTypeManager.getInstance().getFileTypeByFileName(fileName)
         val factory = DiffContentFactory.getInstance()
         val request = SimpleDiffRequest(
             CockpitBundle.message("changes.diff.title", ref.iid, displayPath),
-            factory.create(project, oldText, fileType),
-            factory.create(project, newText, fileType),
+            factory.create(project, oldSide.text, fileType),
+            factory.create(project, newSide.text, fileType),
             CockpitBundle.message("changes.diff.base"),
             CockpitBundle.message("changes.diff.head"),
         )
@@ -536,13 +582,21 @@ class ChangesPanel(
         // The discussions map keys by the position's new_path (falling back to old_path), so both
         // paths are probed — a rename/delete may have been keyed under either one.
         val fileDiscussions =
-            (discussionsByFilePath[file.newPath].orEmpty() + discussionsByFilePath[file.oldPath].orEmpty())
+            (discussionsByPath[file.newPath].orEmpty() + discussionsByPath[file.oldPath].orEmpty())
                 .distinctBy { it.id }
         request.putUserData(
             CockpitDiffContext.KEY,
-            CockpitDiffContext(ref, file, refs, fileDiscussions, projectWebUrl, revealDiscussionId),
+            CockpitDiffContext(
+                mrRef = ref,
+                file = file,
+                refs = refs,
+                discussions = fileDiscussions,
+                projectWebUrl = webUrl,
+                revealDiscussionId = revealDiscussionId,
+                openNewThread = { side, line -> openNewThreadDialog(file, refs, side, line) },
+            ),
         )
-        DiffManager.getInstance().showDiff(project, request)
+        return request
     }
 
     /**
@@ -984,9 +1038,6 @@ class ChangesPanel(
             }
         }
     }
-
-    /** Which diff side a new thread anchors to. */
-    private enum class ThreadSide { NEW, OLD }
 
     /**
      * Modal dialog to start a review thread on a diff line. Shows the file, a New/Old side selector,

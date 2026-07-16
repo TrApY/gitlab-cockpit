@@ -22,6 +22,9 @@ import dev.jota.gitlabcockpit.CockpitBundle
 import dev.jota.gitlabcockpit.api.GitLabDiscussion
 import dev.jota.gitlabcockpit.core.AnchorSide
 import dev.jota.gitlabcockpit.core.CockpitProjectService
+import dev.jota.gitlabcockpit.core.DiffAnchor
+import dev.jota.gitlabcockpit.core.nextAnchorIndex
+import dev.jota.gitlabcockpit.core.sortAnchors
 import dev.jota.gitlabcockpit.core.threadNeedsAttention
 import dev.jota.gitlabcockpit.core.threadsByAnchor
 import java.awt.Color
@@ -51,6 +54,16 @@ internal class DiffThreadsRenderer(
     private val diffContext: CockpitDiffContext,
 ) {
 
+    /**
+     * The file's mounted anchors, sorted for navigation ([sortAnchors]): line ascending, OLD before
+     * NEW at an equal line. Populated on [mount] (EDT); read by [navigate] (EDT). Empty until the
+     * viewer inits, so an early Next/Previous is a harmless no-op.
+     */
+    private var mountedAnchors: List<MountedAnchor> = emptyList()
+
+    /** One navigable review-thread anchor: the [editor] hosting it, its 0-based [lineIndex], the [anchor]. */
+    private data class MountedAnchor(val editor: Editor, val lineIndex: Int, val anchor: DiffAnchor)
+
     /** Defers mounting to the viewer's init; [DiffViewerListener.onInit] fires on the EDT. */
     fun install() {
         viewer.addListener(object : DiffViewerListener() {
@@ -63,6 +76,7 @@ internal class DiffThreadsRenderer(
         val service = CockpitProjectService.getInstance(project)
         // The line (and its editor) hosting the discussion the diff was asked to scroll to, if any.
         var revealTarget: Pair<Editor, Int>? = null
+        val mounted = mutableListOf<MountedAnchor>()
 
         for ((anchor, discussions) in threadsByAnchor(diffContext.discussions)) {
             val editor = viewer.getEditor(if (anchor.side == AnchorSide.OLD) Side.LEFT else Side.RIGHT)
@@ -98,6 +112,7 @@ internal class DiffThreadsRenderer(
             ) ?: continue
 
             val highlighter = addLineMarker(editor, lineIndex, discussions)
+            mounted += MountedAnchor(editor, lineIndex, anchor)
 
             if (diffContext.revealDiscussionId != null &&
                 discussions.any { it.id == diffContext.revealDiscussionId }
@@ -125,11 +140,43 @@ internal class DiffThreadsRenderer(
             )
         }
 
+        // Order the mounted anchors for keyboard navigation; each unique anchor maps to one mount.
+        val byAnchor = mounted.associateBy { it.anchor }
+        mountedAnchors = sortAnchors(mounted.map { it.anchor }).mapNotNull { byAnchor[it] }
+
         revealTarget?.let { (editor, line) ->
             editor.scrollingModel.scrollTo(LogicalPosition(line, 0), ScrollType.CENTER)
         }
         // One-shot: never scroll again if this viewer re-inits.
         diffContext.revealDiscussionId = null
+    }
+
+    /**
+     * EDT. Moves the caret to the next ([forward] = true) or previous review thread and scrolls it
+     * into view, cycling. The "current" position is the focused editor's side + caret line; from it
+     * [nextAnchorIndex] picks the thread to jump to (the anchor on the caret line, else the nearest one
+     * in the navigation order). A no-op until threads are mounted or when the focused editor is not one
+     * of the two sides. Driven by [CockpitThreadNavigator] on both editors.
+     */
+    fun navigate(forward: Boolean) {
+        val anchors = mountedAnchors
+        if (anchors.isEmpty()) return
+        val index = nextAnchorIndex(anchors.map { it.anchor }, currentReference(), forward) ?: return
+        val target = anchors[index]
+        target.editor.caretModel.moveToLogicalPosition(LogicalPosition(target.lineIndex, 0))
+        target.editor.scrollingModel.scrollTo(LogicalPosition(target.lineIndex, 0), ScrollType.CENTER)
+        target.editor.contentComponent.requestFocusInWindow()
+    }
+
+    /** The caret's `(side, 1-based line)` in the focused editor, or null when it is neither side. */
+    private fun currentReference(): DiffAnchor? {
+        val editor = viewer.currentEditor ?: return null
+        val side = when (editor) {
+            viewer.getEditor(Side.LEFT) -> AnchorSide.OLD
+            viewer.getEditor(Side.RIGHT) -> AnchorSide.NEW
+            else -> return null
+        }
+        return DiffAnchor(side, editor.caretModel.logicalPosition.line + 1)
     }
 
     /**

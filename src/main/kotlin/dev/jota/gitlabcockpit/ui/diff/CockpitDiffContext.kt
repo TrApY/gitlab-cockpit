@@ -5,6 +5,7 @@ import dev.jota.gitlabcockpit.api.DiffRefs
 import dev.jota.gitlabcockpit.api.GitLabDiffFile
 import dev.jota.gitlabcockpit.api.GitLabDiscussion
 import dev.jota.gitlabcockpit.core.MrRef
+import dev.jota.gitlabcockpit.core.ThreadSide
 
 /**
  * Everything [CockpitDiffExtension] needs to render one file's review threads inside its diff:
@@ -19,6 +20,11 @@ import dev.jota.gitlabcockpit.core.MrRef
  * action of the Comments tab, it names the discussion the diff should scroll to once its inline
  * threads are mounted. [DiffThreadsRenderer] consumes it (clears it to null) after scrolling, so a
  * later re-init of the same viewer does not scroll again. Null for a diff opened any other way.
+ *
+ * [openNewThread] lets the "New comment at caret" action ([CockpitCommentHandle]) start a review
+ * thread on the caret's `(side, 1-based line)` reusing ChangesPanel's new-thread flow;
+ * [CockpitDiffExtension] moves it onto each editor as user-data. Null (the default) leaves the action
+ * disabled — e.g. for tests that build a context without the panel.
  */
 data class CockpitDiffContext(
     val mrRef: MrRef,
@@ -27,6 +33,7 @@ data class CockpitDiffContext(
     val discussions: List<GitLabDiscussion>,
     val projectWebUrl: String?,
     var revealDiscussionId: String? = null,
+    val openNewThread: ((side: ThreadSide, line1Based: Int) -> Unit)? = null,
 ) {
     companion object {
         /** The request user-data slot [CockpitDiffExtension] looks for. */
