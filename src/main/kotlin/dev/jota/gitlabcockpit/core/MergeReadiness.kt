@@ -40,6 +40,39 @@ fun mergeButtonState(state: String?, detailedMergeStatus: String?): MergeButtonS
 }
 
 /**
+ * How the Overview "merge readiness" line reads: [READY] (green "Ready to merge"), [BLOCKED] (amber
+ * "Merge blocked: <reason>") or [HIDDEN] — the MR is not open, so no readiness is shown at all (its
+ * merged/closed state is already carried by the header's meta line).
+ */
+enum class MergeLineState { READY, BLOCKED, HIDDEN }
+
+/**
+ * The resolved Overview merge-readiness line: the [state] to render and, for a [MergeLineState.BLOCKED]
+ * line, the bundle key of the blocker reason ([reasonKey]) — always `null` for [MergeLineState.READY]
+ * and [MergeLineState.HIDDEN].
+ */
+data class MergeLinePresentation(val state: MergeLineState, val reasonKey: String?)
+
+/**
+ * Derives the Overview merge-readiness line from an MR's [state] and [detailedMergeStatus], layered on
+ * [mergeButtonState] so the line and the Merge action can never disagree: a non-open MR is [HIDDEN]; a
+ * `mergeable` MR is [READY]; a `ci_still_running` MR is [BLOCKED] on its pipeline
+ * ([reasonKey] `merge.status.ciRunning`); every other blocker is [BLOCKED] with the same localized
+ * reason the Merge button shows. Pure and platform-free.
+ */
+fun mergeLinePresentation(state: String?, detailedMergeStatus: String?): MergeLinePresentation {
+    if (state != "opened") return MergeLinePresentation(MergeLineState.HIDDEN, null)
+    val button = mergeButtonState(state, detailedMergeStatus)
+    return when (button.action) {
+        MergeAction.MERGE -> MergeLinePresentation(MergeLineState.READY, null)
+        MergeAction.MERGE_WHEN_PIPELINE_SUCCEEDS ->
+            MergeLinePresentation(MergeLineState.BLOCKED, "merge.status.ciRunning")
+        MergeAction.DISABLED ->
+            MergeLinePresentation(MergeLineState.BLOCKED, button.reasonKey ?: "merge.status.generic")
+    }
+}
+
+/**
  * How healthy an MR's approvals are, for coloring the Overview approvals line: [SATISFIED] (green),
  * [PENDING] (amber) or [UNKNOWN] (no color — the project reports no approval rules).
  */

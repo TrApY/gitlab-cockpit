@@ -42,8 +42,9 @@ import com.intellij.ui.components.JBList
 import com.intellij.ui.components.JBScrollPane
 import com.intellij.ui.components.JBTextArea
 import com.intellij.ui.components.panels.VerticalLayout
+import com.intellij.ui.dsl.builder.Align
+import com.intellij.ui.dsl.builder.panel
 import com.intellij.ui.treeStructure.Tree
-import com.intellij.util.ui.FormBuilder
 import com.intellij.util.ui.JBUI
 import com.intellij.util.ui.UIUtil
 import com.intellij.util.ui.tree.TreeUtil
@@ -1109,17 +1110,24 @@ class ChangesPanel(
 
         override fun createCenterPanel(): JComponent {
             val displayPath = if (file.deletedFile) file.oldPath else file.newPath
-            val builder = FormBuilder.createFormBuilder()
-                .addLabeledComponent(CockpitBundle.message("dialog.newThread.file"), JBLabel(displayPath))
-                .addLabeledComponent(CockpitBundle.message("dialog.newThread.side"), sideCombo)
-                .addLabeledComponent(CockpitBundle.message("dialog.newThread.line"), lineCombo)
-                .addLabeledComponentFillVertically(
-                    CockpitBundle.message("dialog.newThread.body"),
-                    JBScrollPane(bodyArea),
-                )
-                .addComponent(draftCheckBox)
-            if (!hasCommentableLines) builder.addComponent(noticeLabel)
-            return builder.panel.apply { preferredSize = CockpitTheme.NEW_THREAD_DIALOG_SIZE }
+            return panel {
+                row(CockpitBundle.message("dialog.newThread.file")) {
+                    cell(JBLabel(displayPath))
+                }
+                row(CockpitBundle.message("dialog.newThread.side")) {
+                    cell(sideCombo)
+                }
+                row(CockpitBundle.message("dialog.newThread.line")) {
+                    cell(lineCombo)
+                }
+                row(CockpitBundle.message("dialog.newThread.body")) {
+                    cell(JBScrollPane(bodyArea)).align(Align.FILL)
+                }.resizableRow()
+                row { cell(draftCheckBox) }
+                if (!hasCommentableLines) {
+                    row { cell(noticeLabel) }
+                }
+            }.apply { preferredSize = CockpitTheme.NEW_THREAD_DIALOG_SIZE }
         }
 
         override fun doValidate(): ValidationInfo? = when {

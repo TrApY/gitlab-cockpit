@@ -1,5 +1,6 @@
 package dev.jota.gitlabcockpit.ui
 
+import com.intellij.ide.BrowserUtil
 import com.intellij.icons.AllIcons
 import com.intellij.openapi.application.EDT
 import com.intellij.openapi.project.Project
@@ -20,7 +21,10 @@ import com.intellij.ui.components.JBTabbedPane
 import com.intellij.ui.components.JBTextArea
 import com.intellij.ui.components.JBTextField
 import com.intellij.ui.components.panels.VerticalLayout
-import com.intellij.util.ui.FormBuilder
+import com.intellij.ui.dsl.builder.Align
+import com.intellij.ui.dsl.builder.AlignX
+import com.intellij.ui.dsl.builder.panel
+import com.intellij.util.ui.JBFont
 import com.intellij.util.ui.JBUI
 import com.intellij.util.ui.UIUtil
 import dev.jota.gitlabcockpit.CockpitBundle
@@ -30,15 +34,20 @@ import dev.jota.gitlabcockpit.api.GitLabResult
 import dev.jota.gitlabcockpit.api.GitLabUser
 import dev.jota.gitlabcockpit.api.MergeRequestUpdate
 import dev.jota.gitlabcockpit.core.ApprovalsHealth
+import dev.jota.gitlabcockpit.core.Closing
 import dev.jota.gitlabcockpit.core.CockpitProjectService
 import dev.jota.gitlabcockpit.core.CommentThread
 import dev.jota.gitlabcockpit.core.MergeAction
+import dev.jota.gitlabcockpit.core.MergeLinePresentation
+import dev.jota.gitlabcockpit.core.MergeLineState
+import dev.jota.gitlabcockpit.core.MrHeaderPresentation
 import dev.jota.gitlabcockpit.core.MrRef
 import dev.jota.gitlabcockpit.core.ReviewerSelectionModel
 import dev.jota.gitlabcockpit.core.approvalsHealth
 import dev.jota.gitlabcockpit.core.commentThreads
 import dev.jota.gitlabcockpit.core.filterMembers
 import dev.jota.gitlabcockpit.core.mergeButtonState
+import dev.jota.gitlabcockpit.core.mrHeaderPresentation
 import dev.jota.gitlabcockpit.core.projectWebUrlOf
 import dev.jota.gitlabcockpit.core.threadAnchorLabel
 import dev.jota.gitlabcockpit.settings.GitLabCockpitSettings
@@ -54,6 +63,7 @@ import java.awt.Cursor
 import java.awt.FlowLayout
 import java.awt.Font
 import java.awt.GridBagLayout
+import java.awt.event.MouseAdapter
 import java.awt.event.MouseEvent
 import javax.swing.JButton
 import javax.swing.JComponent
@@ -64,9 +74,13 @@ import javax.swing.event.DocumentEvent
 /**
  * The detail pane shown below the MR list. Renders one merge request inside a two-tab layout:
  *
- * - **Overview**: header (`!iid title` + DRAFT/conflicts badges + edit-title/description button),
- *   author/assignee row, reviewers row, an approvals row ("Approved by: …" + an Approve/Revoke
- *   button that reflects whether the current user already approved) and the markdown description.
+ * - **Overview**: a native "Info"-style header — the title (+ a DRAFT badge), a `source → target`
+ *   branch line, a muted `!iid · created … by …` meta line (with a `· merged/closed …` suffix once
+ *   the MR is), the head pipeline's status (clickable, jumps to the Pipelines tab), a
+ *   merge-readiness line ("Ready to merge" / "Merge blocked: …") with the "Approved by: …" line
+ *   below it, and an action row of platform [ActionLink]s (Approve/Revoke, Merge, Open in browser,
+ *   Watch/Unwatch, Edit reviewers/assignee) plus the edit-title/description button — followed by the
+ *   markdown description.
  * - **Comments**: the MR's discussion threads (system notes filtered out) rendered as themed HTML —
  *   each thread's first note at root level, replies indented, with "Resolved" and diff-anchor tags —
  *   plus a text area whose button posts a new general comment or, in reply mode (entered from a
@@ -108,10 +122,10 @@ class MrDetailPanel(
 
     /** Recreated by [buildHeader]; updated by the async approvals load. */
     private var approvalsLabel: JBLabel? = null
-    private var approvalButton: JButton? = null
+    private var approvalLink: ActionLink? = null
 
     /** Recreated by [buildHeader]; its state is fully derived from the MR (no async load needed). */
-    private var mergeButton: JButton? = null
+    private var mergeLink: ActionLink? = null
 
     private val descriptionPane = CockpitHtml.createHtmlPane()
     private val descriptionScroll = JBScrollPane(descriptionPane)
@@ -279,131 +293,217 @@ class MrDetailPanel(
     }
 
     private fun buildHeader(mr: GitLabMergeRequest): JComponent {
+        val pres = mrHeaderPresentation(
+            mr = mr,
+            authorName = displayName(mr.author),
+            createdRelative = mr.createdAt?.let(::formatRelative),
+            mergedRelative = mr.mergedAt?.let(::formatRelative),
+            closedRelative = mr.closedAt?.let(::formatRelative),
+        )
+
         val header = JPanel(VerticalLayout(JBUI.scale(4)))
         header.isOpaque = false
         header.border = CockpitTheme.panelBorder()
 
+        // 1. Title + DRAFT badge.
         val titleLine = flowLine()
-        titleLine.add(JBLabel("!${mr.iid}  ${mr.title}").apply { font = font.deriveFont(Font.BOLD) })
-        if (mr.draft) {
-            titleLine.add(badge(CockpitBundle.message("toolwindow.mr.draft"), UIUtil.getContextHelpForeground()))
+        titleLine.add(JBLabel(pres.title).apply { font = JBFont.h4() })
+        if (pres.draft) {
+            titleLine.add(badge(CockpitBundle.message("toolwindow.mr.draft"), CockpitTheme.warning))
         }
-        if (mr.hasConflicts) {
-            titleLine.add(badge(CockpitBundle.message("toolwindow.mr.conflicts"), CockpitTheme.danger))
+        header.add(titleLine)
+
+        // 2. Branch line: source → target (target muted).
+        val branchLine = flowLine()
+        branchLine.add(JBLabel(pres.sourceBranch).apply { icon = AllIcons.Vcs.Branch })
+        branchLine.add(
+            JBLabel(CockpitBundle.message("detail.branch.arrow", pres.targetBranch)).apply {
+                foreground = CockpitTheme.muted()
+            },
+        )
+        header.add(branchLine)
+
+        // 3. Meta line: !iid · created … by … (· merged/closed …).
+        header.add(buildMetaLine(pres))
+
+        // 4. Pipeline line (omitted when the MR has no head pipeline).
+        buildPipelineLine(pres.pipelineStatus)?.let { header.add(it) }
+
+        // 5. Merge-readiness line (omitted for a non-open MR) + the "Approved by: …" line below it.
+        buildMergeLine(pres.merge)?.let { header.add(it) }
+        header.add(buildApprovalsLine())
+
+        // 6. Action row.
+        header.add(buildActionsRow(mr))
+
+        return header
+    }
+
+    /** The muted `!iid · created <relative> by <author>` meta line, with a merged/closed suffix. */
+    private fun buildMetaLine(pres: MrHeaderPresentation): JComponent {
+        val who = if (pres.createdRelative != null) {
+            CockpitBundle.message("detail.meta.createdBy", pres.createdRelative, pres.authorName)
+        } else {
+            CockpitBundle.message("detail.meta.by", pres.authorName)
         }
-        titleLine.add(
+        val parts = buildList {
+            add(pres.reference)
+            add(who)
+            pres.closingRelative?.let { relative ->
+                val key = if (pres.closing == Closing.MERGED) "detail.meta.merged" else "detail.meta.closed"
+                add(CockpitBundle.message(key, relative))
+            }
+        }
+        val line = flowLine()
+        line.add(JBLabel(parts.joinToString(DATE_SEPARATOR)).apply { foreground = CockpitTheme.muted() })
+        return line
+    }
+
+    /**
+     * The head pipeline line — `Pipeline status:` followed by the status (colored via
+     * [CockpitTheme.statusColor] with its [CockpitIcons] icon), clickable to jump to the Pipelines
+     * tab. Null when [status] is null (the MR has no head pipeline), so no empty row is added.
+     */
+    private fun buildPipelineLine(status: String?): JComponent? {
+        if (status == null) return null
+        val line = flowLine()
+        line.add(JBLabel(CockpitBundle.message("detail.pipeline.status")))
+        val statusLabel = JBLabel(pipelineStatusText(status)).apply {
+            icon = CockpitIcons.status(status)
+            foreground = CockpitTheme.statusColor(status)
+            toolTipText = CockpitBundle.message("detail.pipeline.tooltip")
+            cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
+        }
+        statusLabel.addMouseListener(object : MouseAdapter() {
+            override fun mouseClicked(e: MouseEvent) {
+                tabbedPane.selectedIndex = PIPELINES_TAB_INDEX
+            }
+        })
+        line.add(statusLabel)
+        return line
+    }
+
+    /**
+     * The merge-readiness line derived from [merge]: "Ready to merge" (success) or "Merge blocked:
+     * <reason>" (warning). Null for a [MergeLineState.HIDDEN] presentation (a non-open MR), so no row
+     * is added.
+     */
+    private fun buildMergeLine(merge: MergeLinePresentation): JComponent? {
+        val (text, color) = when (merge.state) {
+            MergeLineState.READY ->
+                CockpitBundle.message("detail.merge.ready") to CockpitTheme.success
+            MergeLineState.BLOCKED -> {
+                val reason = CockpitBundle.message(merge.reasonKey ?: "merge.status.generic")
+                CockpitBundle.message("detail.merge.blocked", reason) to CockpitTheme.warning
+            }
+            MergeLineState.HIDDEN -> return null
+        }
+        val line = flowLine()
+        line.add(JBLabel(text).apply { foreground = color })
+        return line
+    }
+
+    /** The "Approved by: …" line (label only); the async approvals load fills and colors it. */
+    private fun buildApprovalsLine(): JComponent {
+        val line = flowLine()
+        val label = JBLabel(
+            CockpitBundle.message("detail.approvedBy", CockpitBundle.message("detail.approvals.loading")),
+        )
+        approvalsLabel = label
+        line.add(label)
+        return line
+    }
+
+    /**
+     * The action row: platform [ActionLink]s for Approve/Revoke, Merge, Open in browser,
+     * Watch/Unwatch and the reviewer/assignee edit dialogs, plus the icon Edit button for the
+     * title/description.
+     */
+    private fun buildActionsRow(mr: GitLabMergeRequest): JComponent {
+        val row = flowLine()
+        row.add(buildApproveLink())
+        row.add(buildMergeLink(mr))
+        row.add(ActionLink(CockpitBundle.message("detail.openInBrowser")) { BrowserUtil.browse(mr.webUrl) })
+        row.add(buildWatchLink(mr))
+        row.add(ActionLink(CockpitBundle.message("detail.editReviewers")) { onEditReviewers(mr) })
+        row.add(ActionLink(CockpitBundle.message("detail.editAssignee")) { onEditAssignee(mr) })
+        row.add(
             JButton(AllIcons.Actions.Edit).apply {
                 toolTipText = CockpitBundle.message("detail.editTooltip")
                 addActionListener { onEditTitleDescription(mr) }
             },
         )
-        header.add(titleLine)
-
-        val assignee = mr.assignees.firstOrNull()?.let(::displayName) ?: CockpitBundle.message("detail.none")
-        val authorLine = flowLine()
-        authorLine.add(
-            JBLabel(
-                CockpitBundle.message("detail.author") + " " + displayName(mr.author) +
-                    "    " + CockpitBundle.message("detail.assignee") + " " + assignee,
-            ),
-        )
-        authorLine.add(ActionLink(CockpitBundle.message("detail.edit")) { onEditAssignee(mr) })
-        header.add(authorLine)
-
-        val reviewers = mr.reviewers.joinToString(", ") { displayName(it) }
-            .ifEmpty { CockpitBundle.message("detail.none") }
-        val reviewersLine = flowLine()
-        reviewersLine.add(JBLabel(CockpitBundle.message("detail.reviewers") + " " + reviewers))
-        reviewersLine.add(ActionLink(CockpitBundle.message("detail.edit")) { onEditReviewers(mr) })
-        header.add(reviewersLine)
-
-        buildDatesLine(mr)?.let { header.add(it) }
-
-        val approvalsLine = flowLine()
-        val label = JBLabel(
-            CockpitBundle.message("detail.approvedBy", CockpitBundle.message("detail.approvals.loading")),
-        )
-        val button = JButton(CockpitBundle.message("detail.approve")).apply { isEnabled = false }
-        approvalsLine.add(label)
-        approvalsLine.add(button)
-        approvalsLabel = label
-        approvalButton = button
-        approvalsLine.add(buildMergeButton(mr))
-        approvalsLine.add(buildWatchButton(mr))
-        header.add(approvalsLine)
-
-        return header
+        return row
     }
 
     /**
-     * Builds the Watch / Unwatch toggle (GLC-28). Clicking flips this MR's membership of the project's
-     * watch list — a purely local, synchronous persistence (no network) — so a watched MR joins the
-     * notification scope even when it is outside the user's role scope. The label reflects the current
-     * state both when the header is built and after each toggle.
+     * The Approve/Revoke action link, disabled until the async approvals load re-targets it in
+     * [renderApprovals]. [ActionLink.autoHideOnDisable] is turned off so the disabled link stays
+     * visible (greyed) while loading instead of vanishing.
      */
-    private fun buildWatchButton(mr: GitLabMergeRequest): JButton {
+    private fun buildApproveLink(): ActionLink {
+        val link = ActionLink(CockpitBundle.message("detail.approve")).apply {
+            autoHideOnDisable = false
+            isEnabled = false
+        }
+        approvalLink = link
+        return link
+    }
+
+    /**
+     * Builds the Watch / Unwatch toggle (GLC-28) as an [ActionLink]. Clicking flips this MR's
+     * membership of the project's watch list — a purely local, synchronous persistence (no network) —
+     * so a watched MR joins the notification scope even when it is outside the user's role scope. The
+     * label reflects the current state both when the header is built and after each toggle.
+     */
+    private fun buildWatchLink(mr: GitLabMergeRequest): ActionLink {
         val ref = MrRef(mr.projectId, mr.iid)
-        val button = JButton().apply { toolTipText = CockpitBundle.message("detail.watch.tooltip") }
+        val link = ActionLink().apply { toolTipText = CockpitBundle.message("detail.watch.tooltip") }
         fun refreshText() {
-            button.text = CockpitBundle.message(
+            link.text = CockpitBundle.message(
                 if (service.isWatched(ref)) "detail.unwatch" else "detail.watch",
             )
         }
         refreshText()
-        button.addActionListener {
+        link.addActionListener {
             service.setWatched(ref, !service.isWatched(ref))
             refreshText()
         }
-        return button
+        return link
     }
 
     /**
-     * The gray "Created … · Merged/Closed …" line, or null when the MR carries none of those
-     * timestamps (so no empty row is added). Merged and Closed are mutually exclusive in practice.
-     */
-    private fun buildDatesLine(mr: GitLabMergeRequest): JComponent? {
-        val parts = buildList {
-            mr.createdAt?.let { add(CockpitBundle.message("detail.dates.created", formatRelative(it))) }
-            mr.mergedAt?.let { add(CockpitBundle.message("detail.dates.merged", formatRelative(it))) }
-            mr.closedAt?.let { add(CockpitBundle.message("detail.dates.closed", formatRelative(it))) }
-        }
-        if (parts.isEmpty()) return null
-        val line = flowLine()
-        line.add(
-            JBLabel(parts.joinToString(DATE_SEPARATOR)).apply {
-                foreground = UIUtil.getContextHelpForeground()
-            },
-        )
-        return line
-    }
-
-    /**
-     * Builds the Merge button for [mr] from [mergeButtonState]: enabled for a mergeable MR (or a
+     * Builds the Merge action link for [mr] from [mergeButtonState]: enabled for a mergeable MR (or a
      * "when pipeline succeeds" variant), otherwise disabled with the blocker reason as a tooltip (no
-     * tooltip when there is no reason, e.g. an already merged/closed MR).
+     * tooltip when there is no reason, e.g. an already merged/closed MR). [ActionLink.autoHideOnDisable]
+     * is turned off so a blocked Merge link stays visible (greyed) with its tooltip.
      */
-    private fun buildMergeButton(mr: GitLabMergeRequest): JButton {
-        val button = JButton(CockpitBundle.message("detail.merge"))
+    private fun buildMergeLink(mr: GitLabMergeRequest): ActionLink {
+        val link = ActionLink(CockpitBundle.message("detail.merge")).apply { autoHideOnDisable = false }
         val ref = MrRef(mr.projectId, mr.iid)
         val state = mergeButtonState(mr.state, mr.detailedMergeStatus)
         when (state.action) {
             MergeAction.MERGE -> {
-                button.isEnabled = true
-                button.addActionListener { onMerge(ref, mr, mergeWhenPipelineSucceeds = false) }
+                link.isEnabled = true
+                link.addActionListener { onMerge(ref, mr, mergeWhenPipelineSucceeds = false) }
             }
             MergeAction.MERGE_WHEN_PIPELINE_SUCCEEDS -> {
-                button.text = CockpitBundle.message("detail.merge.whenPipeline")
-                button.isEnabled = true
-                button.addActionListener { onMerge(ref, mr, mergeWhenPipelineSucceeds = true) }
+                link.text = CockpitBundle.message("detail.merge.whenPipeline")
+                link.isEnabled = true
+                link.addActionListener { onMerge(ref, mr, mergeWhenPipelineSucceeds = true) }
             }
             MergeAction.DISABLED -> {
-                button.isEnabled = false
-                button.toolTipText = state.reasonKey?.let { CockpitBundle.message(it) }
+                link.isEnabled = false
+                link.toolTipText = state.reasonKey?.let { CockpitBundle.message(it) }
             }
         }
-        mergeButton = button
-        return button
+        mergeLink = link
+        return link
     }
+
+    /** `success` → `Success`: the head pipeline status with its first letter capitalized. */
+    private fun pipelineStatusText(status: String): String =
+        status.replaceFirstChar { it.uppercase() }
 
     /**
      * Opens the [MergeMrDialog] pre-checked from the remembered settings (falling back to the MR's own
@@ -431,7 +531,7 @@ class MrDetailPanel(
             settings.mergeDeleteSourceBranch = removeSourceBranch
         }
 
-        mergeButton?.isEnabled = false
+        mergeLink?.isEnabled = false
         service.coroutineScope.launch {
             val result = service.merge(ref, squash, removeSourceBranch, mergeWhenPipelineSucceeds)
             withContext(Dispatchers.EDT) {
@@ -442,7 +542,7 @@ class MrDetailPanel(
                         onListReloadRequested()
                     }
                     else -> {
-                        mergeButton?.isEnabled = true
+                        mergeLink?.isEnabled = true
                         showError("detail.error.merge", result)
                     }
                 }
@@ -465,7 +565,7 @@ class MrDetailPanel(
                             "detail.approvedBy",
                             CockpitBundle.message("detail.approvals.unavailable"),
                         )
-                        approvalButton?.isEnabled = false
+                        approvalLink?.isEnabled = false
                     }
                 }
             }
@@ -491,17 +591,17 @@ class MrDetailPanel(
 
         val me = service.currentUser
         val approved = me != null && approvals.approvedBy.any { it.user.id == me.id }
-        val button = approvalButton ?: return
-        button.text = CockpitBundle.message(if (approved) "detail.revokeApproval" else "detail.approve")
-        button.isEnabled = me != null
-        button.actionListeners.toList().forEach { button.removeActionListener(it) }
+        val link = approvalLink ?: return
+        link.text = CockpitBundle.message(if (approved) "detail.revokeApproval" else "detail.approve")
+        link.isEnabled = me != null
+        link.actionListeners.toList().forEach { link.removeActionListener(it) }
         val ref = currentRef
-        if (ref != null) button.addActionListener { onToggleApproval(ref, approved) }
+        if (ref != null) link.addActionListener { onToggleApproval(ref, approved) }
     }
 
     /** Approves or revokes in the background, then refreshes approvals and the list on success. */
     private fun onToggleApproval(ref: MrRef, alreadyApproved: Boolean) {
-        approvalButton?.isEnabled = false
+        approvalLink?.isEnabled = false
         service.coroutineScope.launch {
             val result = if (alreadyApproved) service.unapprove(ref) else service.approve(ref)
             withContext(Dispatchers.EDT) {
@@ -512,7 +612,7 @@ class MrDetailPanel(
                         onListReloadRequested()
                     }
                     else -> {
-                        approvalButton?.isEnabled = true
+                        approvalLink?.isEnabled = true
                         showError("detail.error.approve", result)
                     }
                 }
@@ -891,12 +991,14 @@ class MrDetailPanel(
             init()
         }
 
-        override fun createCenterPanel(): JComponent {
-            val scroll = JBScrollPane(descriptionArea).apply { preferredSize = CockpitTheme.EDIT_MR_DIALOG_SIZE }
-            return FormBuilder.createFormBuilder()
-                .addLabeledComponent(CockpitBundle.message("dialog.editMr.titleLabel"), titleField)
-                .addLabeledComponentFillVertically(CockpitBundle.message("dialog.editMr.descriptionLabel"), scroll)
-                .panel
+        override fun createCenterPanel(): JComponent = panel {
+            row(CockpitBundle.message("dialog.editMr.titleLabel")) {
+                cell(titleField).align(AlignX.FILL)
+            }
+            row(CockpitBundle.message("dialog.editMr.descriptionLabel")) {
+                cell(JBScrollPane(descriptionArea).apply { preferredSize = CockpitTheme.EDIT_MR_DIALOG_SIZE })
+                    .align(Align.FILL)
+            }.resizableRow()
         }
 
         override fun getPreferredFocusedComponent(): JComponent = titleField
@@ -941,12 +1043,14 @@ class MrDetailPanel(
             }
         }
 
-        override fun createCenterPanel(): JComponent {
-            val scroll = JBScrollPane(checkList).apply { preferredSize = CockpitTheme.REVIEWERS_DIALOG_SIZE }
-            return JPanel(BorderLayout(0, JBUI.scale(4))).apply {
-                add(searchField, BorderLayout.NORTH)
-                add(scroll, BorderLayout.CENTER)
+        override fun createCenterPanel(): JComponent = panel {
+            row {
+                cell(searchField).align(AlignX.FILL)
             }
+            row {
+                cell(JBScrollPane(checkList).apply { preferredSize = CockpitTheme.REVIEWERS_DIALOG_SIZE })
+                    .align(Align.FILL)
+            }.resizableRow()
         }
 
         override fun getPreferredFocusedComponent(): JComponent = searchField.textEditor
@@ -1013,12 +1117,14 @@ class MrDetailPanel(
             }
         }
 
-        override fun createCenterPanel(): JComponent {
-            val scroll = JBScrollPane(userList).apply { preferredSize = CockpitTheme.REVIEWERS_DIALOG_SIZE }
-            return JPanel(BorderLayout(0, JBUI.scale(4))).apply {
-                add(searchField, BorderLayout.NORTH)
-                add(scroll, BorderLayout.CENTER)
+        override fun createCenterPanel(): JComponent = panel {
+            row {
+                cell(searchField).align(AlignX.FILL)
             }
+            row {
+                cell(JBScrollPane(userList).apply { preferredSize = CockpitTheme.REVIEWERS_DIALOG_SIZE })
+                    .align(Align.FILL)
+            }.resizableRow()
         }
 
         override fun getPreferredFocusedComponent(): JComponent = searchField.textEditor
@@ -1052,16 +1158,17 @@ class MrDetailPanel(
             if (mergeWhenPipelineSucceeds) setOKButtonText(CockpitBundle.message("detail.merge.whenPipeline"))
         }
 
-        override fun createCenterPanel(): JComponent {
-            val summary = JBLabel(CockpitBundle.message("dialog.merge.summary", sourceBranch, targetBranch)).apply {
-                foreground = UIUtil.getContextHelpForeground()
+        override fun createCenterPanel(): JComponent = panel {
+            row {
+                cell(
+                    JBLabel(CockpitBundle.message("dialog.merge.summary", sourceBranch, targetBranch)).apply {
+                        foreground = UIUtil.getContextHelpForeground()
+                    },
+                )
             }
-            return FormBuilder.createFormBuilder()
-                .addComponent(summary)
-                .addComponent(squashCheck)
-                .addComponent(deleteCheck)
-                .addComponent(rememberCheck)
-                .panel
+            row { cell(squashCheck) }
+            row { cell(deleteCheck) }
+            row { cell(rememberCheck) }
         }
 
         val squash: Boolean get() = squashCheck.isSelected

@@ -9,8 +9,9 @@ import org.junit.Test
 
 /**
  * Pure tests for the merge-readiness helpers: [mergeButtonState] (every known
- * `detailed_merge_status`, the non-opened short-circuit and the unknown/null fallback) and
- * [approvalsHealth] (counts-based and approver-list fallback).
+ * `detailed_merge_status`, the non-opened short-circuit and the unknown/null fallback),
+ * [mergeLinePresentation] (ready / blocked-with-reason / hidden) and [approvalsHealth] (counts-based
+ * and approver-list fallback).
  */
 class MergeReadinessTest {
 
@@ -71,6 +72,56 @@ class MergeReadinessTest {
         assertEquals(MergeButtonState(MergeAction.DISABLED, null), mergeButtonState("merged", "mergeable"))
         assertEquals(MergeButtonState(MergeAction.DISABLED, null), mergeButtonState("closed", "conflict"))
         assertEquals(MergeButtonState(MergeAction.DISABLED, null), mergeButtonState(null, "mergeable"))
+    }
+
+    // --- mergeLinePresentation ----------------------------------------------------------------
+
+    @Test
+    fun `an open mergeable MR reads as ready to merge`() {
+        assertEquals(
+            MergeLinePresentation(MergeLineState.READY, null),
+            mergeLinePresentation("opened", "mergeable"),
+        )
+    }
+
+    @Test
+    fun `an open MR blocked on approvals reads as blocked with the approvals reason`() {
+        assertEquals(
+            MergeLinePresentation(MergeLineState.BLOCKED, "merge.status.notApproved"),
+            mergeLinePresentation("opened", "not_approved"),
+        )
+    }
+
+    @Test
+    fun `an open MR with conflicts reads as blocked with the conflict reason`() {
+        assertEquals(
+            MergeLinePresentation(MergeLineState.BLOCKED, "merge.status.conflict"),
+            mergeLinePresentation("opened", "conflict"),
+        )
+    }
+
+    @Test
+    fun `an open MR with CI still running reads as blocked on the pipeline`() {
+        assertEquals(
+            MergeLinePresentation(MergeLineState.BLOCKED, "merge.status.ciRunning"),
+            mergeLinePresentation("opened", "ci_still_running"),
+        )
+    }
+
+    @Test
+    fun `a non-opened MR hides the merge readiness line`() {
+        assertEquals(
+            MergeLinePresentation(MergeLineState.HIDDEN, null),
+            mergeLinePresentation("merged", "mergeable"),
+        )
+        assertEquals(
+            MergeLinePresentation(MergeLineState.HIDDEN, null),
+            mergeLinePresentation("closed", "conflict"),
+        )
+        assertEquals(
+            MergeLinePresentation(MergeLineState.HIDDEN, null),
+            mergeLinePresentation(null, "mergeable"),
+        )
     }
 
     // --- approvalsHealth ----------------------------------------------------------------------
