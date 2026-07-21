@@ -14,6 +14,11 @@ import java.awt.Color
 import java.awt.Component
 import java.awt.Dimension
 import java.awt.FlowLayout
+import java.awt.Graphics
+import java.awt.Graphics2D
+import java.awt.RenderingHints
+import java.awt.geom.RoundRectangle2D
+import javax.swing.Box
 import javax.swing.BoxLayout
 import javax.swing.JLabel
 import javax.swing.JList
@@ -53,15 +58,38 @@ class MrListCellRenderer(
         ipad = JBUI.insets(0)
     }
 
+    /** The `sourceBranch` chip: a muted rounded pill painted on [line2Row] (GLC-37). */
+    private val sourceChip = BranchChipLabel()
+
+    /** The `targetBranch` chip. */
+    private val targetChip = BranchChipLabel()
+
+    /** The muted `→` between the two branch chips. */
+    private val branchArrow = JLabel(BRANCH_ARROW)
+
+    /** Line 2: the muted metadata text followed by the two branch chips, left-aligned. */
+    private val line2Row = JPanel().apply {
+        layout = BoxLayout(this, BoxLayout.X_AXIS)
+        isOpaque = false
+        alignmentX = Component.LEFT_ALIGNMENT
+        add(line2)
+        add(Box.createHorizontalStrut(JBUI.scale(RIGHT_GAP)))
+        add(sourceChip)
+        add(Box.createHorizontalStrut(JBUI.scale(CHIP_GAP)))
+        add(branchArrow)
+        add(Box.createHorizontalStrut(JBUI.scale(CHIP_GAP)))
+        add(targetChip)
+        add(Box.createHorizontalGlue())
+    }
+
     private val textColumn = JPanel().apply {
         layout = BoxLayout(this, BoxLayout.Y_AXIS)
         isOpaque = false
         line1.alignmentX = Component.LEFT_ALIGNMENT
-        line2.alignmentX = Component.LEFT_ALIGNMENT
-        add(javax.swing.Box.createVerticalGlue())
+        add(Box.createVerticalGlue())
         add(line1)
-        add(line2)
-        add(javax.swing.Box.createVerticalGlue())
+        add(line2Row)
+        add(Box.createVerticalGlue())
     }
 
     private val statusLabel = JLabel()
@@ -140,9 +168,20 @@ class MrListCellRenderer(
             line1.append(segment.text, SimpleTextAttributes(SimpleTextAttributes.STYLE_PLAIN, color))
         }
 
-        line2.font = list.font.deriveFont(list.font.size2D - 1f)
+        val metaFont = list.font.deriveFont(list.font.size2D - 1f)
+        line2.font = metaFont
         line2.clear()
         line2.append(presentation.line2, SimpleTextAttributes(SimpleTextAttributes.STYLE_PLAIN, muted))
+
+        // Branch chips: muted text on a subtle rounded pill, `source → target` (GLC-37).
+        branchArrow.font = metaFont
+        branchArrow.foreground = muted
+        sourceChip.font = metaFont
+        sourceChip.foreground = muted
+        sourceChip.text = presentation.sourceBranch
+        targetChip.font = metaFont
+        targetChip.foreground = muted
+        targetChip.text = presentation.targetBranch
 
         val status = enrichment.statusOf(value)
         statusLabel.icon = status?.let { CockpitIcons.status(it) }
@@ -183,18 +222,57 @@ class MrListCellRenderer(
         MrSegmentStyle.DANGER -> CockpitTheme.danger
     }
 
+    /**
+     * A branch "chip": a [JLabel] that paints a subtle [CockpitTheme.chipBackground] rounded pill
+     * behind its text (GLC-37). The label owns its text/foreground (the renderer sets both per row);
+     * the [CHIP_RADIUS] rounding and the h4/v1 padding come from here. One instance per branch is held
+     * as a renderer field, so nothing is allocated per row; the reused [pill] shape avoids a per-paint
+     * allocation too.
+     */
+    private class BranchChipLabel : JLabel() {
+        private val pill = RoundRectangle2D.Float()
+
+        init {
+            isOpaque = false
+            border = JBUI.Borders.empty(1, 4)
+        }
+
+        override fun paintComponent(g: Graphics) {
+            val g2 = g.create() as Graphics2D
+            try {
+                g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON)
+                val arc = JBUI.scale(CHIP_RADIUS) * 2f
+                pill.setRoundRect(0f, 0f, width.toFloat(), height.toFloat(), arc, arc)
+                g2.color = CockpitTheme.chipBackground()
+                g2.fill(pill)
+            } finally {
+                g2.dispose()
+            }
+            super.paintComponent(g)
+        }
+    }
+
     companion object {
         /** Row height in unscaled px; JBUI-scaled at paint time. */
-        private const val ROW_HEIGHT = 44
+        private const val ROW_HEIGHT = 48
 
-        /** Avatar diameter in unscaled px. */
-        private const val AVATAR_SIZE = 16
+        /** Avatar diameter in unscaled px (author + reviewers). */
+        private const val AVATAR_SIZE = 20
 
         /** Gap (unscaled px) between the right column's elements. */
-        private const val RIGHT_GAP = 6
+        private const val RIGHT_GAP = 8
 
         /** Gap (unscaled px) between adjacent reviewer avatars — positive, so they never overlap. */
         private const val AVATAR_GAP = 2
+
+        /** Gap (unscaled px) around the `→` between the two branch chips. */
+        private const val CHIP_GAP = 4
+
+        /** Corner radius (unscaled px) of a branch chip's rounded pill. */
+        private const val CHIP_RADIUS = 6
+
+        /** Arrow rendered between the source and target branch chips. */
+        private const val BRANCH_ARROW = "→"
 
         /** How many reviewers are shown as avatars before the `+N` badge takes over. */
         private const val MAX_REVIEWER_AVATARS = 2

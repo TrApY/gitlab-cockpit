@@ -79,4 +79,16 @@ object CockpitTheme {
         val base = UIUtil.getPanelBackground()
         return if (JBColor.isBright()) ColorUtil.darker(base, 1) else ColorUtil.brighter(base, 1)
     }
+
+    /**
+     * Background for a subtle rounded "chip" — the branch pills on an MR list row (GLC-37). Derived
+     * from [UIUtil.getPanelBackground] with [ColorUtil] tone steps like [cardBackground], but a touch
+     * stronger (two steps) so the pill reads as its own shape against the row: darker on a bright
+     * theme, brighter on a dark one. A function (not a val) so it resolves against the active theme at
+     * call time.
+     */
+    fun chipBackground(): Color {
+        val base = UIUtil.getPanelBackground()
+        return if (JBColor.isBright()) ColorUtil.darker(base, 2) else ColorUtil.brighter(base, 2)
+    }
 }

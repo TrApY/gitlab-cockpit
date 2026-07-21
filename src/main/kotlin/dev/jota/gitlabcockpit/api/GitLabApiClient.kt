@@ -178,6 +178,11 @@ data class MergeRequestUpdate(
     val description: String? = null,
     @SerialName("reviewer_ids") val reviewerIds: List<Long>? = null,
     @SerialName("assignee_ids") val assigneeIds: List<Long>? = null,
+    /**
+     * The MR state transition, e.g. `close` or `reopen`. Nullable so existing update calls (which
+     * never set it) keep serializing without a `state_event` key; only the Close action populates it.
+     */
+    @SerialName("state_event") val stateEvent: String? = null,
 )
 
 /** Approval state of a merge request from `/merge_requests/:iid/approvals`. */

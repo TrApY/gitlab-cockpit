@@ -16,12 +16,11 @@ import com.intellij.diff.util.Side
 import com.intellij.icons.AllIcons
 import com.intellij.notification.NotificationGroupManager
 import com.intellij.notification.NotificationType
-import com.intellij.openapi.actionSystem.ActionManager
 import com.intellij.openapi.actionSystem.ActionUpdateThread
 import com.intellij.openapi.actionSystem.AnAction
 import com.intellij.openapi.actionSystem.AnActionEvent
 import com.intellij.openapi.actionSystem.CommonDataKeys
-import com.intellij.openapi.actionSystem.DefaultActionGroup
+import com.intellij.openapi.actionSystem.Separator
 import com.intellij.openapi.application.EDT
 import com.intellij.openapi.editor.Editor
 import com.intellij.openapi.fileTypes.FileTypeManager
@@ -32,18 +31,14 @@ import com.intellij.openapi.ui.DialogWrapper
 import com.intellij.openapi.ui.Messages
 import com.intellij.openapi.ui.ValidationInfo
 import com.intellij.openapi.vcs.FileStatus
-import com.intellij.ui.CollectionListModel
-import com.intellij.ui.ColorUtil
 import com.intellij.ui.ColoredTreeCellRenderer
 import com.intellij.ui.DoubleClickListener
-import com.intellij.ui.OnePixelSplitter
 import com.intellij.ui.PopupHandler
 import com.intellij.ui.RowIcon
 import com.intellij.ui.SimpleTextAttributes
 import com.intellij.ui.components.ActionLink
 import com.intellij.ui.components.JBCheckBox
 import com.intellij.ui.components.JBLabel
-import com.intellij.ui.components.JBList
 import com.intellij.ui.components.JBScrollPane
 import com.intellij.ui.components.JBTextArea
 import com.intellij.ui.components.panels.VerticalLayout
@@ -57,11 +52,8 @@ import dev.jota.gitlabcockpit.CockpitBundle
 import dev.jota.gitlabcockpit.api.DiffRefs
 import dev.jota.gitlabcockpit.api.GitLabDiffFile
 import dev.jota.gitlabcockpit.api.GitLabDiscussion
-import dev.jota.gitlabcockpit.api.GitLabDiscussionNote
 import dev.jota.gitlabcockpit.api.GitLabDraftNote
 import dev.jota.gitlabcockpit.api.GitLabResult
-import dev.jota.gitlabcockpit.api.GitLabUser
-import dev.jota.gitlabcockpit.api.NotePosition
 import dev.jota.gitlabcockpit.core.COCKPIT_NOTIFICATION_GROUP
 import dev.jota.gitlabcockpit.core.ChangeType
 import dev.jota.gitlabcockpit.core.CockpitProjectService
@@ -98,38 +90,33 @@ import javax.swing.JPanel
 import javax.swing.JPopupMenu
 import javax.swing.JTree
 import javax.swing.KeyStroke
-import javax.swing.ListSelectionModel
 import javax.swing.tree.DefaultMutableTreeNode
 import javax.swing.tree.DefaultTreeModel
 import javax.swing.tree.TreeSelectionModel
 
 /**
- * The "Changes" tab of the MR detail. A vertical action toolbar (west edge) plus a horizontal
- * splitter with:
+ * The changed-files side of an MR tab (GLC-37). A tree of the MR's changed files (grouped by
+ * directory), each file iconed by its [ChangeType] and suffixed with a comment count when it has diff
+ * discussions, with an "N of M files reviewed" counter and — when there are unpublished draft notes —
+ * the "Pending review" section (Submit review / per-row delete) beneath it. A double-click on a file,
+ * or the tab's shared toolbar Open-diff action, opens its base/head diff in the IDE editor
+ * ([DiffManager]) without any checkout — the two sides are fetched raw at the MR's `diff_refs`
+ * base/head SHAs.
  *
- * - **left**: a tree of the MR's changed files (grouped by directory), each file iconed by its
- *   [ChangeType] and suffixed with a comment count when it has diff discussions, with an
- *   "N of M files reviewed" counter at its foot. A double-click on a file opens its base/head diff in
- *   the IDE editor ([DiffManager]) without any checkout — the two sides are fetched raw at the MR's
- *   `diff_refs` base/head SHAs.
- * - **right**: the diff discussions of the selected file. A list of threads, an HTML view of the
- *   selected thread's notes, and a single reply box that posts to the selected thread.
+ * This panel is the left side of the MR tab's horizontal splitter; the review discussions live inline
+ * in the diff and in the Events & Discussions timeline (there is no per-file comment pane here). The
+ * file tree's toolbar actions are exposed via [treeActions] so the MR tab folds them into its single
+ * vertical toolbar.
  *
- * The toolbar reuses the tab's own behavior: refresh the changes, expand / collapse the tree and —
- * on the selection — open its diff or toggle its reviewed state.
+ * Diffs and discussions load lazily the first time the tab binds an MR ([onTabSelected]) and are
+ * re-fetched after every detail refresh ([setMr]). Every network call runs on the service's coroutine
+ * scope (never the EDT); results are marshaled with [Dispatchers.EDT] and dropped when stale
+ * (re-checking [currentRef]).
  *
- * Diffs and discussions load lazily the first time the tab is shown for an MR ([onTabSelected]) and
- * are re-fetched after every detail refresh ([setMr]). Every network call runs on the service's
- * coroutine scope (never the EDT); results are marshaled with [Dispatchers.EDT] and dropped when
- * stale (re-checking [currentRef]).
- *
- * The bottom half also hosts the F4b "Pending review" section (the MR's unpublished draft notes,
- * with per-row delete plus Submit review / Refresh) and a per-thread Resolve/Unresolve action.
- *
- * @param onFileCountChanged reports the loaded file count (or null while unknown) so the parent can
- * put it in the tab title.
+ * @param onFileCountChanged reports the loaded file count (or null while unknown).
  * @param onReviewSubmitted called after a successful "Submit review" (bulk publish) so the parent can
- * refresh its Comments tab (published drafts become regular notes; the draft banner clears).
+ * refresh its Events & Discussions timeline (published drafts become regular notes; the draft banner
+ * clears).
  */
 class ChangesPanel(
     private val project: Project,
@@ -151,13 +138,10 @@ class ChangesPanel(
     /** The ref whose changes have been loaded, so the tab only reloads when it changes. */
     private var loadedForRef: MrRef? = null
 
-    /** Diff discussions grouped by file path; read by the tree renderer and the comments panel. */
+    /** Diff discussions grouped by file path; read by the tree renderer (badges) and the diff context. */
     private var discussionsByFilePath: Map<String, List<GitLabDiscussion>> = emptyMap()
 
-    /** Path of the file whose comments the bottom panel currently shows; null when none. */
-    private var selectedFilePath: String? = null
-
-    /** The changed file currently selected in the tree; enables "New thread". Null when none. */
+    /** The changed file currently selected in the tree; enables the Open-diff / Toggle-reviewed actions. */
     private var selectedFile: GitLabDiffFile? = null
 
     /** The MR's changed files (flat), kept so a reveal can map a discussion's path back to its file. */
@@ -166,7 +150,7 @@ class ChangesPanel(
     /** True once a load has populated the discussions/files, so a pending reveal can resolve. */
     private var discussionsLoaded = false
 
-    /** A discussion the Comments tab asked to reveal; held until the changes finish loading. */
+    /** A discussion the timeline asked to reveal; held until the changes finish loading. */
     private var pendingRevealId: String? = null
 
     /** The MR's pending draft notes, loaded alongside the discussions; drives the "Pending review" section. */
@@ -174,12 +158,10 @@ class ChangesPanel(
 
     private var loadJob: Job? = null
     private var discussionsJob: Job? = null
-    private var replyJob: Job? = null
     private var newThreadJob: Job? = null
     private var draftsJob: Job? = null
     private var publishJob: Job? = null
     private var deleteJob: Job? = null
-    private var resolveJob: Job? = null
 
     /** Per-MR reviewed-file store (GLC-35): drives the tree's muted+tick rendering and the counter. */
     private val reviewedFiles = ReviewedFiles.getInstance(project)
@@ -200,31 +182,6 @@ class ChangesPanel(
         isVisible = false
     }
 
-    private val discussionListModel = CollectionListModel<GitLabDiscussion>()
-    private val discussionList = JBList(discussionListModel).apply {
-        selectionMode = ListSelectionModel.SINGLE_SELECTION
-        cellRenderer = textCellRenderer<GitLabDiscussion>("") { discussionLabel(it) }
-    }
-
-    private val discussionPane = CockpitHtml.createHtmlPane()
-    private val commentsTitle = JBLabel(CockpitBundle.message("changes.comments.title"))
-    private val replyArea = JBTextArea(2, 0).apply {
-        lineWrap = true
-        wrapStyleWord = true
-        emptyText.text = CockpitBundle.message("changes.reply.placeholder")
-    }
-    private val replyButton = JButton(CockpitBundle.message("changes.reply.button"))
-    private val newThreadButton = JButton(CockpitBundle.message("changes.newThread")).apply {
-        isEnabled = false
-        addActionListener { onNewThread() }
-    }
-
-    /** Resolve/Unresolve action for the selected thread; hidden unless that thread is resolvable. */
-    private val resolveButton = JButton().apply {
-        isVisible = false
-        addActionListener { onToggleResolve() }
-    }
-
     // --- Pending review (F4b) -----------------------------------------------------------------
 
     /** One row per draft, rebuilt on every drafts (re)load. */
@@ -236,25 +193,16 @@ class ChangesPanel(
     private val pendingReviewPanel = JPanel(BorderLayout())
 
     init {
-        val treePanel = JPanel(BorderLayout()).apply {
-            add(JBScrollPane(tree), BorderLayout.CENTER)
-            add(reviewedCountLabel, BorderLayout.SOUTH)
-        }
-        // Horizontal split (GLC-36): file tree on the left, the comments/threads panel on the right;
-        // the proportion is persisted under a dedicated key.
-        val splitter = OnePixelSplitter(false, CHANGES_SPLITTER_KEY, 0.55f).apply {
-            firstComponent = treePanel
-            secondComponent = buildBottomPanel()
-        }
-        add(buildChangesToolbar(), BorderLayout.WEST)
-        add(splitter, BorderLayout.CENTER)
+        val bottom = JPanel(VerticalLayout(0)).apply { isOpaque = false }
+        bottom.add(reviewedCountLabel)
+        bottom.add(buildPendingReviewPanel())
+        add(JBScrollPane(tree), BorderLayout.CENTER)
+        add(bottom, BorderLayout.SOUTH)
 
         tree.addTreeSelectionListener {
             val node = tree.lastSelectedPathComponent as? DefaultMutableTreeNode
             val fileNode = node?.userObject as? FileNode
             selectedFile = fileNode?.file
-            newThreadButton.isEnabled = selectedFile != null
-            showFileComments(fileNode?.takeIf { it.file != null }?.path)
         }
 
         object : DoubleClickListener() {
@@ -279,49 +227,31 @@ class ChangesPanel(
             }
         })
 
-        discussionList.addListSelectionListener { event ->
-            if (!event.valueIsAdjusting) {
-                val discussion = discussionList.selectedValue
-                replyButton.isEnabled = discussion != null
-                updateResolveButton(discussion)
-                renderDiscussion(discussion)
-            }
-        }
-        replyButton.addActionListener { onReply() }
-
         clear()
     }
 
     /**
-     * The Changes tab's vertical action toolbar (GLC-36), pinned to the panel's west edge. Every
-     * action reuses the tab's existing behavior (no duplicated logic): reload the changes, expand /
-     * collapse the file tree, and — on the current tree selection — open its diff or toggle its
-     * reviewed state. The tree is the [ActionToolbar.setTargetComponent], so the actions update
-     * against it.
+     * The changed-file tree actions (GLC-37): expand / collapse the tree and — on the current tree
+     * selection — open its diff or toggle its reviewed state. This is the iter1 Changes toolbar, now
+     * folded into the MR tab's single vertical toolbar (no duplicated logic). Expand / Collapse are
+     * enabled whenever an MR is bound; Open diff / Toggle reviewed only while a changed file is
+     * selected.
      */
-    private fun buildChangesToolbar(): JComponent {
-        val group = DefaultActionGroup().apply {
-            add(changesAction("changes.action.refresh", AllIcons.Actions.Refresh, needsSelection = false) {
-                currentRef?.let { load(it) }
-            })
-            add(changesAction("changes.action.expandAll", AllIcons.Actions.Expandall, needsSelection = false) {
-                TreeUtil.expandAll(tree)
-            })
-            add(changesAction("changes.action.collapseAll", AllIcons.Actions.Collapseall, needsSelection = false) {
-                TreeUtil.collapseAll(tree, 1)
-            })
-            addSeparator()
-            add(changesAction("changes.action.openDiff", AllIcons.Actions.Diff, needsSelection = true) {
-                selectedFile?.let { openDiff(it) }
-            })
-            add(changesAction("changes.action.toggleReviewed", AllIcons.Actions.Checked, needsSelection = true) {
-                toggleReviewedForSelection()
-            })
-        }
-        val toolbar = ActionManager.getInstance().createActionToolbar(CHANGES_TOOLBAR_PLACE, group, false)
-        toolbar.targetComponent = tree
-        return toolbar.component
-    }
+    fun treeActions(): List<AnAction> = listOf(
+        changesAction("changes.action.expandAll", AllIcons.Actions.Expandall, needsSelection = false) {
+            TreeUtil.expandAll(tree)
+        },
+        changesAction("changes.action.collapseAll", AllIcons.Actions.Collapseall, needsSelection = false) {
+            TreeUtil.collapseAll(tree, 1)
+        },
+        Separator.getInstance(),
+        changesAction("changes.action.openDiff", AllIcons.Actions.Diff, needsSelection = true) {
+            selectedFile?.let { openDiff(it) }
+        },
+        changesAction("changes.action.toggleReviewed", AllIcons.Actions.Checked, needsSelection = true) {
+            toggleReviewedForSelection()
+        },
+    )
 
     /**
      * Builds one toolbar [AnAction] from a bundle [key], [icon] and [body]. A [needsSelection] action
@@ -341,50 +271,6 @@ class ChangesPanel(
         }
 
         override fun actionPerformed(e: AnActionEvent) = body()
-    }
-
-    private fun buildCommentsPanel(): JComponent {
-        val panel = JPanel(BorderLayout())
-        commentsTitle.border = JBUI.Borders.empty(4, 8)
-        val header = JPanel(BorderLayout())
-        header.add(commentsTitle, BorderLayout.CENTER)
-        val headerButtons = JPanel(FlowLayout(FlowLayout.RIGHT, 0, 0)).apply {
-            isOpaque = false
-            border = CockpitTheme.compactBorder()
-        }
-        headerButtons.add(newThreadButton)
-        header.add(headerButtons, BorderLayout.EAST)
-        panel.add(header, BorderLayout.NORTH)
-
-        val inner = OnePixelSplitter(false, 0.32f).apply {
-            firstComponent = JBScrollPane(discussionList)
-            secondComponent = JBScrollPane(discussionPane)
-        }
-        panel.add(inner, BorderLayout.CENTER)
-        panel.add(buildReplyInput(), BorderLayout.SOUTH)
-        return panel
-    }
-
-    private fun buildReplyInput(): JComponent {
-        val panel = JPanel(BorderLayout(0, JBUI.scale(4)))
-        panel.border = CockpitTheme.panelBorder()
-        panel.add(JBScrollPane(replyArea), BorderLayout.CENTER)
-        val buttons = JPanel(FlowLayout(FlowLayout.RIGHT, JBUI.scale(4), 0)).apply { isOpaque = false }
-        buttons.add(resolveButton)
-        buttons.add(replyButton)
-        panel.add(buttons, BorderLayout.SOUTH)
-        return panel
-    }
-
-    /**
-     * The Changes tab's bottom half: the "Pending review" section (F4b, hidden unless there are
-     * drafts) stacked above the file's discussions.
-     */
-    private fun buildBottomPanel(): JComponent {
-        val panel = JPanel(BorderLayout())
-        panel.add(buildPendingReviewPanel(), BorderLayout.NORTH)
-        panel.add(buildCommentsPanel(), BorderLayout.CENTER)
-        return panel
     }
 
     /** Builds the (initially hidden) "Pending review" section: draft rows + Submit review / Refresh. */
@@ -433,17 +319,16 @@ class ChangesPanel(
         tree.emptyText.text = ""
     }
 
-    /** Called when the Changes tab becomes visible; loads the changes the first time per MR. */
+    /** Called when the changes side becomes bound; loads the changes the first time per MR. */
     fun onTabSelected() {
         val ref = currentRef ?: return
         if (loadedForRef != ref) load(ref)
     }
 
     /**
-     * Reveals a discussion in the diff, driven by the Comments tab's "jump to thread" link. When the
+     * Reveals a discussion in the diff, driven by the timeline's "jump to thread" link. When the
      * changes are already loaded it resolves immediately; otherwise the id is held and resolved once
-     * the (lazy) load triggered by the tab switch finishes. An unknown or non-positioned id is a
-     * silent no-op.
+     * the (lazy) load finishes. An unknown or non-positioned id is a silent no-op.
      */
     fun revealDiscussion(discussionId: String) {
         pendingRevealId = discussionId
@@ -453,12 +338,10 @@ class ChangesPanel(
     private fun cancelJobs() {
         loadJob?.cancel()
         discussionsJob?.cancel()
-        replyJob?.cancel()
         newThreadJob?.cancel()
         draftsJob?.cancel()
         publishJob?.cancel()
         deleteJob?.cancel()
-        resolveJob?.cancel()
     }
 
     private fun clearContent() {
@@ -468,15 +351,7 @@ class ChangesPanel(
         loadedFiles = emptyList()
         discussionsLoaded = false
         pendingRevealId = null
-        selectedFilePath = null
         selectedFile = null
-        newThreadButton.isEnabled = false
-        discussionListModel.removeAll()
-        discussionPane.text = CockpitHtml.wrapHtml("")
-        replyArea.text = ""
-        replyButton.isEnabled = false
-        resolveButton.isVisible = false
-        commentsTitle.text = CockpitBundle.message("changes.comments.title")
         currentDrafts = emptyList()
         draftsRowsPanel.removeAll()
         pendingReviewPanel.isVisible = false
@@ -532,10 +407,7 @@ class ChangesPanel(
         treeModel.reload()
         TreeUtil.expandAll(tree)
         tree.emptyText.text = if (files.isEmpty()) CockpitBundle.message("changes.empty") else ""
-        selectedFilePath = null
         selectedFile = null
-        newThreadButton.isEnabled = false
-        showFileComments(null)
         onFileCountChanged(files.size)
         updateReviewedCounter()
     }
@@ -637,7 +509,7 @@ class ChangesPanel(
      * so opening is instant and the other files cost nothing until visited. A missing `diff_refs` is a
      * hard error (nothing to anchor to).
      *
-     * [revealDiscussionId] is handed only to [file]'s producer (the Comments-tab "jump to thread" path),
+     * [revealDiscussionId] is handed only to [file]'s producer (the timeline "jump to thread" path),
      * so just the file the user landed on scrolls to its thread.
      */
     private fun openDiff(file: GitLabDiffFile, revealDiscussionId: String? = null) {
@@ -717,7 +589,7 @@ class ChangesPanel(
      * can start a review thread from the caret without leaving the diff. The request also carries a
      * [CockpitDiffContext] (F4c) with [file]'s loaded discussions ([discussionsByPath]) so
      * [dev.jota.gitlabcockpit.ui.diff.CockpitDiffExtension] renders the review threads inline, stamps
-     * the "New comment at caret" handle ([openNewThread]) and — when there are threads — the
+     * the "New comment at caret" handle ([openNewThreadDialog]) and — when there are threads — the
      * thread-navigation handle. [revealDiscussionId], when set, tells the renderer to scroll to that
      * thread. The two editors show the whole base/head file, so an editor line equals that side's
      * GitLab line number.
@@ -800,7 +672,7 @@ class ChangesPanel(
         openDiff(file, revealDiscussionId = id)
     }
 
-    /** Selects [file]'s leaf in the changed-files tree (also refreshing the bottom comments panel). */
+    /** Selects [file]'s leaf in the changed-files tree. */
     private fun selectFileInTree(file: GitLabDiffFile) {
         val targetPath = if (file.deletedFile) file.oldPath else file.newPath
         val node = findFileNode(rootNode, targetPath) ?: return
@@ -818,86 +690,8 @@ class ChangesPanel(
         return null
     }
 
-    // --- Comments -----------------------------------------------------------------------------
-
-    /** EDT. Shows the discussions anchored to [path] (null → none); selects the first thread. */
-    private fun showFileComments(path: String?) {
-        selectedFilePath = path
-        commentsTitle.text = path ?: CockpitBundle.message("changes.comments.title")
-        val discussions = path?.let { discussionsByFilePath[it] }.orEmpty()
-        discussionListModel.replaceAll(discussions)
-        if (discussions.isEmpty()) {
-            discussionPane.text = CockpitHtml.wrapHtml(
-                "<p><i>" + CockpitHtml.escapeHtml(CockpitBundle.message("changes.comments.empty")) + "</i></p>",
-            )
-            replyButton.isEnabled = false
-            updateResolveButton(null)
-        } else {
-            discussionList.selectedIndex = 0
-        }
-    }
-
-    /** EDT. Renders every non-system note of [discussion] as one themed HTML document. */
-    private fun renderDiscussion(discussion: GitLabDiscussion?) {
-        val notes = discussion?.notes?.filterNot { it.system }.orEmpty()
-        if (notes.isEmpty()) {
-            discussionPane.text = CockpitHtml.wrapHtml("")
-            return
-        }
-        val metaColor = ColorUtil.toHtmlColor(UIUtil.getContextHelpForeground())
-        val fallbackPosition = positionOf(discussion)
-        val body = buildString {
-            notes.forEachIndexed { index, note ->
-                append("<div style=\"color:").append(metaColor).append(";\">")
-                append(CockpitHtml.escapeHtml(headerFor(note, fallbackPosition)))
-                append("</div>")
-                append(CockpitHtml.stripBody(MarkdownRenderer.toHtml(note.body)))
-                if (index < notes.lastIndex) append("<hr>")
-            }
-        }
-        // The async image re-apply is dropped once the user selects a different thread.
-        applyMarkdownUploads(
-            pane = discussionPane,
-            fragment = body,
-            service = service,
-            projectId = currentRef?.projectId ?: return,
-            projectWebUrl = projectWebUrl,
-            isCurrent = { discussionList.selectedValue === discussion },
-        )
-    }
-
-    /** Posts the reply-box text to the selected thread, then reloads the MR's discussions. */
-    private fun onReply() {
-        val ref = currentRef ?: return
-        val discussion = discussionList.selectedValue ?: return
-        val text = replyArea.text.trim()
-        if (text.isEmpty()) return
-        replyButton.isEnabled = false
-        replyJob?.cancel()
-        replyJob = service.coroutineScope.launch {
-            val result = service.replyToDiscussion(ref, discussion.id, text)
-            withContext(Dispatchers.EDT) {
-                if (currentRef != ref) return@withContext
-                when (result) {
-                    is GitLabResult.Success -> {
-                        replyArea.text = ""
-                        reloadDiscussions(ref, selectedFilePath, discussion.id)
-                    }
-                    else -> {
-                        replyButton.isEnabled = discussionList.selectedValue != null
-                        Messages.showErrorDialog(
-                            project,
-                            CockpitBundle.message("changes.error.reply", describe(result)),
-                            CockpitBundle.message("detail.error.title"),
-                        )
-                    }
-                }
-            }
-        }
-    }
-
-    /** Re-fetches the MR's discussions (diffs unchanged), refreshing tree badges and the panel. */
-    private fun reloadDiscussions(ref: MrRef, keepFilePath: String?, keepDiscussionId: String?) {
+    /** Re-fetches the MR's discussions (diffs unchanged) so the tree's comment badges stay current. */
+    private fun reloadDiscussions(ref: MrRef) {
         discussionsJob?.cancel()
         discussionsJob = service.coroutineScope.launch {
             val result = service.getMrDiscussions(ref)
@@ -906,37 +700,11 @@ class ChangesPanel(
                 val discussions = (result as? GitLabResult.Success)?.data ?: emptyList()
                 discussionsByFilePath = discussionsByFile(discussions)
                 tree.repaint()
-                showFileComments(keepFilePath)
-                if (keepDiscussionId != null) selectDiscussionById(keepDiscussionId)
-            }
-        }
-    }
-
-    private fun selectDiscussionById(id: String) {
-        for (index in 0 until discussionListModel.size) {
-            if (discussionListModel.getElementAt(index).id == id) {
-                discussionList.selectedIndex = index
-                return
             }
         }
     }
 
     // --- New review thread (F4a) --------------------------------------------------------------
-
-    /** "New thread" button: opens the dialog for the selected file, defaulting to the new side. */
-    private fun onNewThread() {
-        val file = selectedFile ?: return
-        val refs = diffRefs
-        if (refs == null) {
-            Messages.showErrorDialog(
-                project,
-                CockpitBundle.message("changes.diff.noRefs"),
-                CockpitBundle.message("detail.error.title"),
-            )
-            return
-        }
-        openNewThreadDialog(file, refs, ThreadSide.NEW, null)
-    }
 
     /**
      * Diff context action: opens the dialog pre-filled from the caret. The caret's editor line (1-based)
@@ -987,7 +755,7 @@ class ChangesPanel(
         }
     }
 
-    /** Posts a new diff thread off the EDT, then reloads discussions and re-selects the new thread. */
+    /** Posts a new diff thread off the EDT, then reloads discussions so the tree badges refresh. */
     private fun submitNewThread(ref: MrRef, file: GitLabDiffFile, refs: DiffRefs, pos: LinePosition, body: String) {
         newThreadJob?.cancel()
         newThreadJob = service.coroutineScope.launch {
@@ -995,7 +763,7 @@ class ChangesPanel(
             withContext(Dispatchers.EDT) {
                 if (currentRef != ref) return@withContext
                 when (result) {
-                    is GitLabResult.Success -> reloadDiscussions(ref, file.newPath, result.data.id)
+                    is GitLabResult.Success -> reloadDiscussions(ref)
                     else -> Messages.showErrorDialog(
                         project,
                         CockpitBundle.message("changes.error.createThread", describe(result)),
@@ -1028,7 +796,7 @@ class ChangesPanel(
         }
     }
 
-    // --- Pending review & resolution (F4b) ----------------------------------------------------
+    // --- Pending review (F4b) -----------------------------------------------------------------
 
     /** EDT. Rebuilds the "Pending review" section from [drafts]; hides it when there are none. */
     private fun renderDrafts(drafts: List<GitLabDraftNote>) {
@@ -1097,8 +865,8 @@ class ChangesPanel(
 
     /**
      * "Submit review": publishes every pending draft off the EDT. On success it reloads the drafts and
-     * the discussions (published drafts become threads), notifies the parent to refresh its Comments
-     * tab, and fires a balloon notification.
+     * the discussions (published drafts become threads), notifies the parent to refresh its timeline,
+     * and fires a balloon notification.
      */
     private fun onSubmitReview() {
         val ref = currentRef ?: return
@@ -1114,7 +882,7 @@ class ChangesPanel(
                     is GitLabResult.Success -> {
                         notifyReviewSubmitted(count)
                         reloadDrafts(ref)
-                        reloadDiscussions(ref, selectedFilePath, null)
+                        reloadDiscussions(ref)
                         onReviewSubmitted()
                     }
                     else -> {
@@ -1139,47 +907,6 @@ class ChangesPanel(
                 NotificationType.INFORMATION,
             )
             .notify(project)
-    }
-
-    /** EDT. Shows a Resolve/Unresolve action for [discussion] when its thread is resolvable. */
-    private fun updateResolveButton(discussion: GitLabDiscussion?) {
-        val firstNote = discussion?.notes?.firstOrNull { !it.system }
-        val resolvable = firstNote?.resolvable == true
-        resolveButton.isVisible = resolvable
-        resolveButton.isEnabled = resolvable
-        if (resolvable) {
-            resolveButton.text = CockpitBundle.message(
-                if (firstNote!!.resolved) "changes.discussion.unresolve" else "changes.discussion.resolve",
-            )
-        }
-    }
-
-    /** Toggles the selected thread's resolution off the EDT, then reloads the discussions. */
-    private fun onToggleResolve() {
-        val ref = currentRef ?: return
-        val discussion = discussionList.selectedValue ?: return
-        val firstNote = discussion.notes.firstOrNull { !it.system } ?: return
-        if (!firstNote.resolvable) return
-        val newResolved = !firstNote.resolved
-        resolveButton.isEnabled = false
-        resolveJob?.cancel()
-        resolveJob = service.coroutineScope.launch {
-            val result = service.setDiscussionResolved(ref, discussion.id, newResolved)
-            withContext(Dispatchers.EDT) {
-                if (currentRef != ref) return@withContext
-                when (result) {
-                    is GitLabResult.Success -> reloadDiscussions(ref, selectedFilePath, discussion.id)
-                    else -> {
-                        resolveButton.isEnabled = true
-                        Messages.showErrorDialog(
-                            project,
-                            CockpitBundle.message("changes.error.resolve", describe(result)),
-                            CockpitBundle.message("detail.error.title"),
-                        )
-                    }
-                }
-            }
-        }
     }
 
     /** `<first line, ≤80 chars>` plus ` · L<n>` when the draft is anchored to a diff line. */
@@ -1357,12 +1084,6 @@ class ChangesPanel(
     }
 
     companion object {
-        /** Persisted proportion key for the horizontal tree | comments splitter (GLC-36). */
-        private const val CHANGES_SPLITTER_KEY = "dev.jota.gitlabcockpit.changes.splitter.h"
-
-        /** [com.intellij.openapi.actionSystem.ActionPlaces]-style id for the vertical changes toolbar. */
-        private const val CHANGES_TOOLBAR_PLACE = "GitLabCockpitChangesToolbar"
-
         /**
          * Name color for a change type: added/deleted/renamed map to the IDE's VCS [FileStatus] colors
          * (with the plugin palette as a fallback when the active theme leaves one unset); a plain
@@ -1374,40 +1095,6 @@ class ChangesPanel(
             ChangeType.RENAMED -> FileStatus.MODIFIED.color ?: CockpitTheme.info
             ChangeType.MODIFIED -> null
         }
-
-        /** The position of a discussion's first positioned, non-system note (or null). */
-        private fun positionOf(discussion: GitLabDiscussion?): NotePosition? =
-            discussion?.notes?.firstOrNull { !it.system && it.position != null }?.position
-
-        /** `author · L<n> · <first body line>` for the thread list. */
-        private fun discussionLabel(discussion: GitLabDiscussion): String {
-            val note = discussion.notes.firstOrNull { !it.system } ?: return "…"
-            val firstLine = note.body.lineSequence().firstOrNull()?.trim().orEmpty().take(60)
-            val parts = buildList {
-                add(displayName(note.author))
-                lineLabel(positionOf(discussion))?.let { add(it) }
-                if (firstLine.isNotEmpty()) add(firstLine)
-            }
-            return parts.joinToString(" · ")
-        }
-
-        /** `author · L<n> · resolved` header for one note. */
-        private fun headerFor(note: GitLabDiscussionNote, fallback: NotePosition?): String {
-            val parts = buildList {
-                add(displayName(note.author))
-                lineLabel(note.position ?: fallback)?.let { add(it) }
-                if (note.resolved) add(CockpitBundle.message("changes.comments.resolved"))
-            }
-            return parts.joinToString(" · ")
-        }
-
-        /** `L<new_line|old_line>` for a position, or null when it anchors to no line. */
-        private fun lineLabel(position: NotePosition?): String? {
-            val line = position?.let { it.newLine ?: it.oldLine } ?: return null
-            return CockpitBundle.message("changes.comments.line", line)
-        }
-
-        private fun displayName(user: GitLabUser): String = user.name.ifBlank { user.username }
 
         private fun describe(result: GitLabResult<*>): String = when (result) {
             is GitLabResult.HttpError -> "HTTP ${result.status}"

@@ -2,8 +2,16 @@ package dev.jota.gitlabcockpit.ui
 
 import com.intellij.ide.BrowserUtil
 import com.intellij.icons.AllIcons
+import com.intellij.notification.NotificationGroupManager
+import com.intellij.notification.NotificationType
 import com.intellij.openapi.Disposable
+import com.intellij.openapi.actionSystem.ActionManager
+import com.intellij.openapi.actionSystem.ActionUpdateThread
+import com.intellij.openapi.actionSystem.AnAction
+import com.intellij.openapi.actionSystem.AnActionEvent
+import com.intellij.openapi.actionSystem.DefaultActionGroup
 import com.intellij.openapi.application.EDT
+import com.intellij.openapi.ide.CopyPasteManager
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.ui.ComboBox
 import com.intellij.openapi.ui.DialogWrapper
@@ -13,6 +21,7 @@ import com.intellij.ui.CollectionListModel
 import com.intellij.ui.ColorUtil
 import com.intellij.ui.DocumentAdapter
 import com.intellij.ui.DoubleClickListener
+import com.intellij.ui.OnePixelSplitter
 import com.intellij.ui.SearchTextField
 import com.intellij.ui.components.ActionLink
 import com.intellij.ui.components.JBCheckBox
@@ -37,6 +46,7 @@ import dev.jota.gitlabcockpit.api.GitLabResult
 import dev.jota.gitlabcockpit.api.GitLabUser
 import dev.jota.gitlabcockpit.api.MergeRequestUpdate
 import dev.jota.gitlabcockpit.core.ApprovalsHealth
+import dev.jota.gitlabcockpit.core.COCKPIT_NOTIFICATION_GROUP
 import dev.jota.gitlabcockpit.core.Closing
 import dev.jota.gitlabcockpit.core.CockpitProjectService
 import dev.jota.gitlabcockpit.core.CommentThread
@@ -44,7 +54,9 @@ import dev.jota.gitlabcockpit.core.MergeAction
 import dev.jota.gitlabcockpit.core.MergeLinePresentation
 import dev.jota.gitlabcockpit.core.MergeLineState
 import dev.jota.gitlabcockpit.core.MrHeaderPresentation
+import dev.jota.gitlabcockpit.core.MrParticipant
 import dev.jota.gitlabcockpit.core.MrRef
+import dev.jota.gitlabcockpit.core.MrRole
 import dev.jota.gitlabcockpit.core.ReviewerSelectionModel
 import dev.jota.gitlabcockpit.core.TimelineFilter
 import dev.jota.gitlabcockpit.core.TimelineItem
@@ -55,6 +67,7 @@ import dev.jota.gitlabcockpit.core.eventIconKey
 import dev.jota.gitlabcockpit.core.filterMembers
 import dev.jota.gitlabcockpit.core.mergeButtonState
 import dev.jota.gitlabcockpit.core.mrHeaderPresentation
+import dev.jota.gitlabcockpit.core.mrParticipants
 import dev.jota.gitlabcockpit.core.projectWebUrlOf
 import dev.jota.gitlabcockpit.core.threadAnchorLabel
 import dev.jota.gitlabcockpit.settings.GitLabCockpitSettings
@@ -65,11 +78,13 @@ import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.awt.BorderLayout
+import java.awt.CardLayout
 import java.awt.Color
 import java.awt.Cursor
 import java.awt.FlowLayout
 import java.awt.Font
 import java.awt.GridBagLayout
+import java.awt.datatransfer.StringSelection
 import java.awt.event.MouseAdapter
 import java.awt.event.MouseEvent
 import javax.swing.JButton
@@ -215,21 +230,37 @@ class MrDetailPanel(
     }
     private val commentsPanel = JPanel(BorderLayout())
 
-    private val tabbedPane = JBTabbedPane()
+    /** Whether the current user has approved this MR; kept for the toolbar Approve/Revoke toggle. */
+    private var approvedByMe: Boolean = false
+
+    /** The right-hand "main" card: a small tabbed pane with Info and Events & Discussions. */
+    private val mainTabbedPane = JBTabbedPane()
+
+    /** Swaps the right side between the "main" card and the drill-in "pipelines" card. */
+    private val cardLayout = CardLayout()
+    private val rightCards = JPanel(cardLayout)
+
+    /** The MR tab's horizontal splitter: the changes tree on the left, the cards on the right. */
+    private val splitter = OnePixelSplitter(false, MRTAB_SPLITTER_KEY, 0.55f)
+
+    /** The whole MR view (WEST toolbar + CENTER splitter); swapped in for the placeholder in [showMr]. */
+    private val contentPanel = JPanel(BorderLayout())
 
     private val pipelinesPanel = PipelinesPanel(project, service)
 
     private val changesPanel = ChangesPanel(
         project,
         service,
-        onFileCountChanged = { count -> setChangesTabTitle(count) },
+        onFileCountChanged = { },
         onReviewSubmitted = { onReviewSubmitted() },
     )
 
     init {
+        // Info card content: the header + the markdown description.
         overviewPanel.add(headerContainer, BorderLayout.NORTH)
         overviewPanel.add(descriptionScroll, BorderLayout.CENTER)
 
+        // Events & Discussions card content: filter/sort toolbar + draft banner, timeline, comment box.
         val commentsNorth = JPanel(BorderLayout()).apply { isOpaque = false }
         commentsNorth.add(buildTimelineToolbar(), BorderLayout.NORTH)
         commentsNorth.add(draftBanner, BorderLayout.SOUTH)
@@ -237,23 +268,209 @@ class MrDetailPanel(
         commentsPanel.add(notesScroll, BorderLayout.CENTER)
         commentsPanel.add(buildCommentInput(), BorderLayout.SOUTH)
 
-        tabbedPane.addTab(CockpitBundle.message("detail.tab.overview"), overviewPanel)
-        tabbedPane.addTab(CockpitBundle.message("detail.tab.timeline"), commentsPanel)
-        tabbedPane.addTab(CockpitBundle.message("pipelines.tab"), pipelinesPanel)
-        tabbedPane.addTab(CockpitBundle.message("changes.tab"), changesPanel)
-        tabbedPane.addChangeListener {
-            when (tabbedPane.selectedIndex) {
-                TIMELINE_TAB_INDEX -> {
-                    val ref = currentRef
-                    if (ref != null && notesLoadedForRef != ref) loadNotes(ref)
-                }
-                PIPELINES_TAB_INDEX -> pipelinesPanel.onTabSelected()
-                CHANGES_TAB_INDEX -> changesPanel.onTabSelected()
+        // The "main" card: a small tabbed pane with Info | Events & Discussions.
+        mainTabbedPane.addTab(CockpitBundle.message("detail.tab.overview"), overviewPanel)
+        mainTabbedPane.addTab(CockpitBundle.message("detail.tab.timeline"), commentsPanel)
+        mainTabbedPane.addChangeListener {
+            if (mainTabbedPane.selectedIndex == TIMELINE_TAB_INDEX) {
+                val ref = currentRef
+                if (ref != null && notesLoadedForRef != ref) loadNotes(ref)
             }
         }
+
+        // The "pipelines" drill-in card: a "← Back" link atop the full PipelinesPanel.
+        val pipelinesCard = JPanel(BorderLayout())
+        val backRow = JPanel(FlowLayout(FlowLayout.LEFT, JBUI.scale(6), 0)).apply { isOpaque = false }
+        backRow.add(ActionLink(CockpitBundle.message("detail.pipelines.back")) { showMainCard() })
+        pipelinesCard.add(backRow, BorderLayout.NORTH)
+        pipelinesCard.add(pipelinesPanel, BorderLayout.CENTER)
+
+        rightCards.add(mainTabbedPane, CARD_MAIN)
+        rightCards.add(pipelinesCard, CARD_PIPELINES)
+
+        // Left: the changes tree (+ counter, + pending review). Right: the cards.
+        splitter.firstComponent = changesPanel
+        splitter.secondComponent = rightCards
+
+        contentPanel.add(buildToolbar(), BorderLayout.WEST)
+        contentPanel.add(splitter, BorderLayout.CENTER)
+
         commentButton.addActionListener { onSubmitComment() }
 
         showPlaceholder()
+    }
+
+    /** Shows the "main" card (Info | Events & Discussions). */
+    private fun showMainCard() = cardLayout.show(rightCards, CARD_MAIN)
+
+    /** Shows the "pipelines" drill-in card, loading its pipelines the first time it is shown. */
+    private fun showPipelinesCard() {
+        cardLayout.show(rightCards, CARD_PIPELINES)
+        pipelinesPanel.onTabSelected()
+    }
+
+    // --- Action toolbar (WEST) ----------------------------------------------------------------
+
+    /**
+     * The MR tab's single vertical action toolbar (GLC-37). The MR-level actions come first —
+     * Approve/Revoke, Request changes, Refresh, then Close / Copy link / Open in browser — followed by
+     * the changed-file tree actions folded in from [ChangesPanel.treeActions]. The [splitter] is the
+     * toolbar's target component; each action's own [AnAction.update] drives its enabled state.
+     */
+    private fun buildToolbar(): JComponent {
+        val group = DefaultActionGroup().apply {
+            add(approveAction())
+            add(requestChangesAction())
+            add(refreshAction())
+            addSeparator()
+            add(closeAction())
+            add(copyLinkAction())
+            add(openInBrowserAction())
+            addSeparator()
+            changesPanel.treeActions().forEach { add(it) }
+        }
+        val toolbar = ActionManager.getInstance().createActionToolbar(MR_TOOLBAR_PLACE, group, false)
+        toolbar.targetComponent = splitter
+        return toolbar.component
+    }
+
+    /**
+     * Approve / Revoke toggle. Reuses the header's approval logic ([onToggleApproval]) and reflects the
+     * current [approvedByMe] state: a plain check ([AllIcons.Actions.Checked]) to approve, a green tick
+     * ([AllIcons.RunConfigurations.TestState.Green2]) with a "Revoke approval" tooltip once approved.
+     * Disabled until the current user and MR are known.
+     */
+    private fun approveAction(): AnAction = object : AnAction() {
+        override fun getActionUpdateThread(): ActionUpdateThread = ActionUpdateThread.EDT
+
+        override fun update(e: AnActionEvent) {
+            e.presentation.isEnabled = currentRef != null && service.currentUser != null
+            if (approvedByMe) {
+                e.presentation.icon = AllIcons.RunConfigurations.TestState.Green2
+                e.presentation.text = CockpitBundle.message("detail.revokeApproval")
+            } else {
+                e.presentation.icon = AllIcons.Actions.Checked
+                e.presentation.text = CockpitBundle.message("detail.approve")
+            }
+        }
+
+        override fun actionPerformed(e: AnActionEvent) {
+            val ref = currentRef ?: return
+            onToggleApproval(ref, approvedByMe)
+        }
+    }
+
+    /**
+     * Request changes. GitLab has no native "request changes" review state, so this is a convenience:
+     * if the MR is currently approved by me it first revokes that approval (an approval and a
+     * change-request are contradictory), then jumps to the Events & Discussions tab and focuses the
+     * comment box so the reviewer can spell out what they want changed.
+     */
+    private fun requestChangesAction(): AnAction = object : AnAction(
+        CockpitBundle.message("detail.toolbar.requestChanges"),
+        null,
+        AllIcons.Actions.SuggestedRefactoringBulb,
+    ) {
+        override fun getActionUpdateThread(): ActionUpdateThread = ActionUpdateThread.EDT
+
+        override fun update(e: AnActionEvent) {
+            e.presentation.isEnabled = currentRef != null
+        }
+
+        override fun actionPerformed(e: AnActionEvent) {
+            val ref = currentRef ?: return
+            if (approvedByMe) onToggleApproval(ref, alreadyApproved = true)
+            showMainCard()
+            mainTabbedPane.selectedIndex = TIMELINE_TAB_INDEX
+            commentArea.requestFocusInWindow()
+        }
+    }
+
+    /** Refreshes the whole MR (detail, changes tree and timeline) by re-loading its detail. */
+    private fun refreshAction(): AnAction = object : AnAction(
+        CockpitBundle.message("detail.toolbar.refresh"),
+        null,
+        AllIcons.Actions.Refresh,
+    ) {
+        override fun getActionUpdateThread(): ActionUpdateThread = ActionUpdateThread.EDT
+
+        override fun update(e: AnActionEvent) {
+            e.presentation.isEnabled = currentRef != null
+        }
+
+        override fun actionPerformed(e: AnActionEvent) {
+            currentRef?.let { loadDetail(it) }
+        }
+    }
+
+    /**
+     * Close merge request. Enabled only while the MR is open; asks for confirmation, then sends a
+     * `state_event=close` update. On success the detail and the list are refreshed (via [applyUpdate]).
+     */
+    private fun closeAction(): AnAction = object : AnAction(
+        CockpitBundle.message("detail.toolbar.close"),
+        null,
+        AllIcons.Actions.Cancel,
+    ) {
+        override fun getActionUpdateThread(): ActionUpdateThread = ActionUpdateThread.EDT
+
+        override fun update(e: AnActionEvent) {
+            e.presentation.isEnabled = currentMr?.state == "opened"
+        }
+
+        override fun actionPerformed(e: AnActionEvent) = onCloseMr()
+    }
+
+    /** Copies the MR's web URL to the clipboard and confirms with a balloon notification. */
+    private fun copyLinkAction(): AnAction = object : AnAction(
+        CockpitBundle.message("detail.toolbar.copyLink"),
+        null,
+        AllIcons.Actions.Copy,
+    ) {
+        override fun getActionUpdateThread(): ActionUpdateThread = ActionUpdateThread.EDT
+
+        override fun update(e: AnActionEvent) {
+            e.presentation.isEnabled = currentMr != null
+        }
+
+        override fun actionPerformed(e: AnActionEvent) = onCopyLink()
+    }
+
+    /** Opens the MR's GitLab page in the external browser. */
+    private fun openInBrowserAction(): AnAction = object : AnAction(
+        CockpitBundle.message("detail.openInBrowser"),
+        null,
+        AllIcons.General.Web,
+    ) {
+        override fun getActionUpdateThread(): ActionUpdateThread = ActionUpdateThread.EDT
+
+        override fun update(e: AnActionEvent) {
+            e.presentation.isEnabled = currentMr != null
+        }
+
+        override fun actionPerformed(e: AnActionEvent) {
+            currentMr?.let { BrowserUtil.browse(it.webUrl) }
+        }
+    }
+
+    /** Confirms and closes the MR (`state_event=close`), then refreshes the detail and the list. */
+    private fun onCloseMr() {
+        val mr = currentMr ?: return
+        if (!ConfirmCloseDialog(project, mr.iid).showAndGet()) return
+        applyUpdate(MrRef(mr.projectId, mr.iid), MergeRequestUpdate(stateEvent = "close"))
+    }
+
+    /** Copies the current MR's web URL to the clipboard and fires a "Link copied" balloon. */
+    private fun onCopyLink() {
+        val mr = currentMr ?: return
+        CopyPasteManager.getInstance().setContents(StringSelection(mr.webUrl))
+        NotificationGroupManager.getInstance()
+            .getNotificationGroup(COCKPIT_NOTIFICATION_GROUP)
+            .createNotification(
+                CockpitBundle.message("detail.toolbar.copyLink.done"),
+                NotificationType.INFORMATION,
+            )
+            .notify(project)
     }
 
     /** EDT. Shows the "select an MR" placeholder and forgets the current selection. */
@@ -304,6 +521,9 @@ class MrDetailPanel(
         headerContainer.add(buildHeader(mr), BorderLayout.CENTER)
         setDescription(mr)
 
+        // Reset the approval state until the async approvals load re-derives it (drives the toolbar toggle).
+        approvedByMe = false
+
         // Reset the comment thread for the (possibly refreshed) MR; it reloads lazily / on demand.
         notesJob?.cancel()
         notesEpoch++
@@ -315,23 +535,25 @@ class MrDetailPanel(
         draftBanner.isVisible = false
         setTimelineTabTitle(null)
 
-        // Rebind the Pipelines tab; it reloads lazily when shown (or now, if already selected).
+        // Rebind the pipelines drill-in; it reloads lazily the first time its card is shown.
         pipelinesPanel.setMr(ref, mr.sourceBranch, mr.headPipeline)
 
-        // Rebind the Changes tab; it reloads lazily when shown (or now, if already selected).
+        // Rebind the changes tree; it is always visible now, so it is (re)loaded eagerly below.
         changesPanel.setMr(ref, mr.diffRefs, projectWebUrlOf(mr))
 
-        if (tabbedPane.parent !== this) {
+        // A (re)load always lands on the main card, never lingering on the previous MR's pipelines.
+        showMainCard()
+
+        if (contentPanel.parent !== this) {
             removeAll()
-            add(tabbedPane, BorderLayout.CENTER)
+            add(contentPanel, BorderLayout.CENTER)
         }
         revalidate()
         repaint()
 
         loadApprovals(ref)
-        if (tabbedPane.selectedIndex == TIMELINE_TAB_INDEX) loadNotes(ref)
-        if (tabbedPane.selectedIndex == PIPELINES_TAB_INDEX) pipelinesPanel.onTabSelected()
-        if (tabbedPane.selectedIndex == CHANGES_TAB_INDEX) changesPanel.onTabSelected()
+        changesPanel.onTabSelected()
+        if (mainTabbedPane.selectedIndex == TIMELINE_TAB_INDEX) loadNotes(ref)
     }
 
     private fun setDescription(mr: GitLabMergeRequest) {
@@ -402,28 +624,39 @@ class MrDetailPanel(
     }
 
     /**
-     * The people row (GLC-36): circular [HEADER_AVATAR_SIZE]px avatars for the author, then the
-     * assignees, then the reviewers — in that order, with only a name tooltip and no text. Sits above
-     * the title so the MR's participants read at a glance; the meta line no longer carries an avatar.
+     * The people row (GLC-37): one circular [HEADER_AVATAR_SIZE]px avatar per user — deduplicated, so a
+     * user who is both, say, author and reviewer appears once — with their combined roles in the
+     * tooltip («Name (Author, Reviewer)»). The author comes first, then the rest ordered by their first
+     * role (see [mrParticipants]); no text, so the participants read at a glance.
      */
     private fun buildAvatarsRow(mr: GitLabMergeRequest): JComponent {
         val row = JPanel(FlowLayout(FlowLayout.LEFT, JBUI.scale(AVATAR_ROW_GAP), 0)).apply { isOpaque = false }
-        val people = buildList {
-            add(mr.author)
-            addAll(mr.assignees)
-            addAll(mr.reviewers)
+        for (participant in mrParticipants(mr.author, mr.assignees, mr.reviewers)) {
+            row.add(headerAvatarLabel(participant.user, participantTooltip(participant)))
         }
-        for (user in people) row.add(headerAvatarLabel(user))
         return row
     }
 
+    /** «Name (Author, Reviewer)» — the display name and the user's combined roles for the avatar tooltip. */
+    private fun participantTooltip(participant: MrParticipant): String {
+        val roles = participant.roles.joinToString(", ") { roleLabel(it) }
+        return CockpitBundle.message("detail.people.tooltip", displayName(participant.user), roles)
+    }
+
+    /** The localized label for one [MrRole]. */
+    private fun roleLabel(role: MrRole): String = when (role) {
+        MrRole.AUTHOR -> CockpitBundle.message("detail.role.author")
+        MrRole.ASSIGNEE -> CockpitBundle.message("detail.role.assignee")
+        MrRole.REVIEWER -> CockpitBundle.message("detail.role.reviewer")
+    }
+
     /**
-     * A [HEADER_AVATAR_SIZE]px circular avatar for [user] with the display name as its tooltip. Shows
+     * A [HEADER_AVATAR_SIZE]px circular avatar for [user] with [tooltip] as its tooltip. Shows
      * [AvatarCache]'s placeholder immediately and swaps in the real image (repainting the header) once
      * the background load lands.
      */
-    private fun headerAvatarLabel(user: GitLabUser): JBLabel {
-        val label = JBLabel().apply { toolTipText = displayName(user) }
+    private fun headerAvatarLabel(user: GitLabUser, tooltip: String): JBLabel {
+        val label = JBLabel().apply { toolTipText = tooltip }
         label.icon = avatarCache.icon(user, HEADER_AVATAR_SIZE) {
             label.icon = avatarCache.icon(user, HEADER_AVATAR_SIZE) {}
             headerContainer.repaint()
@@ -453,8 +686,8 @@ class MrDetailPanel(
 
     /**
      * The head pipeline line — `Pipeline status:` followed by the status (colored via
-     * [CockpitTheme.statusColor] with its [CockpitIcons] icon), clickable to jump to the Pipelines
-     * tab. Null when [status] is null (the MR has no head pipeline), so no empty row is added.
+     * [CockpitTheme.statusColor] with its [CockpitIcons] icon), clickable to drill into the pipelines
+     * card. Null when [status] is null (the MR has no head pipeline), so no empty row is added.
      */
     private fun buildPipelineLine(status: String?): JComponent? {
         if (status == null) return null
@@ -468,7 +701,7 @@ class MrDetailPanel(
         }
         statusLabel.addMouseListener(object : MouseAdapter() {
             override fun mouseClicked(e: MouseEvent) {
-                tabbedPane.selectedIndex = PIPELINES_TAB_INDEX
+                showPipelinesCard()
             }
         })
         line.add(statusLabel)
@@ -653,6 +886,7 @@ class MrDetailPanel(
                 when (result) {
                     is GitLabResult.Success -> renderApprovals(result.data)
                     else -> {
+                        approvedByMe = false
                         approvalsLabel?.text = CockpitBundle.message(
                             "detail.approvedBy",
                             CockpitBundle.message("detail.approvals.unavailable"),
@@ -683,6 +917,7 @@ class MrDetailPanel(
 
         val me = service.currentUser
         val approved = me != null && approvals.approvedBy.any { it.user.id == me.id }
+        approvedByMe = approved
         val link = approvalLink ?: return
         link.text = CockpitBundle.message(if (approved) "detail.revokeApproval" else "detail.approve")
         link.isEnabled = me != null
@@ -809,7 +1044,7 @@ class MrDetailPanel(
         draftBanner.isVisible = false
         val ref = currentRef ?: return
         notesLoadedForRef = null
-        if (tabbedPane.selectedIndex == TIMELINE_TAB_INDEX) loadNotes(ref)
+        if (mainTabbedPane.selectedIndex == TIMELINE_TAB_INDEX) loadNotes(ref)
     }
 
     /**
@@ -984,12 +1219,11 @@ class MrDetailPanel(
     }
 
     /**
-     * Jumps from a Comments-tab thread anchor to that thread inside the diff: selects the Changes tab
-     * (firing its lazy load when first shown) and asks it to reveal the discussion — select its file,
-     * open the diff and scroll to the thread. An unknown or non-positioned id is a silent no-op.
+     * Jumps from a timeline thread anchor to that thread inside the diff: the changes tree is always
+     * visible, so it just asks it to reveal the discussion — select its file, open the diff and scroll
+     * to the thread. An unknown or non-positioned id is a silent no-op.
      */
     private fun gotoDiscussionInChanges(discussionId: String) {
-        tabbedPane.selectedIndex = CHANGES_TAB_INDEX
         changesPanel.revealDiscussion(discussionId)
     }
 
@@ -1028,22 +1262,7 @@ class MrDetailPanel(
         } else {
             CockpitBundle.message("detail.tab.timelineCount", count)
         }
-        tabbedPane.setTitleAt(TIMELINE_TAB_INDEX, title)
-    }
-
-    /**
-     * Updates the Changes tab title with the loaded file count (null → the plain "Changes"). Guarded
-     * against being called before the tab is added (the [ChangesPanel] callback can fire during its
-     * own construction, which happens before [tabbedPane] is populated).
-     */
-    private fun setChangesTabTitle(count: Int?) {
-        if (tabbedPane.tabCount <= CHANGES_TAB_INDEX) return
-        val title = if (count == null) {
-            CockpitBundle.message("changes.tab")
-        } else {
-            CockpitBundle.message("changes.tabCount", count)
-        }
-        tabbedPane.setTitleAt(CHANGES_TAB_INDEX, title)
+        mainTabbedPane.setTitleAt(TIMELINE_TAB_INDEX, title)
     }
 
     // --- Edit actions -------------------------------------------------------------------------
@@ -1344,10 +1563,34 @@ class MrDetailPanel(
         val rememberOptions: Boolean get() = rememberCheck.isSelected
     }
 
+    /** Confirmation for closing an MR: a single "Close merge request !iid?" line (Kotlin UI DSL v2). */
+    private class ConfirmCloseDialog(project: Project, private val iid: Long) : DialogWrapper(project) {
+
+        init {
+            title = CockpitBundle.message("dialog.closeMr.title")
+            init()
+        }
+
+        override fun createCenterPanel(): JComponent = panel {
+            row { label(CockpitBundle.message("dialog.closeMr.confirm", iid)) }
+        }
+    }
+
     companion object {
+        /** Index of the Events & Discussions tab inside the "main" card's small tabbed pane (Info = 0). */
         private const val TIMELINE_TAB_INDEX = 1
-        private const val PIPELINES_TAB_INDEX = 2
-        private const val CHANGES_TAB_INDEX = 3
+
+        /** Persisted proportion key for the MR tab's horizontal (changes | cards) splitter (GLC-37). */
+        private const val MRTAB_SPLITTER_KEY = "dev.jota.gitlabcockpit.mrtab.splitter"
+
+        /** [com.intellij.openapi.actionSystem.ActionPlaces]-style id for the MR tab's vertical toolbar. */
+        private const val MR_TOOLBAR_PLACE = "GitLabCockpitMrToolbar"
+
+        /** CardLayout name of the "main" card (Info | Events & Discussions). */
+        private const val CARD_MAIN = "main"
+
+        /** CardLayout name of the "pipelines" drill-in card. */
+        private const val CARD_PIPELINES = "pipelines"
 
         /** Diameter (px) of the header people-row avatars. */
         private const val HEADER_AVATAR_SIZE = 18

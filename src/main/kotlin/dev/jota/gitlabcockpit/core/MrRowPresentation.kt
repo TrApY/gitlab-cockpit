@@ -23,24 +23,25 @@ data class MrRowSegment(val text: String, val style: MrSegmentStyle)
 /**
  * The text content of a two-line merge-request row, split so the renderer only paints it. [line1] is
  * a list of styled runs (an optional draft prefix, the title, an optional conflicts suffix); [line2]
- * is the fully-composed muted metadata line (all one color, hence a plain string); [reviewerOverflow]
- * is how many reviewers exceed the avatars actually shown, i.e. the `+N` badge count (0 when none).
+ * is the fully-composed muted metadata line without the branches (all one color, hence a plain
+ * string); [sourceBranch] / [targetBranch] are carried separately so the renderer can paint them as
+ * rounded chips (GLC-37) rather than inline text; [reviewerOverflow] is how many reviewers exceed the
+ * avatars actually shown, i.e. the `+N` badge count (0 when none).
  *
  * All the composition rules live here — the draft/conflict decoration, the author display fallback,
- * the optional `group/project` prefix, the `iid`/date/branch tail, and the reviewer overflow — so
- * they are unit-testable without Swing. See [mrRowPresentation].
+ * the optional `group/project` prefix, the `iid`/date tail, and the reviewer overflow — so they are
+ * unit-testable without Swing. See [mrRowPresentation].
  */
 data class MrRowPresentation(
     val line1: List<MrRowSegment>,
     val line2: String,
+    val sourceBranch: String,
+    val targetBranch: String,
     val reviewerOverflow: Int,
 )
 
 /** Separator between the metadata parts of [MrRowPresentation.line2]. */
 private const val META_SEPARATOR = " · " // " · "
-
-/** Arrow between the source and target branches on line 2. */
-private const val BRANCH_ARROW = " → " // " → "
 
 /**
  * Builds the [MrRowPresentation] for [mr]. [showProject] mirrors the "All projects" mode: when set,
@@ -72,7 +73,6 @@ fun mrRowPresentation(
         add("!${mr.iid}")
         add(mr.author.name.ifBlank { mr.author.username })
         add(relativeUpdatedAt)
-        add("${mr.sourceBranch}$BRANCH_ARROW${mr.targetBranch}")
     }
 
     val overflow = (mr.reviewers.size - maxReviewerAvatars).coerceAtLeast(0)
@@ -80,6 +80,8 @@ fun mrRowPresentation(
     return MrRowPresentation(
         line1 = line1,
         line2 = parts.joinToString(META_SEPARATOR),
+        sourceBranch = mr.sourceBranch,
+        targetBranch = mr.targetBranch,
         reviewerOverflow = overflow,
     )
 }

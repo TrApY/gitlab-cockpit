@@ -51,4 +51,14 @@ class MergeRequestUpdateSerializationTest {
     fun `all-null update serializes to an empty object`() {
         assertEquals("{}", encode(MergeRequestUpdate()))
     }
+
+    @Test
+    fun `state_event serializes with a snake_case key when set`() {
+        assertEquals("""{"state_event":"close"}""", encode(MergeRequestUpdate(stateEvent = "close")))
+    }
+
+    @Test
+    fun `a null state_event is omitted`() {
+        assertEquals("""{"title":"New title"}""", encode(MergeRequestUpdate(title = "New title", stateEvent = null)))
+    }
 }

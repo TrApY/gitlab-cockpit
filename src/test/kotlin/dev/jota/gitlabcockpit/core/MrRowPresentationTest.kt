@@ -64,10 +64,12 @@ class MrRowPresentationTest {
     }
 
     @Test
-    fun `line 2 joins iid author date and branches with the author display name`() {
+    fun `line 2 joins iid author and date with the author display name, branches carried separately`() {
         val p = mrRowPresentation(mr(), showProject = false, relativeUpdatedAt = "2h ago")
 
-        assertEquals("!7 · José Tomás · 2h ago · feature/cache → main", p.line2)
+        assertEquals("!7 · José Tomás · 2h ago", p.line2)
+        assertEquals("feature/cache", p.sourceBranch)
+        assertEquals("main", p.targetBranch)
     }
 
     @Test
