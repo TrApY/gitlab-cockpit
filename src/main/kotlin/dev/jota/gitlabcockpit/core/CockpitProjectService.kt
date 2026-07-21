@@ -346,13 +346,19 @@ class CockpitProjectService(
     suspend fun getDraftNotes(ref: MrRef): GitLabResult<List<GitLabDraftNote>> =
         withClientAndProject { client, _ -> client.getDraftNotes(ref.projectId, ref.iid) }
 
-    /** Adds a draft note; a null [position] posts a general draft, otherwise a diff-anchored one. */
+    /**
+     * Adds a draft note; a null [position] posts a general draft, otherwise a diff-anchored one. A
+     * non-null [inReplyToDiscussionId] threads the draft into that discussion (a reply-mode draft).
+     */
     suspend fun createDraftNote(
         ref: MrRef,
         note: String,
         position: PositionPayload? = null,
+        inReplyToDiscussionId: String? = null,
     ): GitLabResult<GitLabDraftNote> =
-        withClientAndProject { client, _ -> client.createDraftNote(ref.projectId, ref.iid, note, position) }
+        withClientAndProject { client, _ ->
+            client.createDraftNote(ref.projectId, ref.iid, note, position, inReplyToDiscussionId)
+        }
 
     /**
      * Opens a diff-anchored draft on [file] at [pos] — the draft analogue of [createDiffThread].

@@ -199,6 +199,43 @@ class GitLabDraftNotesApiTest {
     }
 
     @Test
+    fun `createDraftNote with in_reply_to_discussion_id threads the draft into the discussion`() {
+        responseStatus = 201
+        responseBody = """
+            {
+              "id": 57,
+              "note": "Reply draft",
+              "merge_request_id": 5,
+              "author_id": 9
+            }
+        """.trimIndent()
+        startServer()
+
+        val result = runBlocking {
+            GitLabApiClient(baseUrl()) { "t" }
+                .createDraftNote(123, 42, "Reply draft", inReplyToDiscussionId = "abc123")
+        }
+
+        assertTrue("expected Success but was $result", result is GitLabResult.Success)
+        val draft = (result as GitLabResult.Success).data
+        assertEquals(57L, draft.id)
+        assertEquals("Reply draft", draft.note)
+        assertNull(draft.position)
+
+        assertEquals("POST", method)
+        assertTrue(
+            "path is the draft_notes path, was: $rawPath",
+            rawPath!!.endsWith("/merge_requests/42/draft_notes"),
+        )
+        assertEquals("application/json", contentType)
+        // The null position is omitted; in_reply_to_discussion_id is present only because it is non-null.
+        assertEquals(
+            """{"note":"Reply draft","in_reply_to_discussion_id":"abc123"}""",
+            requestBody,
+        )
+    }
+
+    @Test
     fun `deleteDraftNote issues a DELETE to the exact draft path and treats 204 as success`() {
         responseStatus = 204
         responseBody = ""

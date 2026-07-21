@@ -1237,19 +1237,21 @@ class MrDetailPanel(
             project,
             dialogTitle,
             onSubmit = { text, startReview -> submitComposer(ref, replyToDiscussionId, text, startReview) },
-            onSaveDraft = { text -> saveDraftComposer(ref, text) },
+            onSaveDraft = { text -> saveDraftComposer(ref, replyToDiscussionId, text) },
         ).show()
     }
 
     /**
      * Submit path of the composer. Without "Start review": publishes directly — a reply to the thread in
      * reply mode ([replyToDiscussion]), otherwise a new general note ([addNote]). With "Start review":
-     * creates a draft note that begins the review ([createDraftNote]). On success the timeline reloads.
+     * creates a draft note that begins the review ([createDraftNote]) — in reply mode the draft is
+     * threaded into the discussion via [discussionId], otherwise it is a general draft. On success the
+     * timeline reloads.
      */
     private fun submitComposer(ref: MrRef, discussionId: String?, text: String, startReview: Boolean) {
         service.coroutineScope.launch {
             val result: GitLabResult<*> = when {
-                startReview -> service.createDraftNote(ref, text)
+                startReview -> service.createDraftNote(ref, text, inReplyToDiscussionId = discussionId)
                 discussionId != null -> service.replyToDiscussion(ref, discussionId, text)
                 else -> service.addNote(ref, text)
             }
@@ -1264,13 +1266,13 @@ class MrDetailPanel(
     }
 
     /**
-     * Save-Draft path of the composer: always creates a (general) draft note ([createDraftNote]) — a
-     * reply-mode draft is kept as a general draft since GitLab's draft API this plugin wires has no
-     * threaded-reply draft. On success the timeline reloads (the pending-drafts banner reflects it).
+     * Save-Draft path of the composer: creates a draft note ([createDraftNote]). In reply mode the draft
+     * is threaded into the discussion via [discussionId] (`in_reply_to_discussion_id`); otherwise it is a
+     * general draft. On success the timeline reloads (the pending-drafts banner reflects it).
      */
-    private fun saveDraftComposer(ref: MrRef, text: String) {
+    private fun saveDraftComposer(ref: MrRef, discussionId: String?, text: String) {
         service.coroutineScope.launch {
-            val result = service.createDraftNote(ref, text)
+            val result = service.createDraftNote(ref, text, inReplyToDiscussionId = discussionId)
             withContext(Dispatchers.EDT) {
                 if (currentRef != ref) return@withContext
                 when (result) {

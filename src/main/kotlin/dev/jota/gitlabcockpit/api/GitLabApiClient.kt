@@ -343,14 +343,17 @@ private data class DiffDiscussionCreateBody(
 private data class PipelineCreateBody(val ref: String)
 
 /**
- * Request body for `POST /merge_requests/:iid/draft_notes`: `{ "note": …, "position": {…}? }`. The
- * [position] is omitted for an unpositioned (general) draft; it is encoded by
- * [GitLabApiClient.discussionJson], which drops the null and always emits `position_type`.
+ * Request body for `POST /merge_requests/:iid/draft_notes`:
+ * `{ "note": …, "position": {…}?, "in_reply_to_discussion_id": "…"? }`. The [position] is omitted for
+ * an unpositioned (general) draft; it is encoded by [GitLabApiClient.discussionJson], which drops the
+ * null and always emits `position_type`. The [inReplyToDiscussionId] threads the draft into an existing
+ * discussion (a reply-mode draft) and is likewise omitted when null.
  */
 @Serializable
 private data class DraftNoteCreateBody(
     val note: String,
     val position: PositionPayload? = null,
+    @SerialName("in_reply_to_discussion_id") val inReplyToDiscussionId: String? = null,
 )
 
 /** Request body for `PUT /merge_requests/:iid/discussions/:id`: `{ "resolved": true|false }`. */
@@ -710,20 +713,24 @@ class GitLabApiClient(
         )
 
     /**
-     * Calls `POST /projects/:id/merge_requests/:iid/draft_notes` with `{ "note": …, "position": {…}? }`
-     * to add a personal (unpublished) review comment. A null [position] posts a general draft (the
-     * field is omitted); a non-null one anchors the draft to a diff line, encoded exactly like
-     * [createDiffDiscussion]'s position. Returns the created [GitLabDraftNote].
+     * Calls `POST /projects/:id/merge_requests/:iid/draft_notes` with
+     * `{ "note": …, "position": {…}?, "in_reply_to_discussion_id": "…"? }` to add a personal
+     * (unpublished) review comment. A null [position] posts a general draft (the field is omitted); a
+     * non-null one anchors the draft to a diff line, encoded exactly like [createDiffDiscussion]'s
+     * position. A non-null [inReplyToDiscussionId] threads the draft into that existing discussion (a
+     * reply-mode draft); when null the field is omitted and the draft is a standalone one. Returns the
+     * created [GitLabDraftNote].
      */
     suspend fun createDraftNote(
         projectId: Long,
         mrIid: Long,
         note: String,
         position: PositionPayload? = null,
+        inReplyToDiscussionId: String? = null,
     ): GitLabResult<GitLabDraftNote> {
         val payload = discussionJson.encodeToString(
             DraftNoteCreateBody.serializer(),
-            DraftNoteCreateBody(note, position),
+            DraftNoteCreateBody(note, position, inReplyToDiscussionId),
         )
         return post(
             "/projects/$projectId/merge_requests/$mrIid/draft_notes",
