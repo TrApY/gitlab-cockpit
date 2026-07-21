@@ -50,6 +50,41 @@ class PipelineModelTest {
     }
 
     @Test
+    fun `groupByStage orders stages by their smallest job id, not by arrival order`() {
+        // Jobs arrive stage-shuffled, but the deploy stage's first job (id 1) was created before the
+        // build stage's (id 2) before the test stage's (id 4): execution order is deploy, build, test.
+        val deploy1 = job("d1", "deploy", "manual") // id 1
+        val build1 = job("b1", "build", "success") // id 2
+        val build2 = job("b2", "build", "success") // id 3
+        val test1 = job("t1", "test", "success") // id 4
+
+        val groups = groupByStage(listOf(build2, test1, deploy1, build1).sortedBy { it.name })
+
+        assertEquals(listOf("deploy", "build", "test"), groups.map { it.name })
+    }
+
+    @Test
+    fun `groupByStage sorts the jobs inside a stage by id ascending`() {
+        val first = job("first", "build", "success") // id 1
+        val second = job("second", "build", "success") // id 2
+        // Fed newest-first; the stage must still list them by id ascending (1 then 2).
+        val groups = groupByStage(listOf(second, first))
+        assertEquals(listOf(1L, 2L), groups.single().jobs.map { it.id })
+        assertEquals(listOf("first", "second"), groups.single().jobs.map { it.name })
+    }
+
+    @Test
+    fun `groupByStage keeps pre first and deploy last regardless of arrival`() {
+        // Created in execution order, so ids grow with the pipeline definition (.pre → build → deploy).
+        val pre = job("prep", ".pre", "success") // id 1
+        val build = job("compile", "build", "success") // id 2
+        val deploy = job("ship", "deploy_to_preprod", "manual") // id 3
+        // GitLab returns them shuffled (deploy, build, pre); execution order is pre, build, deploy.
+        val groups = groupByStage(listOf(deploy, build, pre))
+        assertEquals(listOf(".pre", "build", "deploy_to_preprod"), groups.map { it.name })
+    }
+
+    @Test
     fun `groupByStage sets each group status via aggregateStatus`() {
         val groups = groupByStage(
             listOf(

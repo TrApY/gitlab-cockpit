@@ -16,10 +16,12 @@ import com.intellij.diff.util.Side
 import com.intellij.icons.AllIcons
 import com.intellij.notification.NotificationGroupManager
 import com.intellij.notification.NotificationType
+import com.intellij.openapi.actionSystem.ActionManager
 import com.intellij.openapi.actionSystem.ActionUpdateThread
 import com.intellij.openapi.actionSystem.AnAction
 import com.intellij.openapi.actionSystem.AnActionEvent
 import com.intellij.openapi.actionSystem.CommonDataKeys
+import com.intellij.openapi.actionSystem.DefaultActionGroup
 import com.intellij.openapi.application.EDT
 import com.intellij.openapi.editor.Editor
 import com.intellij.openapi.fileTypes.FileTypeManager
@@ -88,6 +90,7 @@ import java.awt.FlowLayout
 import java.awt.Font
 import java.awt.event.KeyEvent
 import java.awt.event.MouseEvent
+import javax.swing.Icon
 import javax.swing.JButton
 import javax.swing.JComponent
 import javax.swing.JMenuItem
@@ -101,14 +104,19 @@ import javax.swing.tree.DefaultTreeModel
 import javax.swing.tree.TreeSelectionModel
 
 /**
- * The "Changes" tab of the MR detail. A vertical splitter with:
+ * The "Changes" tab of the MR detail. A vertical action toolbar (west edge) plus a horizontal
+ * splitter with:
  *
- * - **top**: a tree of the MR's changed files (grouped by directory), each file iconed by its
- *   [ChangeType] and suffixed with a comment count when it has diff discussions. A double-click on a
- *   file opens its base/head diff in the IDE editor ([DiffManager]) without any checkout — the two
- *   sides are fetched raw at the MR's `diff_refs` base/head SHAs.
- * - **bottom**: the diff discussions of the selected file. A list of threads, an HTML view of the
+ * - **left**: a tree of the MR's changed files (grouped by directory), each file iconed by its
+ *   [ChangeType] and suffixed with a comment count when it has diff discussions, with an
+ *   "N of M files reviewed" counter at its foot. A double-click on a file opens its base/head diff in
+ *   the IDE editor ([DiffManager]) without any checkout — the two sides are fetched raw at the MR's
+ *   `diff_refs` base/head SHAs.
+ * - **right**: the diff discussions of the selected file. A list of threads, an HTML view of the
  *   selected thread's notes, and a single reply box that posts to the selected thread.
+ *
+ * The toolbar reuses the tab's own behavior: refresh the changes, expand / collapse the tree and —
+ * on the selection — open its diff or toggle its reviewed state.
  *
  * Diffs and discussions load lazily the first time the tab is shown for an MR ([onTabSelected]) and
  * are re-fetched after every detail refresh ([setMr]). Every network call runs on the service's
@@ -232,10 +240,13 @@ class ChangesPanel(
             add(JBScrollPane(tree), BorderLayout.CENTER)
             add(reviewedCountLabel, BorderLayout.SOUTH)
         }
-        val splitter = OnePixelSplitter(true, 0.6f).apply {
+        // Horizontal split (GLC-36): file tree on the left, the comments/threads panel on the right;
+        // the proportion is persisted under a dedicated key.
+        val splitter = OnePixelSplitter(false, CHANGES_SPLITTER_KEY, 0.55f).apply {
             firstComponent = treePanel
             secondComponent = buildBottomPanel()
         }
+        add(buildChangesToolbar(), BorderLayout.WEST)
         add(splitter, BorderLayout.CENTER)
 
         tree.addTreeSelectionListener {
@@ -279,6 +290,57 @@ class ChangesPanel(
         replyButton.addActionListener { onReply() }
 
         clear()
+    }
+
+    /**
+     * The Changes tab's vertical action toolbar (GLC-36), pinned to the panel's west edge. Every
+     * action reuses the tab's existing behavior (no duplicated logic): reload the changes, expand /
+     * collapse the file tree, and — on the current tree selection — open its diff or toggle its
+     * reviewed state. The tree is the [ActionToolbar.setTargetComponent], so the actions update
+     * against it.
+     */
+    private fun buildChangesToolbar(): JComponent {
+        val group = DefaultActionGroup().apply {
+            add(changesAction("changes.action.refresh", AllIcons.Actions.Refresh, needsSelection = false) {
+                currentRef?.let { load(it) }
+            })
+            add(changesAction("changes.action.expandAll", AllIcons.Actions.Expandall, needsSelection = false) {
+                TreeUtil.expandAll(tree)
+            })
+            add(changesAction("changes.action.collapseAll", AllIcons.Actions.Collapseall, needsSelection = false) {
+                TreeUtil.collapseAll(tree, 1)
+            })
+            addSeparator()
+            add(changesAction("changes.action.openDiff", AllIcons.Actions.Diff, needsSelection = true) {
+                selectedFile?.let { openDiff(it) }
+            })
+            add(changesAction("changes.action.toggleReviewed", AllIcons.Actions.Checked, needsSelection = true) {
+                toggleReviewedForSelection()
+            })
+        }
+        val toolbar = ActionManager.getInstance().createActionToolbar(CHANGES_TOOLBAR_PLACE, group, false)
+        toolbar.targetComponent = tree
+        return toolbar.component
+    }
+
+    /**
+     * Builds one toolbar [AnAction] from a bundle [key], [icon] and [body]. A [needsSelection] action
+     * is enabled only while a changed file is selected in the tree (Open diff / Toggle reviewed); the
+     * others are enabled whenever an MR is bound.
+     */
+    private fun changesAction(
+        key: String,
+        icon: Icon,
+        needsSelection: Boolean,
+        body: () -> Unit,
+    ): AnAction = object : AnAction(CockpitBundle.message(key), null, icon) {
+        override fun getActionUpdateThread(): ActionUpdateThread = ActionUpdateThread.EDT
+
+        override fun update(e: AnActionEvent) {
+            e.presentation.isEnabled = if (needsSelection) selectedFile != null else currentRef != null
+        }
+
+        override fun actionPerformed(e: AnActionEvent) = body()
     }
 
     private fun buildCommentsPanel(): JComponent {
@@ -1295,6 +1357,12 @@ class ChangesPanel(
     }
 
     companion object {
+        /** Persisted proportion key for the horizontal tree | comments splitter (GLC-36). */
+        private const val CHANGES_SPLITTER_KEY = "dev.jota.gitlabcockpit.changes.splitter.h"
+
+        /** [com.intellij.openapi.actionSystem.ActionPlaces]-style id for the vertical changes toolbar. */
+        private const val CHANGES_TOOLBAR_PLACE = "GitLabCockpitChangesToolbar"
+
         /**
          * Name color for a change type: added/deleted/renamed map to the IDE's VCS [FileStatus] colors
          * (with the plugin palette as a fallback when the active theme leaves one unset); a plain

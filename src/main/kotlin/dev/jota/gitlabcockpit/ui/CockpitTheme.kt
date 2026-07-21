@@ -1,5 +1,6 @@
 package dev.jota.gitlabcockpit.ui
 
+import com.intellij.ui.ColorUtil
 import com.intellij.ui.JBColor
 import com.intellij.util.ui.JBUI
 import com.intellij.util.ui.UIUtil
@@ -66,4 +67,16 @@ object CockpitTheme {
 
     /** Preferred size of the job/stage log viewer dialogs. */
     val LOG_DIALOG_SIZE = JBUI.size(900, 600)
+
+    /**
+     * Background for a timeline "card" — a subtle one-step shift off the panel background so each
+     * event or discussion reads as its own block without needing a divider. A function rather than a
+     * val (like [muted]) because it resolves against the active theme at call time: on a bright theme
+     * the card is a touch darker than the panel, on a dark theme a touch brighter, both via the
+     * platform's [ColorUtil] tone steps (roughly one 5% step off the base).
+     */
+    fun cardBackground(): Color {
+        val base = UIUtil.getPanelBackground()
+        return if (JBColor.isBright()) ColorUtil.darker(base, 1) else ColorUtil.brighter(base, 1)
+    }
 }

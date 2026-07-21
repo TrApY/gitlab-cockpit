@@ -81,9 +81,9 @@ import javax.swing.event.DocumentEvent
 /**
  * The detail pane shown below the MR list. Renders one merge request inside a two-tab layout:
  *
- * - **Overview**: a native "Info"-style header — the title (+ a DRAFT badge), a `source → target`
- *   branch line, a muted `!iid · created … <avatar> by …` meta line (the author's circular avatar
- *   sits in front of the "by …", with a `· merged/closed …` suffix once the MR is), the head
+ * - **Overview**: a native "Info"-style header — a people row of circular avatars (author, assignees,
+ *   reviewers) above the title (+ a DRAFT badge), a `source → target` branch line, a muted
+ *   `!iid · created … · by …` meta line (with a `· merged/closed …` suffix once the MR is), the head
  *   pipeline's status (clickable, jumps to the Pipelines tab), a merge-readiness line ("Ready to
  *   merge" / "Merge blocked: …") with the "Approved by: …" line below it, and an action row of
  *   platform [ActionLink]s (Approve/Revoke, Merge, Open in browser, Watch/Unwatch, Edit
@@ -146,7 +146,7 @@ class MrDetailPanel(
     private val headerContainer = JPanel(BorderLayout()).apply { isOpaque = false }
     private val overviewPanel = JPanel(BorderLayout())
 
-    /** Shared circular-avatar cache; feeds the header author avatar (GLC-34, remate de F3). */
+    /** Shared circular-avatar cache; feeds the header people row (author, assignees, reviewers). */
     private val avatarCache = AvatarCache.getInstance()
 
     private val notesPane = CockpitHtml.createHtmlPane { handleNotesLink(it) }
@@ -364,6 +364,9 @@ class MrDetailPanel(
         header.isOpaque = false
         header.border = CockpitTheme.panelBorder()
 
+        // 0. People row: circular avatars (author, assignees, reviewers) with a name tooltip, no text.
+        header.add(buildAvatarsRow(mr))
+
         // 1. Title + DRAFT badge.
         val titleLine = flowLine()
         titleLine.add(JBLabel(pres.title).apply { font = JBFont.h4() })
@@ -382,8 +385,8 @@ class MrDetailPanel(
         )
         header.add(branchLine)
 
-        // 3. Meta line: !iid · created … <avatar> by … (· merged/closed …).
-        header.add(buildMetaLine(mr, pres))
+        // 3. Meta line: !iid · created … · by … (· merged/closed …) — single muted label.
+        header.add(buildMetaLine(pres))
 
         // 4. Pipeline line (omitted when the MR has no head pipeline).
         buildPipelineLine(pres.pipelineStatus)?.let { header.add(it) }
@@ -399,43 +402,53 @@ class MrDetailPanel(
     }
 
     /**
-     * The muted `!iid · created <relative>` <author avatar> `by <author>` meta line, with a
-     * merged/closed suffix. Split into two labels around the author avatar (GLC-34, remate de F3) so
-     * the 16px circular avatar sits directly in front of the "by <author>" segment.
+     * The people row (GLC-36): circular [HEADER_AVATAR_SIZE]px avatars for the author, then the
+     * assignees, then the reviewers — in that order, with only a name tooltip and no text. Sits above
+     * the title so the MR's participants read at a glance; the meta line no longer carries an avatar.
      */
-    private fun buildMetaLine(mr: GitLabMergeRequest, pres: MrHeaderPresentation): JComponent {
-        val line = flowLine()
+    private fun buildAvatarsRow(mr: GitLabMergeRequest): JComponent {
+        val row = JPanel(FlowLayout(FlowLayout.LEFT, JBUI.scale(AVATAR_ROW_GAP), 0)).apply { isOpaque = false }
+        val people = buildList {
+            add(mr.author)
+            addAll(mr.assignees)
+            addAll(mr.reviewers)
+        }
+        for (user in people) row.add(headerAvatarLabel(user))
+        return row
+    }
 
-        val leadParts = buildList {
+    /**
+     * A [HEADER_AVATAR_SIZE]px circular avatar for [user] with the display name as its tooltip. Shows
+     * [AvatarCache]'s placeholder immediately and swaps in the real image (repainting the header) once
+     * the background load lands.
+     */
+    private fun headerAvatarLabel(user: GitLabUser): JBLabel {
+        val label = JBLabel().apply { toolTipText = displayName(user) }
+        label.icon = avatarCache.icon(user, HEADER_AVATAR_SIZE) {
+            label.icon = avatarCache.icon(user, HEADER_AVATAR_SIZE) {}
+            headerContainer.repaint()
+        }
+        return label
+    }
+
+    /**
+     * The muted `!iid · created <relative> · by <author>` meta line, with a `· merged/closed
+     * <relative>` suffix once the MR is (GLC-36: back to a single label — the author avatar moved to
+     * the people row above the title).
+     */
+    private fun buildMetaLine(pres: MrHeaderPresentation): JComponent {
+        val line = flowLine()
+        val parts = buildList {
             add(pres.reference)
             pres.createdRelative?.let { add(CockpitBundle.message("detail.meta.created", it)) }
-        }
-        line.add(JBLabel(leadParts.joinToString(DATE_SEPARATOR)).apply { foreground = CockpitTheme.muted() })
-
-        line.add(authorAvatarLabel(mr.author))
-
-        val trailParts = buildList {
             add(CockpitBundle.message("detail.meta.by", pres.authorName))
             pres.closingRelative?.let { relative ->
                 val key = if (pres.closing == Closing.MERGED) "detail.meta.merged" else "detail.meta.closed"
                 add(CockpitBundle.message(key, relative))
             }
         }
-        line.add(JBLabel(trailParts.joinToString(DATE_SEPARATOR)).apply { foreground = CockpitTheme.muted() })
+        line.add(JBLabel(parts.joinToString(DATE_SEPARATOR)).apply { foreground = CockpitTheme.muted() })
         return line
-    }
-
-    /**
-     * A 16px circular author avatar for the header meta line. It shows [AvatarCache]'s placeholder
-     * immediately and swaps in the real image (repainting the header) once the background load lands.
-     */
-    private fun authorAvatarLabel(user: GitLabUser): JBLabel {
-        val label = JBLabel()
-        label.icon = avatarCache.icon(user, AVATAR_SIZE) {
-            label.icon = avatarCache.icon(user, AVATAR_SIZE) {}
-            headerContainer.repaint()
-        }
-        return label
     }
 
     /**
@@ -820,13 +833,14 @@ class MrDetailPanel(
             return
         }
         val metaColor = ColorUtil.toHtmlColor(UIUtil.getContextHelpForeground())
+        val cardColor = ColorUtil.toHtmlColor(CockpitTheme.cardBackground())
         val body = buildString {
             items.forEachIndexed { index, item ->
+                if (index > 0) append(CARD_SPACER)
                 when (item) {
-                    is TimelineItem.EventItem -> appendEvent(item.note, metaColor)
-                    is TimelineItem.DiscussionItem -> appendThread(item.thread, metaColor)
+                    is TimelineItem.EventItem -> appendEvent(item.note, metaColor, cardColor)
+                    is TimelineItem.DiscussionItem -> appendThread(item.thread, metaColor, cardColor)
                 }
-                if (index < items.lastIndex) append("<hr>")
             }
         }
         val ref = currentRef
@@ -843,17 +857,19 @@ class MrDetailPanel(
     }
 
     /**
-     * Appends one system note as a compact single-line event block: its type icon (mapped from
-     * [eventIconKey] to an [com.intellij.icons.AllIcons] path rendered through the platform HTML
-     * `<icon>` tag), the author and the inlined note body on the left, and the muted relative date
-     * right-aligned via a full-width two-cell table. System notes carry no Reply link.
+     * Appends one system note as a "card" (GLC-36): a padded, subtly shaded [cardColor] table whose
+     * single row carries — on the left — the event's type icon (mapped from [eventIconKey] to an
+     * [com.intellij.icons.AllIcons] path rendered through the platform HTML `<icon>` tag), the author
+     * in bold and the inlined note body, and — on the right, muted — the relative date. System notes
+     * carry no Reply link.
      */
-    private fun StringBuilder.appendEvent(note: GitLabNote, metaColor: String) {
-        append("<table width=\"100%\" cellpadding=\"0\" cellspacing=\"0\"><tr><td>")
+    private fun StringBuilder.appendEvent(note: GitLabNote, metaColor: String, cardColor: String) {
+        append("<table width=\"100%\" cellpadding=\"8\" cellspacing=\"0\" bgcolor=\"").append(cardColor).append("\">")
+        append("<tr><td>")
         append("<icon src=\"").append(eventIconSrc(eventIconKey(note.body))).append("\">&nbsp;")
-        append(CockpitHtml.escapeHtml(displayName(note.author))).append(' ')
+        append("<b>").append(CockpitHtml.escapeHtml(displayName(note.author))).append("</b> ")
         append(inlineMarkdown(note.body))
-        append("</td><td align=\"right\"><span style=\"color:").append(metaColor).append(";\">")
+        append("</td><td align=\"right\" valign=\"top\"><span style=\"color:").append(metaColor).append(";\">")
         append(CockpitHtml.escapeHtml(formatRelative(note.createdAt)))
         append("</span></td></tr></table>")
     }
@@ -872,14 +888,18 @@ class MrDetailPanel(
         }
     }
 
-    /** Appends one thread's HTML: root note, indented replies, resolved/anchor tags and Reply link. */
-    private fun StringBuilder.appendThread(thread: CommentThread, metaColor: String) {
+    /**
+     * Appends one discussion thread as a "card" (GLC-36): a padded, subtly shaded [cardColor] table.
+     * The top row carries the root author in bold plus the resolved/anchor tags on the left and the
+     * muted relative date on the right; the body row below (same card) holds the root note's markdown,
+     * the indented replies and the `Reply` link.
+     */
+    private fun StringBuilder.appendThread(thread: CommentThread, metaColor: String, cardColor: String) {
         val notes = thread.notes
         val first = notes.first()
-        append("<div style=\"color:").append(metaColor).append(";\">")
-        append(CockpitHtml.escapeHtml(displayName(first.author)))
-        append(" &middot; ")
-        append(CockpitHtml.escapeHtml(formatRelative(first.createdAt)))
+        append("<table width=\"100%\" cellpadding=\"8\" cellspacing=\"0\" bgcolor=\"").append(cardColor).append("\">")
+        // Top row: author (bold) + resolved/anchor tags | relative date (right, muted).
+        append("<tr><td><b>").append(CockpitHtml.escapeHtml(displayName(first.author))).append("</b>")
         if (thread.resolved) {
             append("&nbsp;&nbsp;[")
                 .append(CockpitHtml.escapeHtml(CockpitBundle.message("detail.comment.thread.resolved")))
@@ -889,7 +909,11 @@ class MrDetailPanel(
             append("&nbsp;&nbsp;[<a href=\"").append(GOTO_LINK_PREFIX).append(thread.discussionId).append("\">")
                 .append(CockpitHtml.escapeHtml(anchor)).append("</a>]")
         }
-        append("</div>")
+        append("</td><td align=\"right\" valign=\"top\"><span style=\"color:").append(metaColor).append(";\">")
+        append(CockpitHtml.escapeHtml(formatRelative(first.createdAt)))
+        append("</span></td></tr>")
+        // Body row (same card): root markdown, indented replies, Reply link.
+        append("<tr><td colspan=\"2\">")
         append(CockpitHtml.stripBody(MarkdownRenderer.toHtml(first.body)))
         if (notes.size > 1) {
             append("<blockquote>")
@@ -906,6 +930,7 @@ class MrDetailPanel(
         append("<p><a href=\"").append(REPLY_LINK_PREFIX).append(thread.discussionId).append("\">")
         append(CockpitHtml.escapeHtml(CockpitBundle.message("detail.comment.thread.reply")))
         append("</a></p>")
+        append("</td></tr></table>")
     }
 
     /**
@@ -992,9 +1017,13 @@ class MrDetailPanel(
         repaint()
     }
 
-    /** Sets the timeline tab's title with the human-note count (null → the plain tab title). */
+    /**
+     * Sets the timeline tab's title with the human-note count. A null (loading/error) or zero count
+     * shows the plain "Events & Discussions" title — the `(0)` suffix is suppressed so an MR with no
+     * comments does not read as "zero".
+     */
     private fun setTimelineTabTitle(count: Int?) {
-        val title = if (count == null) {
+        val title = if (count == null || count == 0) {
             CockpitBundle.message("detail.tab.timeline")
         } else {
             CockpitBundle.message("detail.tab.timelineCount", count)
@@ -1320,8 +1349,11 @@ class MrDetailPanel(
         private const val PIPELINES_TAB_INDEX = 2
         private const val CHANGES_TAB_INDEX = 3
 
-        /** Diameter (px) of the header author avatar. */
-        private const val AVATAR_SIZE = 16
+        /** Diameter (px) of the header people-row avatars. */
+        private const val HEADER_AVATAR_SIZE = 18
+
+        /** Gap (unscaled px) between adjacent avatars in the header people row. */
+        private const val AVATAR_ROW_GAP = 4
 
         /** Separator between the Overview date parts (a spaced middle dot U+00B7). */
         private const val DATE_SEPARATOR = " · "
@@ -1346,6 +1378,12 @@ class MrDetailPanel(
             "state" -> "AllIcons.General.Note"
             else -> "AllIcons.General.Note"
         }
+
+        /**
+         * Vertical gap rendered between two timeline cards (GLC-36). A short small-font line renders
+         * reliably in Swing's HTMLEditorKit where CSS margins between tables do not.
+         */
+        private const val CARD_SPACER = "<div style=\"font-size:8px\">&nbsp;</div>"
 
         /** Href scheme of a thread's Reply link; the discussion id follows the prefix. */
         private const val REPLY_LINK_PREFIX = "cockpit:reply:"

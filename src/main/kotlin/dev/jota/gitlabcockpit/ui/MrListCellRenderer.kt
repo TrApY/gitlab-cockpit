@@ -7,7 +7,6 @@ import com.intellij.ui.SimpleTextAttributes
 import com.intellij.util.ui.JBUI
 import dev.jota.gitlabcockpit.CockpitBundle
 import dev.jota.gitlabcockpit.api.GitLabMergeRequest
-import dev.jota.gitlabcockpit.api.GitLabUser
 import dev.jota.gitlabcockpit.core.MrSegmentStyle
 import dev.jota.gitlabcockpit.core.mrRowPresentation
 import java.awt.BorderLayout
@@ -69,18 +68,32 @@ class MrListCellRenderer(
 
     private val commentsLabel = JLabel().apply { iconTextGap = JBUI.scale(2) }
 
-    /** Overlapping avatar stack (negative gap): author first (painted on top), then up to 2 reviewers. */
-    private val avatarsPanel = JPanel(FlowLayout(FlowLayout.LEFT, JBUI.scale(AVATAR_OVERLAP), 0)).apply {
+    /** The author's circular avatar: its own fixed element, one [RIGHT_GAP] gap from the comments badge. */
+    private val authorLabel = JLabel()
+
+    /**
+     * Up to [MAX_REVIEWER_AVATARS] reviewer avatars, laid out left-to-right with a small *positive*
+     * gap ([AVATAR_GAP]) — no negative overlap, so no avatar paints on top of another.
+     */
+    private val reviewersPanel = JPanel(FlowLayout(FlowLayout.LEFT, JBUI.scale(AVATAR_GAP), 0)).apply {
         isOpaque = false
     }
 
     private val overflowLabel = JLabel()
 
-    private val rightColumn = JPanel(FlowLayout(FlowLayout.RIGHT, JBUI.scale(6), 0)).apply {
+    /**
+     * The right column: one horizontal row of fixed-size elements, each separated by a [RIGHT_GAP]
+     * gap — `[pipeline icon] [comments badge] [author avatar] [reviewer avatars] [+N]`. [FlowLayout]
+     * honors every child's `preferredSize` (nothing is compressed) and centers them vertically in the
+     * [ROW_HEIGHT] row; the column reports its own preferred width, so the center text column is the
+     * one that gives way and truncates (ellipsis) when the row is narrow.
+     */
+    private val rightColumn = JPanel(FlowLayout(FlowLayout.RIGHT, JBUI.scale(RIGHT_GAP), 0)).apply {
         isOpaque = false
         add(statusLabel)
         add(commentsLabel)
-        add(avatarsPanel)
+        add(authorLabel)
+        add(reviewersPanel)
         add(overflowLabel)
     }
 
@@ -145,11 +158,13 @@ class MrListCellRenderer(
             commentsLabel.isVisible = false
         }
 
-        avatarsPanel.removeAll()
-        val avatarUsers: List<GitLabUser> = listOf(value.author) + value.reviewers.take(MAX_REVIEWER_AVATARS)
-        for (user in avatarUsers) {
-            avatarsPanel.add(JLabel(avatarCache.icon(user, AVATAR_SIZE) { repaintList() }))
+        authorLabel.icon = avatarCache.icon(value.author, AVATAR_SIZE) { repaintList() }
+
+        reviewersPanel.removeAll()
+        for (reviewer in value.reviewers.take(MAX_REVIEWER_AVATARS)) {
+            reviewersPanel.add(JLabel(avatarCache.icon(reviewer, AVATAR_SIZE) { repaintList() }))
         }
+        reviewersPanel.isVisible = value.reviewers.isNotEmpty()
 
         if (presentation.reviewerOverflow > 0) {
             overflowLabel.text = "+${presentation.reviewerOverflow}"
@@ -175,8 +190,11 @@ class MrListCellRenderer(
         /** Avatar diameter in unscaled px. */
         private const val AVATAR_SIZE = 16
 
-        /** Horizontal gap between stacked avatars (negative → overlap). */
-        private const val AVATAR_OVERLAP = -4
+        /** Gap (unscaled px) between the right column's elements. */
+        private const val RIGHT_GAP = 6
+
+        /** Gap (unscaled px) between adjacent reviewer avatars — positive, so they never overlap. */
+        private const val AVATAR_GAP = 2
 
         /** How many reviewers are shown as avatars before the `+N` badge takes over. */
         private const val MAX_REVIEWER_AVATARS = 2

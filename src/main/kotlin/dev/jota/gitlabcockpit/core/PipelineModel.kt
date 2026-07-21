@@ -14,16 +14,27 @@ data class StageGroup(
 )
 
 /**
- * Groups [jobs] into stages, preserving the order in which each stage first appears in the list
- * (GitLab already returns jobs stage-ordered). Each group's status is aggregated with
- * [aggregateStatus].
+ * Groups [jobs] into stages ordered by pipeline *execution* order (`.pre` → build → … → deploy),
+ * not by the order GitLab happens to return them in. A stage's position is its smallest
+ * [GitLabJob.id]: job ids grow with creation, which follows the pipeline's stage definition order, so
+ * the stage whose first job was created earliest runs earliest. The jobs inside each stage are sorted
+ * by [GitLabJob.id] ascending for the same reason, and each group's status is aggregated (from those
+ * jobs) with [aggregateStatus].
+ *
+ * Both the sort of the stages and the sort within a stage are stable, so stages that (impossibly)
+ * tied on their smallest id would keep their first-appearance order.
  */
 fun groupByStage(jobs: List<GitLabJob>): List<StageGroup> {
     val byStage = LinkedHashMap<String, MutableList<GitLabJob>>()
     for (job in jobs) {
         byStage.getOrPut(job.stage) { mutableListOf() }.add(job)
     }
-    return byStage.map { (name, stageJobs) -> StageGroup(name, stageJobs, aggregateStatus(stageJobs)) }
+    return byStage
+        .map { (name, stageJobs) ->
+            val ordered = stageJobs.sortedBy { it.id }
+            StageGroup(name, ordered, aggregateStatus(ordered))
+        }
+        .sortedBy { group -> group.jobs.minOf { it.id } }
 }
 
 /**
