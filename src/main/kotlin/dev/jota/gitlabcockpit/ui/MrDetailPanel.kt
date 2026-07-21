@@ -4,6 +4,7 @@ import com.intellij.ide.BrowserUtil
 import com.intellij.icons.AllIcons
 import com.intellij.openapi.application.EDT
 import com.intellij.openapi.project.Project
+import com.intellij.openapi.ui.ComboBox
 import com.intellij.openapi.ui.DialogWrapper
 import com.intellij.openapi.ui.Messages
 import com.intellij.ui.CheckBoxList
@@ -30,6 +31,7 @@ import com.intellij.util.ui.UIUtil
 import dev.jota.gitlabcockpit.CockpitBundle
 import dev.jota.gitlabcockpit.api.GitLabApprovals
 import dev.jota.gitlabcockpit.api.GitLabMergeRequest
+import dev.jota.gitlabcockpit.api.GitLabNote
 import dev.jota.gitlabcockpit.api.GitLabResult
 import dev.jota.gitlabcockpit.api.GitLabUser
 import dev.jota.gitlabcockpit.api.MergeRequestUpdate
@@ -43,8 +45,12 @@ import dev.jota.gitlabcockpit.core.MergeLineState
 import dev.jota.gitlabcockpit.core.MrHeaderPresentation
 import dev.jota.gitlabcockpit.core.MrRef
 import dev.jota.gitlabcockpit.core.ReviewerSelectionModel
+import dev.jota.gitlabcockpit.core.TimelineFilter
+import dev.jota.gitlabcockpit.core.TimelineItem
 import dev.jota.gitlabcockpit.core.approvalsHealth
+import dev.jota.gitlabcockpit.core.buildTimeline
 import dev.jota.gitlabcockpit.core.commentThreads
+import dev.jota.gitlabcockpit.core.eventIconKey
 import dev.jota.gitlabcockpit.core.filterMembers
 import dev.jota.gitlabcockpit.core.mergeButtonState
 import dev.jota.gitlabcockpit.core.mrHeaderPresentation
@@ -75,17 +81,20 @@ import javax.swing.event.DocumentEvent
  * The detail pane shown below the MR list. Renders one merge request inside a two-tab layout:
  *
  * - **Overview**: a native "Info"-style header — the title (+ a DRAFT badge), a `source → target`
- *   branch line, a muted `!iid · created … by …` meta line (with a `· merged/closed …` suffix once
- *   the MR is), the head pipeline's status (clickable, jumps to the Pipelines tab), a
- *   merge-readiness line ("Ready to merge" / "Merge blocked: …") with the "Approved by: …" line
- *   below it, and an action row of platform [ActionLink]s (Approve/Revoke, Merge, Open in browser,
- *   Watch/Unwatch, Edit reviewers/assignee) plus the edit-title/description button — followed by the
- *   markdown description.
- * - **Comments**: the MR's discussion threads (system notes filtered out) rendered as themed HTML —
- *   each thread's first note at root level, replies indented, with "Resolved" and diff-anchor tags —
- *   plus a text area whose button posts a new general comment or, in reply mode (entered from a
- *   thread's Reply link), a reply to that thread. Threads load lazily the first time the tab is shown
- *   for each MR and again on every detail refresh; the tab title carries the total note count.
+ *   branch line, a muted `!iid · created … <avatar> by …` meta line (the author's circular avatar
+ *   sits in front of the "by …", with a `· merged/closed …` suffix once the MR is), the head
+ *   pipeline's status (clickable, jumps to the Pipelines tab), a merge-readiness line ("Ready to
+ *   merge" / "Merge blocked: …") with the "Approved by: …" line below it, and an action row of
+ *   platform [ActionLink]s (Approve/Revoke, Merge, Open in browser, Watch/Unwatch, Edit
+ *   reviewers/assignee) plus the edit-title/description button — followed by the markdown description.
+ * - **Events & Discussions**: a chronological timeline (GLC-34) merging the MR's GitLab system notes
+ *   ("added N commits", "approved this merge request", …) — rendered as compact one-line event blocks
+ *   with a type icon — and its user discussion threads (each thread's first note at root level,
+ *   replies indented, with "Resolved" and diff-anchor tags and a `Reply` link). A toolbar filters
+ *   the timeline (All / Events / Discussions) and toggles the sort order (session-only, not
+ *   persisted); a text area's button posts a new general comment or, in reply mode (entered from a
+ *   thread's Reply link), a reply to that thread. The timeline loads lazily the first time the tab is
+ *   shown for each MR and again on every detail refresh; the tab title carries the human-note count.
  *
  * Editing is done through modal dialogs; every network call (detail load, member load, update,
  * approvals, notes, approve/unapprove, comment) runs on the service's coroutine scope and only
@@ -132,6 +141,9 @@ class MrDetailPanel(
     private val headerContainer = JPanel(BorderLayout()).apply { isOpaque = false }
     private val overviewPanel = JPanel(BorderLayout())
 
+    /** Shared circular-avatar cache; feeds the header author avatar (GLC-34, remate de F3). */
+    private val avatarCache = AvatarCache.getInstance()
+
     private val notesPane = CockpitHtml.createHtmlPane { handleNotesLink(it) }
     private val notesScroll = JBScrollPane(notesPane)
     private val commentArea = JBTextArea(3, 0).apply {
@@ -141,8 +153,40 @@ class MrDetailPanel(
     }
     private val commentButton = JButton(CockpitBundle.message("detail.comment.button"))
 
-    /** The threads currently rendered in the Comments tab; used to resolve a Reply link to its author. */
+    /** The threads currently rendered in the timeline; used to resolve a Reply link to its author. */
     private var loadedThreads: List<CommentThread> = emptyList()
+
+    /** All notes of the MR incl. GitLab system ones — the timeline's event source; reloaded with threads. */
+    private var loadedTimelineNotes: List<GitLabNote> = emptyList()
+
+    /** Session-only timeline filter (All / Events / Discussions); not persisted across restarts. */
+    private var timelineFilter: TimelineFilter = TimelineFilter.ALL
+
+    /** Session-only sort direction; true = oldest first (the GitLab web default). */
+    private var timelineAscending: Boolean = true
+
+    /** Toolbar filter combo (All / Events / Discussions); re-renders the loaded timeline on change. */
+    private val timelineFilterCombo = ComboBox(TimelineFilter.entries.toTypedArray()).apply {
+        renderer = textCellRenderer<TimelineFilter>("") { timelineFilterLabel(it) }
+        selectedItem = TimelineFilter.ALL
+        toolTipText = CockpitBundle.message("detail.timeline.filter.tooltip")
+        addActionListener {
+            val choice = selectedItem as? TimelineFilter ?: return@addActionListener
+            if (choice == timelineFilter) return@addActionListener
+            timelineFilter = choice
+            renderTimeline(loadedThreads)
+        }
+    }
+
+    /** Toolbar sort toggle; flips [timelineAscending] and re-renders the loaded timeline. */
+    private val timelineOrderButton = JButton(AllIcons.General.ArrowDown).apply {
+        toolTipText = CockpitBundle.message("detail.timeline.order.oldest")
+        addActionListener {
+            timelineAscending = !timelineAscending
+            refreshOrderButton()
+            renderTimeline(loadedThreads)
+        }
+    }
 
     /** The discussion id being replied to, or null in the general-comment mode. */
     private var replyingToDiscussionId: String? = null
@@ -181,17 +225,20 @@ class MrDetailPanel(
         overviewPanel.add(headerContainer, BorderLayout.NORTH)
         overviewPanel.add(descriptionScroll, BorderLayout.CENTER)
 
-        commentsPanel.add(draftBanner, BorderLayout.NORTH)
+        val commentsNorth = JPanel(BorderLayout()).apply { isOpaque = false }
+        commentsNorth.add(buildTimelineToolbar(), BorderLayout.NORTH)
+        commentsNorth.add(draftBanner, BorderLayout.SOUTH)
+        commentsPanel.add(commentsNorth, BorderLayout.NORTH)
         commentsPanel.add(notesScroll, BorderLayout.CENTER)
         commentsPanel.add(buildCommentInput(), BorderLayout.SOUTH)
 
         tabbedPane.addTab(CockpitBundle.message("detail.tab.overview"), overviewPanel)
-        tabbedPane.addTab(CockpitBundle.message("detail.tab.comments"), commentsPanel)
+        tabbedPane.addTab(CockpitBundle.message("detail.tab.timeline"), commentsPanel)
         tabbedPane.addTab(CockpitBundle.message("pipelines.tab"), pipelinesPanel)
         tabbedPane.addTab(CockpitBundle.message("changes.tab"), changesPanel)
         tabbedPane.addChangeListener {
             when (tabbedPane.selectedIndex) {
-                COMMENTS_TAB_INDEX -> {
+                TIMELINE_TAB_INDEX -> {
                     val ref = currentRef
                     if (ref != null && notesLoadedForRef != ref) loadNotes(ref)
                 }
@@ -251,10 +298,11 @@ class MrDetailPanel(
         notesEpoch++
         notesLoadedForRef = null
         loadedThreads = emptyList()
+        loadedTimelineNotes = emptyList()
         exitReplyMode()
         notesPane.text = CockpitHtml.wrapHtml("")
         draftBanner.isVisible = false
-        setCommentsTabTitle(null)
+        setTimelineTabTitle(null)
 
         // Rebind the Pipelines tab; it reloads lazily when shown (or now, if already selected).
         pipelinesPanel.setMr(ref, mr.sourceBranch, mr.headPipeline)
@@ -270,7 +318,7 @@ class MrDetailPanel(
         repaint()
 
         loadApprovals(ref)
-        if (tabbedPane.selectedIndex == COMMENTS_TAB_INDEX) loadNotes(ref)
+        if (tabbedPane.selectedIndex == TIMELINE_TAB_INDEX) loadNotes(ref)
         if (tabbedPane.selectedIndex == PIPELINES_TAB_INDEX) pipelinesPanel.onTabSelected()
         if (tabbedPane.selectedIndex == CHANGES_TAB_INDEX) changesPanel.onTabSelected()
     }
@@ -323,8 +371,8 @@ class MrDetailPanel(
         )
         header.add(branchLine)
 
-        // 3. Meta line: !iid · created … by … (· merged/closed …).
-        header.add(buildMetaLine(pres))
+        // 3. Meta line: !iid · created … <avatar> by … (· merged/closed …).
+        header.add(buildMetaLine(mr, pres))
 
         // 4. Pipeline line (omitted when the MR has no head pipeline).
         buildPipelineLine(pres.pipelineStatus)?.let { header.add(it) }
@@ -339,24 +387,44 @@ class MrDetailPanel(
         return header
     }
 
-    /** The muted `!iid · created <relative> by <author>` meta line, with a merged/closed suffix. */
-    private fun buildMetaLine(pres: MrHeaderPresentation): JComponent {
-        val who = if (pres.createdRelative != null) {
-            CockpitBundle.message("detail.meta.createdBy", pres.createdRelative, pres.authorName)
-        } else {
-            CockpitBundle.message("detail.meta.by", pres.authorName)
-        }
-        val parts = buildList {
+    /**
+     * The muted `!iid · created <relative>` <author avatar> `by <author>` meta line, with a
+     * merged/closed suffix. Split into two labels around the author avatar (GLC-34, remate de F3) so
+     * the 16px circular avatar sits directly in front of the "by <author>" segment.
+     */
+    private fun buildMetaLine(mr: GitLabMergeRequest, pres: MrHeaderPresentation): JComponent {
+        val line = flowLine()
+
+        val leadParts = buildList {
             add(pres.reference)
-            add(who)
+            pres.createdRelative?.let { add(CockpitBundle.message("detail.meta.created", it)) }
+        }
+        line.add(JBLabel(leadParts.joinToString(DATE_SEPARATOR)).apply { foreground = CockpitTheme.muted() })
+
+        line.add(authorAvatarLabel(mr.author))
+
+        val trailParts = buildList {
+            add(CockpitBundle.message("detail.meta.by", pres.authorName))
             pres.closingRelative?.let { relative ->
                 val key = if (pres.closing == Closing.MERGED) "detail.meta.merged" else "detail.meta.closed"
                 add(CockpitBundle.message(key, relative))
             }
         }
-        val line = flowLine()
-        line.add(JBLabel(parts.joinToString(DATE_SEPARATOR)).apply { foreground = CockpitTheme.muted() })
+        line.add(JBLabel(trailParts.joinToString(DATE_SEPARATOR)).apply { foreground = CockpitTheme.muted() })
         return line
+    }
+
+    /**
+     * A 16px circular author avatar for the header meta line. It shows [AvatarCache]'s placeholder
+     * immediately and swaps in the real image (repainting the header) once the background load lands.
+     */
+    private fun authorAvatarLabel(user: GitLabUser): JBLabel {
+        val label = JBLabel()
+        label.icon = avatarCache.icon(user, AVATAR_SIZE) {
+            label.icon = avatarCache.icon(user, AVATAR_SIZE) {}
+            headerContainer.repaint()
+        }
+        return label
     }
 
     /**
@@ -635,9 +703,10 @@ class MrDetailPanel(
     }
 
     /**
-     * Fetches the MR's notes in the background and renders them (guarded by [currentRef]). The pending
-     * draft count is loaded in the same cycle (in parallel, non-blocking and non-fatal) to drive the
-     * "pending draft notes" banner.
+     * Fetches the MR's discussions and its raw notes (system notes included) in the background and
+     * renders them as the timeline (guarded by [currentRef]). The pending draft count is loaded in the
+     * same cycle (all three in parallel); a failed notes/drafts fetch is non-fatal — the timeline then
+     * simply carries no events / no draft banner, while a failed discussions fetch shows the error.
      */
     private fun loadNotes(ref: MrRef) {
         notesLoadedForRef = ref
@@ -645,22 +714,27 @@ class MrDetailPanel(
         notesPane.text = CockpitHtml.wrapHtml(
             "<p><i>" + CockpitHtml.escapeHtml(CockpitBundle.message("detail.comment.loading")) + "</i></p>",
         )
-        setCommentsTabTitle(null)
+        setTimelineTabTitle(null)
         notesJob?.cancel()
         notesJob = service.coroutineScope.launch {
-            val (discussionsResult, draftsResult) = coroutineScope {
+            val (discussionsResult, notesResult, draftsResult) = coroutineScope {
                 val discussions = async { service.getMrDiscussions(ref) }
+                val notes = async { service.getTimelineNotes(ref) }
                 val drafts = async { service.getDraftNotes(ref) }
-                discussions.await() to drafts.await()
+                Triple(discussions.await(), notes.await(), drafts.await())
             }
             withContext(Dispatchers.EDT) {
                 if (currentRef != ref) return@withContext
                 renderDraftBanner((draftsResult as? GitLabResult.Success)?.data?.size ?: 0)
                 when (discussionsResult) {
-                    is GitLabResult.Success -> renderThreads(commentThreads(discussionsResult.data))
+                    is GitLabResult.Success -> {
+                        loadedTimelineNotes = (notesResult as? GitLabResult.Success)?.data ?: emptyList()
+                        renderTimeline(commentThreads(discussionsResult.data))
+                    }
                     else -> {
                         notesLoadedForRef = null
                         loadedThreads = emptyList()
+                        loadedTimelineNotes = emptyList()
                         notesPane.text = CockpitHtml.wrapHtml(
                             "<p><i>" +
                                 CockpitHtml.escapeHtml(
@@ -668,11 +742,28 @@ class MrDetailPanel(
                                 ) +
                                 "</i></p>",
                         )
-                        setCommentsTabTitle(null)
+                        setTimelineTabTitle(null)
                     }
                 }
             }
         }
+    }
+
+    /** The timeline toolbar: a "Show" filter combo (All / Events / Discussions) and the sort toggle. */
+    private fun buildTimelineToolbar(): JComponent {
+        val toolbar = JPanel(FlowLayout(FlowLayout.LEFT, JBUI.scale(6), JBUI.scale(2))).apply { isOpaque = false }
+        toolbar.add(JBLabel(CockpitBundle.message("detail.timeline.filter.tooltip")))
+        toolbar.add(timelineFilterCombo)
+        toolbar.add(timelineOrderButton)
+        return toolbar
+    }
+
+    /** Syncs the sort toggle's icon and tooltip with the current [timelineAscending] direction. */
+    private fun refreshOrderButton() {
+        timelineOrderButton.icon = if (timelineAscending) AllIcons.General.ArrowDown else AllIcons.General.ArrowUp
+        timelineOrderButton.toolTipText = CockpitBundle.message(
+            if (timelineAscending) "detail.timeline.order.oldest" else "detail.timeline.order.newest",
+        )
     }
 
     /** EDT. Shows or hides the pending-drafts banner based on [count]. */
@@ -694,31 +785,37 @@ class MrDetailPanel(
         draftBanner.isVisible = false
         val ref = currentRef ?: return
         notesLoadedForRef = null
-        if (tabbedPane.selectedIndex == COMMENTS_TAB_INDEX) loadNotes(ref)
+        if (tabbedPane.selectedIndex == TIMELINE_TAB_INDEX) loadNotes(ref)
     }
 
     /**
-     * EDT. Renders the MR's discussion [threads] as one themed HTML document and updates the tab
-     * counter (total number of notes across every thread). Each thread shows its first note at root
-     * level and its replies indented; the thread's meta line carries a "Resolved" tag when resolved
-     * and a `file:line` tag when diff-anchored, and every thread ends with a `Reply` link.
+     * EDT. Renders the timeline for the given user [threads] and the already-loaded
+     * [loadedTimelineNotes] (its event source) as one themed HTML document, honoring the current
+     * [timelineFilter] and [timelineAscending] toggle, and updates the tab counter (total number of
+     * human notes across every thread). System notes render as compact event lines (no Reply); each
+     * discussion thread renders exactly as before (root note, indented replies, resolved/anchor tags
+     * and its `Reply` link).
      */
-    private fun renderThreads(threads: List<CommentThread>) {
+    private fun renderTimeline(threads: List<CommentThread>) {
         loadedThreads = threads
         val noteCount = threads.sumOf { it.notes.size }
-        if (threads.isEmpty()) {
+        val items = buildTimeline(loadedTimelineNotes, threads, timelineFilter, timelineAscending)
+        if (items.isEmpty()) {
             notesPane.text = CockpitHtml.wrapHtml(
                 "<p><i>" + CockpitHtml.escapeHtml(CockpitBundle.message("detail.comment.empty")) + "</i></p>",
             )
             notesPane.caretPosition = 0
-            setCommentsTabTitle(noteCount)
+            setTimelineTabTitle(noteCount)
             return
         }
         val metaColor = ColorUtil.toHtmlColor(UIUtil.getContextHelpForeground())
         val body = buildString {
-            threads.forEachIndexed { index, thread ->
-                appendThread(thread, metaColor)
-                if (index < threads.lastIndex) append("<hr>")
+            items.forEachIndexed { index, item ->
+                when (item) {
+                    is TimelineItem.EventItem -> appendEvent(item.note, metaColor)
+                    is TimelineItem.DiscussionItem -> appendThread(item.thread, metaColor)
+                }
+                if (index < items.lastIndex) append("<hr>")
             }
         }
         val ref = currentRef
@@ -731,7 +828,37 @@ class MrDetailPanel(
             projectWebUrl = currentMr?.let(::projectWebUrlOf),
             isCurrent = { currentRef == ref && notesEpoch == epoch },
         )
-        setCommentsTabTitle(noteCount)
+        setTimelineTabTitle(noteCount)
+    }
+
+    /**
+     * Appends one system note as a compact single-line event block: its type icon (mapped from
+     * [eventIconKey] to an [com.intellij.icons.AllIcons] path rendered through the platform HTML
+     * `<icon>` tag), the author and the inlined note body on the left, and the muted relative date
+     * right-aligned via a full-width two-cell table. System notes carry no Reply link.
+     */
+    private fun StringBuilder.appendEvent(note: GitLabNote, metaColor: String) {
+        append("<table width=\"100%\" cellpadding=\"0\" cellspacing=\"0\"><tr><td>")
+        append("<icon src=\"").append(eventIconSrc(eventIconKey(note.body))).append("\">&nbsp;")
+        append(CockpitHtml.escapeHtml(displayName(note.author))).append(' ')
+        append(inlineMarkdown(note.body))
+        append("</td><td align=\"right\"><span style=\"color:").append(metaColor).append(";\">")
+        append(CockpitHtml.escapeHtml(formatRelative(note.createdAt)))
+        append("</span></td></tr></table>")
+    }
+
+    /**
+     * Renders a system note [body] as inline HTML: a single-paragraph markdown result is unwrapped
+     * from its `<p>…</p>` so the event stays on one line; multi-paragraph bodies (rare) keep their
+     * block markup. Preserves the markdown's links and emphasis (commit links, `@mentions`, …).
+     */
+    private fun inlineMarkdown(body: String): String {
+        val html = CockpitHtml.stripBody(MarkdownRenderer.toHtml(body)).trim()
+        return if (html.startsWith("<p>") && html.endsWith("</p>") && html.indexOf("<p>", 1) == -1) {
+            html.removePrefix("<p>").removeSuffix("</p>")
+        } else {
+            html
+        }
     }
 
     /** Appends one thread's HTML: root note, indented replies, resolved/anchor tags and Reply link. */
@@ -854,13 +981,14 @@ class MrDetailPanel(
         repaint()
     }
 
-    private fun setCommentsTabTitle(count: Int?) {
+    /** Sets the timeline tab's title with the human-note count (null → the plain tab title). */
+    private fun setTimelineTabTitle(count: Int?) {
         val title = if (count == null) {
-            CockpitBundle.message("detail.tab.comments")
+            CockpitBundle.message("detail.tab.timeline")
         } else {
-            CockpitBundle.message("detail.tab.commentsCount", count)
+            CockpitBundle.message("detail.tab.timelineCount", count)
         }
-        tabbedPane.setTitleAt(COMMENTS_TAB_INDEX, title)
+        tabbedPane.setTitleAt(TIMELINE_TAB_INDEX, title)
     }
 
     /**
@@ -1177,12 +1305,36 @@ class MrDetailPanel(
     }
 
     companion object {
-        private const val COMMENTS_TAB_INDEX = 1
+        private const val TIMELINE_TAB_INDEX = 1
         private const val PIPELINES_TAB_INDEX = 2
         private const val CHANGES_TAB_INDEX = 3
 
+        /** Diameter (px) of the header author avatar. */
+        private const val AVATAR_SIZE = 16
+
         /** Separator between the Overview date parts (a spaced middle dot U+00B7). */
         private const val DATE_SEPARATOR = " · "
+
+        /** Bundle label for a [TimelineFilter] combo entry. */
+        private fun timelineFilterLabel(filter: TimelineFilter): String = when (filter) {
+            TimelineFilter.ALL -> CockpitBundle.message("detail.timeline.filter.all")
+            TimelineFilter.EVENTS -> CockpitBundle.message("detail.timeline.filter.events")
+            TimelineFilter.DISCUSSIONS -> CockpitBundle.message("detail.timeline.filter.discussions")
+        }
+
+        /**
+         * Maps an [eventIconKey] to the reflective `AllIcons` path the platform HTML `<icon src>` tag
+         * resolves. Every path is verified to exist in the 2025.2 platform.
+         */
+        private fun eventIconSrc(key: String): String = when (key) {
+            "commit" -> "AllIcons.Vcs.CommitNode"
+            "assign" -> "AllIcons.General.User"
+            "review" -> "AllIcons.General.User"
+            "approve" -> "AllIcons.RunConfigurations.TestState.Green2"
+            "merge" -> "AllIcons.Vcs.Merge"
+            "state" -> "AllIcons.General.Note"
+            else -> "AllIcons.General.Note"
+        }
 
         /** Href scheme of a thread's Reply link; the discussion id follows the prefix. */
         private const val REPLY_LINK_PREFIX = "cockpit:reply:"

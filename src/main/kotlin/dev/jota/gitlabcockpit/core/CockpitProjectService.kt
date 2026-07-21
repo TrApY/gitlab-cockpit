@@ -221,6 +221,14 @@ class CockpitProjectService(
             }
         }
 
+    /**
+     * Fetches an MR's raw notes with GitLab's system notes kept, for the Events & Discussions
+     * timeline (GLC-34). Unlike [getNotes] — which drops system notes for a plain comment list — the
+     * timeline turns the system notes into its event entries, so it needs them unfiltered.
+     */
+    suspend fun getTimelineNotes(ref: MrRef): GitLabResult<List<GitLabNote>> =
+        withClientAndProject { client, _ -> client.getMrNotes(ref.projectId, ref.iid) }
+
     /** Posts a general comment on an MR and returns the created note. */
     suspend fun addNote(ref: MrRef, body: String): GitLabResult<GitLabNote> =
         withClientAndProject { client, _ -> client.createMrNote(ref.projectId, ref.iid, body) }
