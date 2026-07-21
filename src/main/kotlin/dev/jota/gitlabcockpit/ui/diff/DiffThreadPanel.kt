@@ -22,6 +22,7 @@ import dev.jota.gitlabcockpit.core.CockpitProjectService
 import dev.jota.gitlabcockpit.core.MrRef
 import dev.jota.gitlabcockpit.core.threadNeedsAttention
 import dev.jota.gitlabcockpit.ui.CockpitHtml
+import dev.jota.gitlabcockpit.ui.CockpitTheme
 import dev.jota.gitlabcockpit.ui.MarkdownRenderer
 import dev.jota.gitlabcockpit.ui.applyMarkdownUploads
 import dev.jota.gitlabcockpit.ui.formatRelative
@@ -128,12 +129,12 @@ internal class DiffThreadPanel(
      * border and inner padding. Recomputed whenever the resolution state changes.
      */
     private fun updateAccentBorder() {
-        val accent = if (threadNeedsAttention(notes)) ACCENT_ATTENTION else ACCENT_RESOLVED
+        val accent = if (threadNeedsAttention(notes)) CockpitTheme.warning else CockpitTheme.success
         border = BorderFactory.createCompoundBorder(
             JBUI.Borders.customLine(JBColor.border(), 1),
             BorderFactory.createCompoundBorder(
                 MatteBorder(0, JBUI.scale(3), 0, 0, accent),
-                JBUI.Borders.empty(6, 8),
+                CockpitTheme.panelBorder(),
             ),
         )
     }
@@ -312,12 +313,6 @@ internal class DiffThreadPanel(
     }
 
     companion object {
-        /** Amber (light/dark) left accent for a thread that still needs attention. */
-        private val ACCENT_ATTENTION = JBColor(0xB07800, 0xD6A243)
-
-        /** Green (light/dark) left accent for a resolved (or non-resolvable) thread. */
-        private val ACCENT_RESOLVED = JBColor(0x2E7D32, 0x499C54)
-
         private fun displayName(user: GitLabUser): String = user.name.ifBlank { user.username }
 
         private fun describe(result: GitLabResult<*>): String = when (result) {

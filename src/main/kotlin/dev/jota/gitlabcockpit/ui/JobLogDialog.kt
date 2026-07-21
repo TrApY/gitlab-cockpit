@@ -3,7 +3,6 @@ package dev.jota.gitlabcockpit.ui
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.ui.DialogWrapper
 import com.intellij.openapi.ui.DialogWrapper.IdeModalityType
-import com.intellij.util.ui.JBUI
 import dev.jota.gitlabcockpit.CockpitBundle
 import dev.jota.gitlabcockpit.api.GitLabJob
 import dev.jota.gitlabcockpit.core.CockpitProjectService
@@ -41,7 +40,7 @@ class JobLogDialog(
     override fun createCenterPanel(): JComponent {
         val panel = JPanel(BorderLayout())
         panel.add(logConsole.component, BorderLayout.CENTER)
-        panel.preferredSize = JBUI.size(900, 600)
+        panel.preferredSize = CockpitTheme.LOG_DIALOG_SIZE
         return panel
     }
 

@@ -47,7 +47,7 @@
             id="GitLab Cockpit"
             anchor="right"
             factoryClass="dev.jota.gitlabcockpit.ui.CockpitToolWindowFactory"
-            icon="AllIcons.Vcs.Vendors.Github"/>
+            icon="/icons/toolwindow.svg"/>
         <notificationGroup
             id="Cockpit for GitLab"
             displayType="BALLOON"/>

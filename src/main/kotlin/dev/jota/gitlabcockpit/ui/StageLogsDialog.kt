@@ -4,7 +4,6 @@ import com.intellij.openapi.project.Project
 import com.intellij.openapi.ui.DialogWrapper
 import com.intellij.openapi.ui.DialogWrapper.IdeModalityType
 import com.intellij.ui.components.JBTabbedPane
-import com.intellij.util.ui.JBUI
 import dev.jota.gitlabcockpit.CockpitBundle
 import dev.jota.gitlabcockpit.core.CockpitProjectService
 import dev.jota.gitlabcockpit.core.StageGroup
@@ -50,7 +49,7 @@ class StageLogsDialog(
     override fun createCenterPanel(): JComponent {
         val panel = JPanel(BorderLayout())
         panel.add(tabbedPane, BorderLayout.CENTER)
-        panel.preferredSize = JBUI.size(900, 600)
+        panel.preferredSize = CockpitTheme.LOG_DIALOG_SIZE
         return panel
     }
 

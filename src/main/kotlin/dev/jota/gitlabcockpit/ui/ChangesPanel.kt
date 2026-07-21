@@ -33,7 +33,6 @@ import com.intellij.ui.CollectionListModel
 import com.intellij.ui.ColorUtil
 import com.intellij.ui.ColoredTreeCellRenderer
 import com.intellij.ui.DoubleClickListener
-import com.intellij.ui.JBColor
 import com.intellij.ui.OnePixelSplitter
 import com.intellij.ui.SimpleTextAttributes
 import com.intellij.ui.components.ActionLink
@@ -253,7 +252,7 @@ class ChangesPanel(
         header.add(commentsTitle, BorderLayout.CENTER)
         val headerButtons = JPanel(FlowLayout(FlowLayout.RIGHT, 0, 0)).apply {
             isOpaque = false
-            border = JBUI.Borders.empty(2, 8)
+            border = CockpitTheme.compactBorder()
         }
         headerButtons.add(newThreadButton)
         header.add(headerButtons, BorderLayout.EAST)
@@ -270,7 +269,7 @@ class ChangesPanel(
 
     private fun buildReplyInput(): JComponent {
         val panel = JPanel(BorderLayout(0, JBUI.scale(4)))
-        panel.border = JBUI.Borders.empty(6, 8)
+        panel.border = CockpitTheme.panelBorder()
         panel.add(JBScrollPane(replyArea), BorderLayout.CENTER)
         val buttons = JPanel(FlowLayout(FlowLayout.RIGHT, JBUI.scale(4), 0)).apply { isOpaque = false }
         buttons.add(resolveButton)
@@ -1084,7 +1083,7 @@ class ChangesPanel(
         private val draftCheckBox = JBCheckBox(CockpitBundle.message("dialog.newThread.draft"))
 
         private val noticeLabel = JBLabel(CockpitBundle.message("dialog.newThread.noDiff")).apply {
-            foreground = JBColor.RED
+            foreground = CockpitTheme.danger
             isVisible = !hasCommentableLines
         }
 
@@ -1120,7 +1119,7 @@ class ChangesPanel(
                 )
                 .addComponent(draftCheckBox)
             if (!hasCommentableLines) builder.addComponent(noticeLabel)
-            return builder.panel.apply { preferredSize = JBUI.size(520, 360) }
+            return builder.panel.apply { preferredSize = CockpitTheme.NEW_THREAD_DIALOG_SIZE }
         }
 
         override fun doValidate(): ValidationInfo? = when {

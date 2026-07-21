@@ -6,10 +6,8 @@ import com.intellij.openapi.application.EDT
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.ui.ComboBox
 import com.intellij.openapi.ui.Messages
-import com.intellij.ui.AnimatedIcon
 import com.intellij.ui.ColoredTreeCellRenderer
 import com.intellij.ui.DoubleClickListener
-import com.intellij.ui.JBColor
 import com.intellij.ui.PopupHandler
 import com.intellij.ui.SimpleTextAttributes
 import com.intellij.ui.components.JBLabel
@@ -37,7 +35,6 @@ import java.awt.BorderLayout
 import java.awt.Component
 import java.awt.FlowLayout
 import java.awt.event.MouseEvent
-import javax.swing.Icon
 import javax.swing.JButton
 import javax.swing.JComponent
 import javax.swing.JMenuItem
@@ -164,7 +161,7 @@ class PipelinesPanel(
 
     private fun buildNorth(): JComponent {
         val north = JPanel(VerticalLayout(JBUI.scale(4)))
-        north.border = JBUI.Borders.empty(6, 8)
+        north.border = CockpitTheme.panelBorder()
 
         val controls = JPanel(FlowLayout(FlowLayout.LEFT, JBUI.scale(6), 0)).apply { isOpaque = false }
         controls.add(pipelineCombo)
@@ -324,7 +321,7 @@ class PipelinesPanel(
         stageStrip.removeAll()
         for (stage in stages) {
             val label = JBLabel("\u25CF " + stage.name).apply {
-                foreground = colorForStatus(stage.status)
+                foreground = CockpitTheme.statusColor(stage.status)
                 toolTipText = stage.status
             }
             stageStrip.add(label)
@@ -567,13 +564,13 @@ class PipelinesPanel(
             val node = value as? DefaultMutableTreeNode ?: return
             when (val data = node.userObject) {
                 is StageNodeData -> {
-                    icon = iconForStatus(data.stage.status)
+                    icon = CockpitIcons.status(data.stage.status)
                     append(data.stage.name, SimpleTextAttributes.REGULAR_BOLD_ATTRIBUTES)
                     append("  (${data.stage.jobs.size})", SimpleTextAttributes.GRAYED_ATTRIBUTES)
                 }
                 is JobNodeData -> {
                     val job = data.job
-                    icon = jobIcon(job)
+                    icon = CockpitIcons.status(job.status, job.allowFailure)
                     append(job.name)
                     job.duration?.let { append("  ${formatDuration(it)}", SimpleTextAttributes.GRAYED_ATTRIBUTES) }
                 }
@@ -596,32 +593,6 @@ class PipelinesPanel(
                 add(when0)
             }
             return parts.joinToString(dot)
-        }
-
-        /** Maps a job or aggregated stage status to its status icon. */
-        private fun iconForStatus(status: String): Icon = when (status) {
-            "success" -> AllIcons.RunConfigurations.TestState.Green2
-            "failed" -> AllIcons.RunConfigurations.TestState.Red2
-            "running" -> AnimatedIcon.Default()
-            "warning" -> AllIcons.General.Warning
-            "manual" -> AllIcons.Actions.Pause
-            "canceled" -> AllIcons.Actions.Suspend
-            else -> AllIcons.RunConfigurations.TestNotRan // pending / created / skipped / unknown
-        }
-
-        /** Like [iconForStatus] but a failed job that is allowed to fail shows the warning icon. */
-        private fun jobIcon(job: GitLabJob): Icon =
-            if (job.status == "failed" && job.allowFailure) AllIcons.General.Warning else iconForStatus(job.status)
-
-        /** Maps a job or aggregated stage status to its dot/label color. */
-        private fun colorForStatus(status: String): JBColor = when (status) {
-            "success" -> JBColor.GREEN
-            "failed" -> JBColor.RED
-            "running" -> JBColor.BLUE
-            "warning" -> JBColor.ORANGE
-            "canceled" -> JBColor.DARK_GRAY
-            "manual", "skipped" -> JBColor.LIGHT_GRAY
-            else -> JBColor.GRAY // pending / created / unknown
         }
 
         /** Formats a duration in seconds as `Xm Ys` (or `Ys` under a minute). */

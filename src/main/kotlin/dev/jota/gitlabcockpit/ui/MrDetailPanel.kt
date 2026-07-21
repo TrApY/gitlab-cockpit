@@ -10,7 +10,6 @@ import com.intellij.ui.CollectionListModel
 import com.intellij.ui.ColorUtil
 import com.intellij.ui.DocumentAdapter
 import com.intellij.ui.DoubleClickListener
-import com.intellij.ui.JBColor
 import com.intellij.ui.SearchTextField
 import com.intellij.ui.components.ActionLink
 import com.intellij.ui.components.JBCheckBox
@@ -200,6 +199,11 @@ class MrDetailPanel(
         setSingleMessage(CockpitBundle.message("detail.placeholder"))
     }
 
+    /** EDT. Moves keyboard focus into the detail's tab area (e.g. after opening an MR from the list). */
+    fun focusContent() {
+        tabbedPane.requestFocusInWindow()
+    }
+
     /** EDT. Kicks off a background detail load for [ref] and renders the result when it arrives. */
     fun loadDetail(ref: MrRef) {
         currentRef = ref
@@ -277,7 +281,7 @@ class MrDetailPanel(
     private fun buildHeader(mr: GitLabMergeRequest): JComponent {
         val header = JPanel(VerticalLayout(JBUI.scale(4)))
         header.isOpaque = false
-        header.border = JBUI.Borders.empty(6, 8)
+        header.border = CockpitTheme.panelBorder()
 
         val titleLine = flowLine()
         titleLine.add(JBLabel("!${mr.iid}  ${mr.title}").apply { font = font.deriveFont(Font.BOLD) })
@@ -285,7 +289,7 @@ class MrDetailPanel(
             titleLine.add(badge(CockpitBundle.message("toolwindow.mr.draft"), UIUtil.getContextHelpForeground()))
         }
         if (mr.hasConflicts) {
-            titleLine.add(badge(CockpitBundle.message("toolwindow.mr.conflicts"), JBColor.RED))
+            titleLine.add(badge(CockpitBundle.message("toolwindow.mr.conflicts"), CockpitTheme.danger))
         }
         titleLine.add(
             JButton(AllIcons.Actions.Edit).apply {
@@ -479,8 +483,8 @@ class MrDetailPanel(
         approvalsLabel?.let { label ->
             label.text = CockpitBundle.message("detail.approvedBy", display)
             label.foreground = when (approvalsHealth(approvals)) {
-                ApprovalsHealth.SATISFIED -> APPROVALS_SATISFIED_COLOR
-                ApprovalsHealth.PENDING -> APPROVALS_PENDING_COLOR
+                ApprovalsHealth.SATISFIED -> CockpitTheme.success
+                ApprovalsHealth.PENDING -> CockpitTheme.warning
                 ApprovalsHealth.UNKNOWN -> UIUtil.getLabelForeground()
             }
         }
@@ -521,7 +525,7 @@ class MrDetailPanel(
     private fun buildCommentInput(): JComponent {
         val panel = JPanel(BorderLayout(0, JBUI.scale(4)))
         panel.isOpaque = false
-        panel.border = JBUI.Borders.empty(6, 8)
+        panel.border = CockpitTheme.panelBorder()
         panel.add(replyContextPanel, BorderLayout.NORTH)
         panel.add(JBScrollPane(commentArea), BorderLayout.CENTER)
         val buttons = JPanel(FlowLayout(FlowLayout.RIGHT, 0, 0)).apply { isOpaque = false }
@@ -888,7 +892,7 @@ class MrDetailPanel(
         }
 
         override fun createCenterPanel(): JComponent {
-            val scroll = JBScrollPane(descriptionArea).apply { preferredSize = JBUI.size(560, 300) }
+            val scroll = JBScrollPane(descriptionArea).apply { preferredSize = CockpitTheme.EDIT_MR_DIALOG_SIZE }
             return FormBuilder.createFormBuilder()
                 .addLabeledComponent(CockpitBundle.message("dialog.editMr.titleLabel"), titleField)
                 .addLabeledComponentFillVertically(CockpitBundle.message("dialog.editMr.descriptionLabel"), scroll)
@@ -938,7 +942,7 @@ class MrDetailPanel(
         }
 
         override fun createCenterPanel(): JComponent {
-            val scroll = JBScrollPane(checkList).apply { preferredSize = JBUI.size(360, 320) }
+            val scroll = JBScrollPane(checkList).apply { preferredSize = CockpitTheme.REVIEWERS_DIALOG_SIZE }
             return JPanel(BorderLayout(0, JBUI.scale(4))).apply {
                 add(searchField, BorderLayout.NORTH)
                 add(scroll, BorderLayout.CENTER)
@@ -1010,7 +1014,7 @@ class MrDetailPanel(
         }
 
         override fun createCenterPanel(): JComponent {
-            val scroll = JBScrollPane(userList).apply { preferredSize = JBUI.size(360, 320) }
+            val scroll = JBScrollPane(userList).apply { preferredSize = CockpitTheme.REVIEWERS_DIALOG_SIZE }
             return JPanel(BorderLayout(0, JBUI.scale(4))).apply {
                 add(searchField, BorderLayout.NORTH)
                 add(scroll, BorderLayout.CENTER)
@@ -1072,12 +1076,6 @@ class MrDetailPanel(
 
         /** Separator between the Overview date parts (a spaced middle dot U+00B7). */
         private const val DATE_SEPARATOR = " · "
-
-        /** Green (light/dark) for a satisfied approvals line. */
-        private val APPROVALS_SATISFIED_COLOR = JBColor(0x2E7D32, 0x499C54)
-
-        /** Amber (light/dark) for a pending approvals line. */
-        private val APPROVALS_PENDING_COLOR = JBColor(0xB07800, 0xD6A243)
 
         /** Href scheme of a thread's Reply link; the discussion id follows the prefix. */
         private const val REPLY_LINK_PREFIX = "cockpit:reply:"

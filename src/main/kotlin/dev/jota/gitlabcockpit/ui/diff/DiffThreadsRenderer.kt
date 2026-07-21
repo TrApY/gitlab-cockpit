@@ -15,7 +15,6 @@ import com.intellij.openapi.editor.markup.RangeHighlighter
 import com.intellij.openapi.editor.markup.TextAttributes
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.util.Disposer
-import com.intellij.ui.JBColor
 import com.intellij.ui.components.panels.VerticalLayout
 import com.intellij.util.ui.JBUI
 import dev.jota.gitlabcockpit.CockpitBundle
@@ -27,7 +26,7 @@ import dev.jota.gitlabcockpit.core.nextAnchorIndex
 import dev.jota.gitlabcockpit.core.sortAnchors
 import dev.jota.gitlabcockpit.core.threadNeedsAttention
 import dev.jota.gitlabcockpit.core.threadsByAnchor
-import java.awt.Color
+import dev.jota.gitlabcockpit.ui.CockpitTheme
 import javax.swing.Icon
 import javax.swing.JPanel
 
@@ -191,7 +190,7 @@ internal class DiffThreadsRenderer(
     ): RangeHighlighter {
         val needsAttention = discussions.any { threadNeedsAttention(it.notes) }
         val commentCount = discussions.sumOf { discussion -> discussion.notes.count { !it.system } }
-        val attributes = if (needsAttention) TextAttributes().apply { backgroundColor = LINE_BACKGROUND } else null
+        val attributes = if (needsAttention) TextAttributes().apply { backgroundColor = CockpitTheme.attentionBackground } else null
         val highlighter = editor.markupModel.addLineHighlighter(lineIndex, HighlighterLayer.SELECTION - 1, attributes)
         highlighter.gutterIconRenderer =
             ThreadGutterIconRenderer(CockpitBundle.message("diff.gutter.tooltip", commentCount))
@@ -205,11 +204,5 @@ internal class DiffThreadsRenderer(
         override fun getAlignment(): Alignment = Alignment.LEFT
         override fun equals(other: Any?): Boolean = other is ThreadGutterIconRenderer && other.tooltip == tooltip
         override fun hashCode(): Int = tooltip.hashCode()
-    }
-
-    companion object {
-        /** Translucent amber background for a commented line whose thread still needs attention. */
-        private val LINE_BACKGROUND =
-            JBColor(Color(0xFF, 0xC1, 0x07, 0x18), Color(0xD6, 0xA2, 0x43, 0x20))
     }
 }

@@ -13,6 +13,7 @@ import com.intellij.ui.CollectionListModel
 import com.intellij.ui.ColoredListCellRenderer
 import com.intellij.ui.DoubleClickListener
 import com.intellij.ui.OnePixelSplitter
+import com.intellij.ui.PopupHandler
 import com.intellij.ui.SimpleTextAttributes
 import com.intellij.ui.TextFieldWithAutoCompletion
 import com.intellij.ui.components.ActionLink
@@ -41,13 +42,17 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.awt.BorderLayout
+import java.awt.Component
 import java.awt.FlowLayout
+import java.awt.Point
 import java.awt.event.KeyEvent
 import java.awt.event.MouseEvent
 import javax.swing.DefaultComboBoxModel
 import javax.swing.JButton
 import javax.swing.JComponent
+import javax.swing.JMenuItem
 import javax.swing.JPanel
+import javax.swing.JPopupMenu
 import javax.swing.KeyStroke
 import javax.swing.ListSelectionModel
 
@@ -106,6 +111,11 @@ class CockpitToolWindowPanel(
 
     private val refreshButton = JButton(AllIcons.Actions.Refresh).apply {
         toolTipText = CockpitBundle.message("toolwindow.refresh")
+    }
+
+    /** Opens the selected MR's GitLab page in the external browser (also offered on right-click). */
+    private val openInBrowserButton = JButton(AllIcons.General.Web).apply {
+        toolTipText = CockpitBundle.message("toolwindow.openInBrowser")
     }
 
     /** Web URL opened by [projectLink]; set from the resolved project on each successful load. */
@@ -212,6 +222,7 @@ class CockpitToolWindowPanel(
             }
         })
         refreshButton.addActionListener { reload(invalidateCache = true) }
+        openInBrowserButton.addActionListener { browseSelected() }
 
         installOpenActions()
 
@@ -228,6 +239,7 @@ class CockpitToolWindowPanel(
         toolbar.add(stateCombo)
         toolbar.add(allProjectsCheckBox)
         toolbar.add(refreshButton)
+        toolbar.add(openInBrowserButton)
         toolbar.add(projectLink)
         toolbar.add(remoteSelector)
         return toolbar
@@ -246,9 +258,33 @@ class CockpitToolWindowPanel(
             KeyStroke.getKeyStroke(KeyEvent.VK_ENTER, 0),
             JComponent.WHEN_FOCUSED,
         )
+
+        // Right-click on a row: select it and offer "Open in browser" (mirrors the toolbar button).
+        mrList.addMouseListener(object : PopupHandler() {
+            override fun invokePopup(comp: Component, x: Int, y: Int) {
+                val index = mrList.locationToIndex(Point(x, y))
+                if (index < 0 || mrList.getCellBounds(index, index)?.contains(x, y) != true) return
+                mrList.selectedIndex = index
+                JPopupMenu().apply {
+                    add(
+                        JMenuItem(CockpitBundle.message("toolwindow.openInBrowser")).apply {
+                            addActionListener { browseSelected() }
+                        },
+                    )
+                }.show(comp, x, y)
+            }
+        })
     }
 
+    /** Double-click / Enter on a row: show the selected MR in the detail pane and move focus to it. */
     private fun openSelected() {
+        if (mrList.selectedValue == null) return
+        reconcileDetailWithSelection()
+        detailPanel.focusContent()
+    }
+
+    /** Opens the selected MR's GitLab page in the external browser. */
+    private fun browseSelected() {
         mrList.selectedValue?.let { BrowserUtil.browse(it.webUrl) }
     }
 
