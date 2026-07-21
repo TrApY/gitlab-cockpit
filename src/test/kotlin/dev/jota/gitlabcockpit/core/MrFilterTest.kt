@@ -76,6 +76,40 @@ class MrFilterTest {
         assertEquals(listOf(mr(2), mr(3), mr(4)), filterNotApproved(mrs, byRef, me))
     }
 
+    // --- filterByTitle ------------------------------------------------------------------------
+
+    private fun titled(iid: Long, title: String): GitLabMergeRequest = mr(iid).copy(title = title)
+
+    @Test
+    fun `blank title query returns every merge request`() {
+        val mrs = listOf(titled(1, "Fix login"), titled(2, "Add cache"))
+
+        assertEquals(mrs, filterByTitle(mrs, ""))
+        assertEquals(mrs, filterByTitle(mrs, "   "))
+    }
+
+    @Test
+    fun `title query matches case-insensitively as a substring`() {
+        val mrs = listOf(titled(1, "Fix Login bug"), titled(2, "Add cache"), titled(3, "Refactor LOGIN flow"))
+
+        assertEquals(listOf(titled(1, "Fix Login bug"), titled(3, "Refactor LOGIN flow")), filterByTitle(mrs, "login"))
+    }
+
+    @Test
+    fun `title query is trimmed before matching`() {
+        val mrs = listOf(titled(1, "Fix login"), titled(2, "Add cache"))
+
+        assertEquals(listOf(titled(2, "Add cache")), filterByTitle(mrs, "  cache  "))
+    }
+
+    @Test
+    fun `title query with no match returns empty and preserves input order otherwise`() {
+        val mrs = listOf(titled(3, "gamma"), titled(1, "alpha"), titled(2, "alphabet"))
+
+        assertEquals(emptyList<GitLabMergeRequest>(), filterByTitle(mrs, "zzz"))
+        assertEquals(listOf(titled(1, "alpha"), titled(2, "alphabet")), filterByTitle(mrs, "alpha"))
+    }
+
     // --- isGlobalByUserWithoutUser ------------------------------------------------------------
 
     @Test

@@ -10,15 +10,13 @@ import com.intellij.openapi.project.Project
 import com.intellij.openapi.ui.ComboBox
 import com.intellij.openapi.wm.ToolWindow
 import com.intellij.ui.CollectionListModel
-import com.intellij.ui.ColoredListCellRenderer
 import com.intellij.ui.DoubleClickListener
 import com.intellij.ui.OnePixelSplitter
 import com.intellij.ui.PopupHandler
-import com.intellij.ui.SimpleTextAttributes
+import com.intellij.ui.SearchTextField
 import com.intellij.ui.TextFieldWithAutoCompletion
 import com.intellij.ui.components.ActionLink
 import com.intellij.ui.components.JBCheckBox
-import com.intellij.ui.components.JBLabel
 import com.intellij.ui.components.JBList
 import com.intellij.ui.components.JBPanel
 import com.intellij.ui.components.JBScrollPane
@@ -34,7 +32,7 @@ import dev.jota.gitlabcockpit.core.MrFilterSelection
 import dev.jota.gitlabcockpit.core.MrNotificationsWatcher
 import dev.jota.gitlabcockpit.core.MrRef
 import dev.jota.gitlabcockpit.core.RoleFilter
-import dev.jota.gitlabcockpit.core.projectLabelOf
+import dev.jota.gitlabcockpit.core.filterByTitle
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -74,7 +72,21 @@ class CockpitToolWindowPanel(
     private val roleCombo = ComboBox(RoleFilter.entries.toTypedArray()).apply {
         renderer = textCellRenderer<RoleFilter>("") { roleLabel(it) }
         selectedItem = RoleFilter.ALL
+        toolTipText = CockpitBundle.message("toolwindow.filter.role.label")
     }
+
+    /**
+     * Live, in-memory title filter over the already-loaded list (no network). Debounced through
+     * [titleFilterAlarm] so typing coalesces into a single [applyDisplayedList]; sits at the front of
+     * the toolbar, self-explained by its search icon and placeholder.
+     */
+    private val titleSearchField = SearchTextField().apply {
+        textEditor.emptyText.text = CockpitBundle.message("toolwindow.filter.title.placeholder")
+        textEditor.columns = TITLE_FIELD_COLUMNS
+    }
+
+    /** Debounces the title filter: each keystroke restarts a [TITLE_FILTER_DEBOUNCE_MS] timer. */
+    private val titleFilterAlarm = Alarm(Alarm.ThreadToUse.SWING_THREAD, this)
 
     /** Feeds the "By user" field with member candidates matched by [filterMembers] semantics. */
     private val userCompletionProvider = MemberCompletionProvider()
@@ -99,6 +111,7 @@ class CockpitToolWindowPanel(
     private val stateCombo = ComboBox(MergeRequestState.entries.toTypedArray()).apply {
         renderer = textCellRenderer<MergeRequestState>("") { stateLabel(it) }
         selectedItem = MergeRequestState.OPENED
+        toolTipText = CockpitBundle.message("toolwindow.filter.state.label")
     }
 
     /**
@@ -151,13 +164,26 @@ class CockpitToolWindowPanel(
 
     private val listModel = CollectionListModel<GitLabMergeRequest>()
 
-    /** Shared row renderer; its [MrCellRenderer.showProject] is toggled by [render] per loaded mode. */
-    private val mrCellRenderer = MrCellRenderer()
+    /** Circular author/reviewer avatars for the rows; shared application-level cache. */
+    private val avatarCache = AvatarCache.getInstance()
 
-    private val mrList = JBList(listModel).apply {
+    /** Per-row head-pipeline status, fetched in the background and read synchronously by the renderer. */
+    private val enrichment = MrListEnrichment.getInstance(project)
+
+    /** Shared row renderer; its [MrListCellRenderer.showProject] is toggled by [render] per loaded mode. */
+    private val mrCellRenderer = MrListCellRenderer(project, avatarCache, enrichment) { mrList.repaint() }
+
+    private val mrList: JBList<GitLabMergeRequest> = JBList(listModel).apply {
         selectionMode = ListSelectionModel.SINGLE_SELECTION
         cellRenderer = mrCellRenderer
     }
+
+    /**
+     * The full list as last loaded from GitLab, before the in-memory title filter. The displayed
+     * [listModel] is [filterByTitle] applied to this; kept so the filter can re-run on each keystroke
+     * without a reload.
+     */
+    private var loadedMrs: List<GitLabMergeRequest> = emptyList()
 
     private val detailPanel = MrDetailPanel(project, service, onListReloadRequested = { reloadSilently() })
 
@@ -223,6 +249,16 @@ class CockpitToolWindowPanel(
         })
         refreshButton.addActionListener { reload(invalidateCache = true) }
         openInBrowserButton.addActionListener { browseSelected() }
+        titleSearchField.addDocumentListener(object : javax.swing.event.DocumentListener {
+            private fun schedule() {
+                titleFilterAlarm.cancelAllRequests()
+                titleFilterAlarm.addRequest({ applyDisplayedList() }, TITLE_FILTER_DEBOUNCE_MS)
+            }
+
+            override fun insertUpdate(e: javax.swing.event.DocumentEvent) = schedule()
+            override fun removeUpdate(e: javax.swing.event.DocumentEvent) = schedule()
+            override fun changedUpdate(e: javax.swing.event.DocumentEvent) = schedule()
+        })
 
         installOpenActions()
 
@@ -232,10 +268,9 @@ class CockpitToolWindowPanel(
 
     private fun buildToolbar(): JComponent {
         val toolbar = JPanel(FlowLayout(FlowLayout.LEFT, JBUI.scale(4), JBUI.scale(4)))
-        toolbar.add(JBLabel(CockpitBundle.message("toolwindow.filter.role.label")))
+        toolbar.add(titleSearchField)
         toolbar.add(roleCombo)
         toolbar.add(userField)
-        toolbar.add(JBLabel(CockpitBundle.message("toolwindow.filter.state.label")))
         toolbar.add(stateCombo)
         toolbar.add(allProjectsCheckBox)
         toolbar.add(refreshButton)
@@ -382,18 +417,30 @@ class CockpitToolWindowPanel(
             is CockpitState.Error ->
                 showMessage(state.message)
             is CockpitState.Ready -> {
-                val previousRef = mrList.selectedValue?.let { MrRef(it.projectId, it.iid) }
+                loadedMrs = state.mrs
                 mrList.emptyText.text = CockpitBundle.message("toolwindow.empty.noMrs")
-                suppressSelectionEvents = true
-                listModel.replaceAll(state.mrs)
-                val restoreIndex = previousRef?.let { ref ->
-                    state.mrs.indexOfFirst { MrRef(it.projectId, it.iid) == ref }
-                } ?: -1
-                if (restoreIndex >= 0) mrList.selectedIndex = restoreIndex
-                suppressSelectionEvents = false
-                reconcileDetailWithSelection()
+                enrichment.enrich(loadedMrs) { mrList.repaint() }
+                applyDisplayedList()
             }
         }
+    }
+
+    /**
+     * Rebuilds the displayed [listModel] from [loadedMrs] through the in-memory title filter,
+     * preserving the current selection by [MrRef]. Runs on the EDT; called on each successful load and
+     * on every (debounced) title-filter keystroke.
+     */
+    private fun applyDisplayedList() {
+        val previousRef = mrList.selectedValue?.let { MrRef(it.projectId, it.iid) }
+        val displayed = filterByTitle(loadedMrs, titleSearchField.text)
+        suppressSelectionEvents = true
+        listModel.replaceAll(displayed)
+        val restoreIndex = previousRef?.let { ref ->
+            displayed.indexOfFirst { MrRef(it.projectId, it.iid) == ref }
+        } ?: -1
+        if (restoreIndex >= 0) mrList.selectedIndex = restoreIndex
+        suppressSelectionEvents = false
+        reconcileDetailWithSelection()
     }
 
     /**
@@ -446,6 +493,7 @@ class CockpitToolWindowPanel(
     }
 
     private fun showMessage(text: String) {
+        loadedMrs = emptyList()
         listModel.removeAll()
         mrList.emptyText.text = text
     }
@@ -455,56 +503,11 @@ class CockpitToolWindowPanel(
         loadJob?.cancel()
     }
 
-    private class MrCellRenderer : ColoredListCellRenderer<GitLabMergeRequest>() {
-
-        /** When true (the "All projects" mode), each row is prefixed with its `group/project` label. */
-        var showProject: Boolean = false
-
-        override fun customizeCellRenderer(
-            list: javax.swing.JList<out GitLabMergeRequest>,
-            value: GitLabMergeRequest,
-            index: Int,
-            selected: Boolean,
-            hasFocus: Boolean,
-        ) {
-            if (value.draft) {
-                append(
-                    CockpitBundle.message("toolwindow.mr.draft") + " ",
-                    SimpleTextAttributes.GRAYED_ATTRIBUTES,
-                )
-            }
-            if (showProject) {
-                projectLabelOf(value)?.let { label ->
-                    append("$label  ", SimpleTextAttributes.GRAYED_ATTRIBUTES)
-                }
-            }
-            append(value.title)
-            append("  !${value.iid} ", SimpleTextAttributes.GRAYED_ATTRIBUTES)
-            append(
-                "${value.sourceBranch} → ${value.targetBranch}",
-                SimpleTextAttributes.GRAYED_ATTRIBUTES,
-            )
-            append("   ${value.author.username}", SimpleTextAttributes.GRAYED_ATTRIBUTES)
-            val reviewers = value.reviewers.joinToString(", ") { it.username }
-            if (reviewers.isNotEmpty()) {
-                append(" → $reviewers", SimpleTextAttributes.GRAYED_ATTRIBUTES)
-            }
-            append(
-                "   ${formatRelative(value.updatedAt)}",
-                SimpleTextAttributes.GRAYED_ITALIC_ATTRIBUTES,
-            )
-            if (value.hasConflicts) {
-                append(
-                    "  ${CockpitBundle.message("toolwindow.mr.conflicts")}",
-                    SimpleTextAttributes.ERROR_ATTRIBUTES,
-                )
-            }
-        }
-    }
-
     companion object {
         private const val AUTO_REFRESH_MS = 60_000L
         private const val USER_FILTER_DEBOUNCE_MS = 500
+        private const val TITLE_FILTER_DEBOUNCE_MS = 300
+        private const val TITLE_FIELD_COLUMNS = 16
         private const val SPLITTER_PROPORTION_KEY = "dev.jota.gitlabcockpit.detail.splitter"
 
         private fun roleLabel(role: RoleFilter): String = when (role) {

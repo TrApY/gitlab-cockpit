@@ -32,6 +32,13 @@ data class GitLabUser(
     val id: Long,
     val username: String,
     val name: String = "",
+    /**
+     * URL of the user's avatar image, returned by `/user` and embedded in merge-request payloads.
+     * Nullable because GitLab omits it for users without a custom avatar (and older/trimmed payloads
+     * may not carry it); such users get the placeholder icon with no network cost (see
+     * [dev.jota.gitlabcockpit.ui.AvatarCache]).
+     */
+    @SerialName("avatar_url") val avatarUrl: String? = null,
 )
 
 /** A GitLab project. Only the fields the cockpit needs are modeled. */

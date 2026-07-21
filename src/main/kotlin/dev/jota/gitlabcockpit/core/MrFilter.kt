@@ -48,6 +48,19 @@ fun isGlobalByUserWithoutUser(selection: MrFilterSelection): Boolean =
         selection.username?.trim().isNullOrEmpty()
 
 /**
+ * In-memory title filter for the already-loaded MR list, backing the toolbar's live search. Keeps
+ * the merge requests whose [GitLabMergeRequest.title] contains the (trimmed) [query] as a
+ * case-insensitive substring; a blank query returns [mrs] unchanged (so an empty box shows every
+ * loaded MR). Purely client-side — no network — and platform-free so it shares one testable contract
+ * with its tests. The input order is preserved.
+ */
+fun filterByTitle(mrs: List<GitLabMergeRequest>, query: String): List<GitLabMergeRequest> {
+    val q = query.trim()
+    if (q.isEmpty()) return mrs
+    return mrs.filter { it.title.contains(q, ignoreCase = true) }
+}
+
+/**
  * Keeps the merge requests the current user has NOT approved. The list is expected to already be
  * server-filtered to "I am a reviewer", so the only remaining test is whether [currentUserId]
  * appears among each MR's approvers. Approvals are keyed by [MrRef] (project + iid) so the lookup

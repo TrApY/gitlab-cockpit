@@ -1,0 +1,184 @@
+package dev.jota.gitlabcockpit.ui
+
+import com.intellij.icons.AllIcons
+import com.intellij.openapi.project.Project
+import com.intellij.ui.SimpleColoredComponent
+import com.intellij.ui.SimpleTextAttributes
+import com.intellij.util.ui.JBUI
+import dev.jota.gitlabcockpit.CockpitBundle
+import dev.jota.gitlabcockpit.api.GitLabMergeRequest
+import dev.jota.gitlabcockpit.api.GitLabUser
+import dev.jota.gitlabcockpit.core.MrSegmentStyle
+import dev.jota.gitlabcockpit.core.mrRowPresentation
+import java.awt.BorderLayout
+import java.awt.Color
+import java.awt.Component
+import java.awt.Dimension
+import java.awt.FlowLayout
+import javax.swing.BoxLayout
+import javax.swing.JLabel
+import javax.swing.JList
+import javax.swing.JPanel
+import javax.swing.ListCellRenderer
+
+/**
+ * The MR list row renderer: a two-line cell (title on top, muted `iid · author · when · branches`
+ * below) with a right-aligned column carrying the head-pipeline status icon, a comments badge and the
+ * author + reviewer avatars. Replaces the old single-line [com.intellij.ui.ColoredListCellRenderer]
+ * because a 2-line layout with a right column needs a real [JPanel] renderer.
+ *
+ * All text composition is delegated to [mrRowPresentation] (pure, tested); this class only paints.
+ * Avatars come from [AvatarCache] (placeholder first, [repaintList] on load) and the pipeline status
+ * from [MrListEnrichment] (no icon until known). Selection colors are honored on every segment.
+ *
+ * @param showProject mirrors the "All projects" mode; when set, line 2 is prefixed with `group/project`.
+ */
+class MrListCellRenderer(
+    project: Project,
+    private val avatarCache: AvatarCache,
+    private val enrichment: MrListEnrichment,
+    private val repaintList: () -> Unit,
+) : ListCellRenderer<GitLabMergeRequest> {
+
+    var showProject: Boolean = false
+
+    private val draftPrefix: String = CockpitBundle.message("toolwindow.mr.draftPrefix") + " "
+    private val conflictsSuffix: String = " · " + CockpitBundle.message("toolwindow.mr.conflicts")
+
+    private val line1 = SimpleColoredComponent().apply {
+        isOpaque = false
+        ipad = JBUI.insets(0)
+    }
+    private val line2 = SimpleColoredComponent().apply {
+        isOpaque = false
+        ipad = JBUI.insets(0)
+    }
+
+    private val textColumn = JPanel().apply {
+        layout = BoxLayout(this, BoxLayout.Y_AXIS)
+        isOpaque = false
+        line1.alignmentX = Component.LEFT_ALIGNMENT
+        line2.alignmentX = Component.LEFT_ALIGNMENT
+        add(javax.swing.Box.createVerticalGlue())
+        add(line1)
+        add(line2)
+        add(javax.swing.Box.createVerticalGlue())
+    }
+
+    private val statusLabel = JLabel()
+
+    private val commentsLabel = JLabel().apply { iconTextGap = JBUI.scale(2) }
+
+    /** Overlapping avatar stack (negative gap): author first (painted on top), then up to 2 reviewers. */
+    private val avatarsPanel = JPanel(FlowLayout(FlowLayout.LEFT, JBUI.scale(AVATAR_OVERLAP), 0)).apply {
+        isOpaque = false
+    }
+
+    private val overflowLabel = JLabel()
+
+    private val rightColumn = JPanel(FlowLayout(FlowLayout.RIGHT, JBUI.scale(6), 0)).apply {
+        isOpaque = false
+        add(statusLabel)
+        add(commentsLabel)
+        add(avatarsPanel)
+        add(overflowLabel)
+    }
+
+    private val root = object : JPanel(BorderLayout()) {
+        override fun getPreferredSize(): Dimension {
+            val size = super.getPreferredSize()
+            size.height = JBUI.scale(ROW_HEIGHT)
+            return size
+        }
+    }.apply {
+        border = CockpitTheme.compactBorder()
+        add(textColumn, BorderLayout.CENTER)
+        add(rightColumn, BorderLayout.EAST)
+    }
+
+    override fun getListCellRendererComponent(
+        list: JList<out GitLabMergeRequest>,
+        value: GitLabMergeRequest,
+        index: Int,
+        isSelected: Boolean,
+        cellHasFocus: Boolean,
+    ): Component {
+        val background: Color = if (isSelected) list.selectionBackground else list.background
+        val foreground: Color = if (isSelected) list.selectionForeground else list.foreground
+        // On a selected row every run uses the selection foreground for legibility over the highlight.
+        val muted: Color = if (isSelected) foreground else CockpitTheme.muted()
+
+        root.isOpaque = true
+        root.background = background
+
+        val presentation = mrRowPresentation(
+            mr = value,
+            showProject = showProject,
+            relativeUpdatedAt = formatRelative(value.updatedAt),
+            maxReviewerAvatars = MAX_REVIEWER_AVATARS,
+            draftPrefix = draftPrefix,
+            conflictsSuffix = conflictsSuffix,
+        )
+
+        line1.font = list.font
+        line1.clear()
+        for (segment in presentation.line1) {
+            val color = if (isSelected) foreground else segmentColor(segment.style, foreground)
+            line1.append(segment.text, SimpleTextAttributes(SimpleTextAttributes.STYLE_PLAIN, color))
+        }
+
+        line2.font = list.font.deriveFont(list.font.size2D - 1f)
+        line2.clear()
+        line2.append(presentation.line2, SimpleTextAttributes(SimpleTextAttributes.STYLE_PLAIN, muted))
+
+        val status = enrichment.statusOf(value)
+        statusLabel.icon = status?.let { CockpitIcons.status(it) }
+        statusLabel.isVisible = statusLabel.icon != null
+
+        val notes = value.userNotesCount ?: 0
+        if (notes > 0) {
+            commentsLabel.icon = AllIcons.Toolwindows.ToolWindowMessages
+            commentsLabel.text = notes.toString()
+            commentsLabel.foreground = muted
+            commentsLabel.isVisible = true
+        } else {
+            commentsLabel.isVisible = false
+        }
+
+        avatarsPanel.removeAll()
+        val avatarUsers: List<GitLabUser> = listOf(value.author) + value.reviewers.take(MAX_REVIEWER_AVATARS)
+        for (user in avatarUsers) {
+            avatarsPanel.add(JLabel(avatarCache.icon(user, AVATAR_SIZE) { repaintList() }))
+        }
+
+        if (presentation.reviewerOverflow > 0) {
+            overflowLabel.text = "+${presentation.reviewerOverflow}"
+            overflowLabel.foreground = muted
+            overflowLabel.isVisible = true
+        } else {
+            overflowLabel.isVisible = false
+        }
+
+        return root
+    }
+
+    private fun segmentColor(style: MrSegmentStyle, normal: Color): Color = when (style) {
+        MrSegmentStyle.NORMAL -> normal
+        MrSegmentStyle.WARNING -> CockpitTheme.warning
+        MrSegmentStyle.DANGER -> CockpitTheme.danger
+    }
+
+    companion object {
+        /** Row height in unscaled px; JBUI-scaled at paint time. */
+        private const val ROW_HEIGHT = 44
+
+        /** Avatar diameter in unscaled px. */
+        private const val AVATAR_SIZE = 16
+
+        /** Horizontal gap between stacked avatars (negative → overlap). */
+        private const val AVATAR_OVERLAP = -4
+
+        /** How many reviewers are shown as avatars before the `+N` badge takes over. */
+        private const val MAX_REVIEWER_AVATARS = 2
+    }
+}
