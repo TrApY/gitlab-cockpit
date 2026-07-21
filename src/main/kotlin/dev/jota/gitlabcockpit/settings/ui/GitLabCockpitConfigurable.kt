@@ -43,6 +43,7 @@ class GitLabCockpitConfigurable : Configurable {
         JBCheckBox(CockpitBundle.message("settings.notifications.enabled")).apply {
             addActionListener { syncNotificationChecks() }
         }
+    private val stickyCheck = JBCheckBox(CockpitBundle.message("settings.notifications.sticky"))
     private val notifyPipelineCheck = JBCheckBox(CockpitBundle.message("settings.notifications.pipeline"))
     private val notifyNewMrCheck = JBCheckBox(CockpitBundle.message("settings.notifications.newMr"))
     private val notifyMrStateCheck = JBCheckBox(CockpitBundle.message("settings.notifications.mrState"))
@@ -52,8 +53,12 @@ class GitLabCockpitConfigurable : Configurable {
         JBCheckBox(CockpitBundle.message("settings.notifications.scopeAllFiltered"))
     private val backgroundIntervalCombo = ComboBox(PollInterval.values())
 
-    /** The per-event checkboxes plus the scope/interval controls, greyed out while the master is off. */
+    /**
+     * The sticky presentation modifier, the per-event checkboxes and the scope/interval controls,
+     * all greyed out while the master switch is off (they only make sense once notifications are on).
+     */
     private val eventChecks = listOf(
+        stickyCheck,
         notifyPipelineCheck,
         notifyNewMrCheck,
         notifyMrStateCheck,
@@ -89,6 +94,7 @@ class GitLabCockpitConfigurable : Configurable {
             }
             group(CockpitBundle.message("settings.notifications.title")) {
                 row { cell(notificationsEnabledCheck) }
+                row { cell(stickyCheck) }
                 row { cell(notifyPipelineCheck) }
                 row { cell(notifyNewMrCheck) }
                 row { cell(notifyMrStateCheck) }
@@ -123,6 +129,7 @@ class GitLabCockpitConfigurable : Configurable {
         val deleteChanged = selectedMerge(deleteSourceCombo).value != settings.mergeDeleteSourceBranch
         val notificationsChanged =
             notificationsEnabledCheck.isSelected != settings.notificationsEnabled ||
+                stickyCheck.isSelected != settings.stickyNotifications ||
                 notifyPipelineCheck.isSelected != settings.notifyPipeline ||
                 notifyNewMrCheck.isSelected != settings.notifyNewMr ||
                 notifyMrStateCheck.isSelected != settings.notifyMrState ||
@@ -158,6 +165,7 @@ class GitLabCockpitConfigurable : Configurable {
         settings.mergeDeleteSourceBranch = selectedMerge(deleteSourceCombo).value
 
         settings.notificationsEnabled = notificationsEnabledCheck.isSelected
+        settings.stickyNotifications = stickyCheck.isSelected
         settings.notifyPipeline = notifyPipelineCheck.isSelected
         settings.notifyNewMr = notifyNewMrCheck.isSelected
         settings.notifyMrState = notifyMrStateCheck.isSelected
@@ -179,6 +187,7 @@ class GitLabCockpitConfigurable : Configurable {
         deleteSourceCombo.selectedItem = MergeDefault.of(settings.mergeDeleteSourceBranch)
 
         notificationsEnabledCheck.isSelected = settings.notificationsEnabled
+        stickyCheck.isSelected = settings.stickyNotifications
         notifyPipelineCheck.isSelected = settings.notifyPipeline
         notifyNewMrCheck.isSelected = settings.notifyNewMr
         notifyMrStateCheck.isSelected = settings.notifyMrState

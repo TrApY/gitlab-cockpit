@@ -10,8 +10,25 @@ import dev.jota.gitlabcockpit.settings.GitLabCockpitSettings
 /** Id of the notification group declared in `plugin.xml` (`Cockpit for GitLab`, balloon display). */
 const val COCKPIT_NOTIFICATION_GROUP = "Cockpit for GitLab"
 
+/**
+ * Id of the sticky notification group declared in `plugin.xml` (`Cockpit for GitLab (Sticky)`,
+ * STICKY_BALLOON display). Same visuals as [COCKPIT_NOTIFICATION_GROUP], but its balloons stay on
+ * screen until the user dismisses them. Used when the opt-in sticky setting is on (GLC-30).
+ */
+const val COCKPIT_STICKY_NOTIFICATION_GROUP = "Cockpit for GitLab (Sticky)"
+
 /** Terminal pipeline statuses whose arrival is worth an IDE notification. */
 private val NOTIFY_STATUSES = setOf("success", "failed")
+
+/**
+ * Pure selection of which notification group an event balloon should use: the sticky group when
+ * [sticky] is on, the auto-hiding one otherwise. There are two physical groups because a group's
+ * display type (BALLOON vs STICKY_BALLOON) is fixed when it is registered in `plugin.xml` and is
+ * not mutable at runtime — so honoring the toggle means routing each post to the right group id
+ * rather than reconfiguring a single group (GLC-30).
+ */
+fun notificationGroupFor(sticky: Boolean): String =
+    if (sticky) COCKPIT_STICKY_NOTIFICATION_GROUP else COCKPIT_NOTIFICATION_GROUP
 
 /**
  * A detected pipeline transition worth notifying: the [mr] whose latest pipeline just reached a
@@ -94,8 +111,11 @@ class MrNotificationsWatcher(
     }
 
     private fun post(title: String, content: String, type: NotificationType) {
+        // Resolve the group per post (never cache): reading the setting on each event makes a
+        // sticky-toggle change take effect on the next notification without restarting anything.
+        val group = notificationGroupFor(GitLabCockpitSettings.getInstance().stickyNotifications)
         NotificationGroupManager.getInstance()
-            .getNotificationGroup(COCKPIT_NOTIFICATION_GROUP)
+            .getNotificationGroup(group)
             .createNotification(title, content, type)
             .notify(project)
     }

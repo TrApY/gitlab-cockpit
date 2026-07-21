@@ -4,6 +4,12 @@
 
 ## [Unreleased]
 
+## [0.12.1] - 2026-07-21
+
+### Added
+
+- Optional sticky notifications: keep event balloons on screen until dismissed (Settings → Tools → Cockpit for GitLab)
+
 ## [0.12.0] - 2026-07-16
 
 ### Added

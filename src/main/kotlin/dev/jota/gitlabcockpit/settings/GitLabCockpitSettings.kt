@@ -61,6 +61,13 @@ class GitLabCockpitSettings : PersistentStateComponent<GitLabCockpitSettings.Sta
         var notifyComments: Boolean = false
 
         /**
+         * When `true`, event balloons use the STICKY_BALLOON group so they stay on screen until the
+         * user dismisses them instead of auto-hiding (GLC-30). Defaults to `false` — the status-quo
+         * auto-hiding behavior for existing users. Applies to the watcher's event notifications only.
+         */
+        var stickyNotifications: Boolean = false
+
+        /**
          * How often (minutes) the background poller checks for events while the tool window is closed
          * (GLC-28). Only 1/2/5 are offered in the UI; re-read every tick so a change takes effect
          * without restarting the loop. Defaults to 2.
@@ -128,6 +135,11 @@ class GitLabCockpitSettings : PersistentStateComponent<GitLabCockpitSettings.Sta
     var notifyComments: Boolean
         get() = state.notifyComments
         set(value) { state.notifyComments = value }
+
+    /** Keep event balloons on screen until dismissed (STICKY_BALLOON); see [State.stickyNotifications]. */
+    var stickyNotifications: Boolean
+        get() = state.stickyNotifications
+        set(value) { state.stickyNotifications = value }
 
     /** Background poll interval in minutes; see [State.backgroundPollMinutes]. */
     var backgroundPollMinutes: Int
