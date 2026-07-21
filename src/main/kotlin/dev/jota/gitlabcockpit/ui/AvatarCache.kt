@@ -6,6 +6,7 @@ import com.intellij.openapi.application.PathManager
 import com.intellij.openapi.components.Service
 import com.intellij.openapi.components.service
 import com.intellij.util.ui.ImageUtil
+import com.intellij.util.IconUtil
 import com.intellij.util.ui.JBImageIcon
 import com.intellij.util.ui.JBUI
 import dev.jota.gitlabcockpit.api.GitLabUser
@@ -77,6 +78,7 @@ class AvatarLoader(
     private val scope: CoroutineScope,
     private val downloader: AvatarDownloader,
     private val diskDir: Path,
+    private val placeholderFactory: (Int) -> Icon = { AllIcons.General.User },
     private val clock: () -> Long = System::currentTimeMillis,
 ) {
 
@@ -91,8 +93,11 @@ class AvatarLoader(
 
     private val semaphore = Semaphore(MAX_CONCURRENT_DOWNLOADS)
 
-    /** The immediate placeholder shown while (or instead of) downloading. */
-    private val placeholder: Icon = AllIcons.General.User
+    /** The immediate placeholder shown while (or instead of) downloading, memoized per requested size. */
+    private val placeholders = ConcurrentHashMap<Int, Icon>()
+
+    /** The placeholder for [size] px, built once per size from [placeholderFactory]. */
+    private fun placeholder(size: Int): Icon = placeholders.getOrPut(size) { placeholderFactory(size) }
 
     /**
      * The circular avatar for [user] at [size] px, or the placeholder while it loads. A user with no
@@ -100,10 +105,10 @@ class AvatarLoader(
      * the background and [onLoaded] fires on the EDT once the icon is ready (the caller repaints).
      */
     fun icon(user: GitLabUser, size: Int, onLoaded: () -> Unit): Icon {
-        val url = user.avatarUrl?.takeIf { it.isNotBlank() } ?: return placeholder
+        val url = user.avatarUrl?.takeIf { it.isNotBlank() } ?: return placeholder(size)
         val key = memKey(url, size)
         memory[key]?.let { return it }
-        if (isRecentFailure(url)) return placeholder
+        if (isRecentFailure(url)) return placeholder(size)
         if (inFlight.add(key)) {
             scope.launch {
                 try {
@@ -114,7 +119,7 @@ class AvatarLoader(
                 }
             }
         }
-        return placeholder
+        return placeholder(size)
     }
 
     /**
@@ -215,6 +220,10 @@ class AvatarCache(scope: CoroutineScope) {
         scope = scope,
         downloader = HttpAvatarDownloader(),
         diskDir = Path.of(PathManager.getSystemPath(), "gitlab-cockpit", "avatars"),
+        // Placeholder avatar (GLC-38 / iter3 A3, ADENDA 2): the copied collaboration-tools DefaultAvatar,
+        // resized to the requested size with IconUtil.resizeSquared — the same helper JetBrains'
+        // GitLabImageLoader uses — instead of the generic AllIcons.General.User silhouette.
+        placeholderFactory = { size -> IconUtil.resizeSquared(CockpitIcons.defaultAvatar, size) },
     )
 
     /**

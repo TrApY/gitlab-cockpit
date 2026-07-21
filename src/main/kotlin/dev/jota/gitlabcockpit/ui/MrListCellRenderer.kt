@@ -1,6 +1,5 @@
 package dev.jota.gitlabcockpit.ui
 
-import com.intellij.icons.AllIcons
 import com.intellij.openapi.project.Project
 import com.intellij.ui.SimpleColoredComponent
 import com.intellij.ui.SimpleTextAttributes
@@ -58,8 +57,14 @@ class MrListCellRenderer(
         ipad = JBUI.insets(0)
     }
 
-    /** The `sourceBranch` chip: a muted rounded pill painted on [line2Row] (GLC-37). */
-    private val sourceChip = BranchChipLabel()
+    /**
+     * The `sourceBranch` chip: a muted rounded pill painted on [line2Row] (GLC-37), prefixed with the
+     * collab branch glyph (GLC-38 / iter3 A3) so it reads as a branch at a glance.
+     */
+    private val sourceChip = BranchChipLabel().apply {
+        icon = CockpitIcons.branchChip
+        iconTextGap = JBUI.scale(2)
+    }
 
     /** The `targetBranch` chip. */
     private val targetChip = BranchChipLabel()
@@ -94,6 +99,11 @@ class MrListCellRenderer(
 
     private val statusLabel = JLabel()
 
+    /** Conflicts indicator (GLC-38 / iter3 A3): the collab non-mergeable glyph, shown only on conflict. */
+    private val conflictsLabel = JLabel(CockpitIcons.nonMergeable).apply {
+        toolTipText = CockpitBundle.message("toolwindow.mr.conflicts")
+    }
+
     private val commentsLabel = JLabel().apply { iconTextGap = JBUI.scale(2) }
 
     /** The author's circular avatar: its own fixed element, one [RIGHT_GAP] gap from the comments badge. */
@@ -118,6 +128,7 @@ class MrListCellRenderer(
      */
     private val rightColumn = JPanel(FlowLayout(FlowLayout.RIGHT, JBUI.scale(RIGHT_GAP), 0)).apply {
         isOpaque = false
+        add(conflictsLabel)
         add(statusLabel)
         add(commentsLabel)
         add(authorLabel)
@@ -183,13 +194,16 @@ class MrListCellRenderer(
         targetChip.foreground = muted
         targetChip.text = presentation.targetBranch
 
+        conflictsLabel.isVisible = value.hasConflicts
+
         val status = enrichment.statusOf(value)
         statusLabel.icon = status?.let { CockpitIcons.status(it) }
         statusLabel.isVisible = statusLabel.icon != null
 
         val notes = value.userNotesCount ?: 0
         if (notes > 0) {
-            commentsLabel.icon = AllIcons.Toolwindows.ToolWindowMessages
+            // The collab speech-balloon badge with the count (GLC-38 / iter3 A3, G18).
+            commentsLabel.icon = CockpitIcons.commentBadge
             commentsLabel.text = notes.toString()
             commentsLabel.foreground = muted
             commentsLabel.isVisible = true

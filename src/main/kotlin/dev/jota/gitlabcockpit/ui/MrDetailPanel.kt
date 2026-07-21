@@ -6,10 +6,12 @@ import com.intellij.notification.NotificationGroupManager
 import com.intellij.notification.NotificationType
 import com.intellij.openapi.Disposable
 import com.intellij.openapi.actionSystem.ActionManager
+import com.intellij.openapi.actionSystem.ActionToolbar
 import com.intellij.openapi.actionSystem.ActionUpdateThread
 import com.intellij.openapi.actionSystem.AnAction
 import com.intellij.openapi.actionSystem.AnActionEvent
 import com.intellij.openapi.actionSystem.DefaultActionGroup
+import com.intellij.openapi.actionSystem.Toggleable
 import com.intellij.openapi.application.EDT
 import com.intellij.openapi.ide.CopyPasteManager
 import com.intellij.openapi.project.Project
@@ -21,6 +23,7 @@ import com.intellij.ui.CollectionListModel
 import com.intellij.ui.ColorUtil
 import com.intellij.ui.DocumentAdapter
 import com.intellij.ui.DoubleClickListener
+import com.intellij.ui.JBColor
 import com.intellij.ui.OnePixelSplitter
 import com.intellij.ui.SearchTextField
 import com.intellij.ui.components.ActionLink
@@ -50,6 +53,7 @@ import dev.jota.gitlabcockpit.core.COCKPIT_NOTIFICATION_GROUP
 import dev.jota.gitlabcockpit.core.Closing
 import dev.jota.gitlabcockpit.core.CockpitProjectService
 import dev.jota.gitlabcockpit.core.CommentThread
+import dev.jota.gitlabcockpit.core.MarkdownMarker
 import dev.jota.gitlabcockpit.core.MergeAction
 import dev.jota.gitlabcockpit.core.MergeLinePresentation
 import dev.jota.gitlabcockpit.core.MergeLineState
@@ -57,7 +61,6 @@ import dev.jota.gitlabcockpit.core.MrHeaderPresentation
 import dev.jota.gitlabcockpit.core.MrParticipant
 import dev.jota.gitlabcockpit.core.MrRef
 import dev.jota.gitlabcockpit.core.MrRole
-import dev.jota.gitlabcockpit.core.ReviewerSelectionModel
 import dev.jota.gitlabcockpit.core.TimelineFilter
 import dev.jota.gitlabcockpit.core.TimelineItem
 import dev.jota.gitlabcockpit.core.approvalsHealth
@@ -70,6 +73,7 @@ import dev.jota.gitlabcockpit.core.mrHeaderPresentation
 import dev.jota.gitlabcockpit.core.mrParticipants
 import dev.jota.gitlabcockpit.core.projectWebUrlOf
 import dev.jota.gitlabcockpit.core.threadAnchorLabel
+import dev.jota.gitlabcockpit.core.wrapMarkdown
 import dev.jota.gitlabcockpit.settings.GitLabCockpitSettings
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -83,37 +87,42 @@ import java.awt.Color
 import java.awt.Cursor
 import java.awt.FlowLayout
 import java.awt.Font
+import java.awt.Graphics
+import java.awt.Graphics2D
 import java.awt.GridBagLayout
+import java.awt.RenderingHints
 import java.awt.datatransfer.StringSelection
 import java.awt.event.MouseAdapter
 import java.awt.event.MouseEvent
+import java.awt.geom.RoundRectangle2D
+import javax.swing.Action
 import javax.swing.JButton
 import javax.swing.JComponent
 import javax.swing.JPanel
+import javax.swing.JSeparator
 import javax.swing.ListSelectionModel
+import javax.swing.SwingConstants
 import javax.swing.event.DocumentEvent
 
 /**
  * The detail pane shown below the MR list. Renders one merge request inside a two-tab layout:
  *
- * - **Overview**: a native "Info"-style header — a people row of circular avatars (author, assignees,
- *   reviewers) above the title (+ a DRAFT badge), a `source → target` branch line, a muted
- *   `!iid · created … · by …` meta line (with a `· merged/closed …` suffix once the MR is), the head
- *   pipeline's status (clickable, jumps to the Pipelines tab), a merge-readiness line ("Ready to
- *   merge" / "Merge blocked: …") with the "Approved by: …" line below it, and an action row of
- *   platform [ActionLink]s (Approve/Revoke, Merge, Open in browser, Watch/Unwatch, Edit
- *   reviewers/assignee) plus the edit-title/description button — followed by the markdown description.
+ * - **Info**: a native header — a people row of circular avatars (author, assignees, reviewers) above
+ *   the title (+ a DRAFT badge), a `source → target` branch line, a muted `!iid · created … · by …`
+ *   meta line (with a `· merged/closed …` suffix once the MR is), the head pipeline's status
+ *   (clickable, jumps to the Pipelines card), a two-tone merge-readiness line ("Ready to merge" /
+ *   "Merge blocked: <reason>" with a contextual Merge / Set auto-merge link) and an "Approved by: …"
+ *   line, then the markdown description. A single pencil (top-right) opens the unified Edit dialog
+ *   (title, description, reviewers, assignee); every other MR action lives on the vertical toolbar.
  * - **Events & Discussions**: a chronological timeline (GLC-34) merging the MR's GitLab system notes
- *   ("added N commits", "approved this merge request", …) — rendered as compact one-line event blocks
- *   with a type icon — and its user discussion threads (each thread's first note at root level,
- *   replies indented, with "Resolved" and diff-anchor tags and a `Reply` link). A toolbar filters
- *   the timeline (All / Events / Discussions) and toggles the sort order (session-only, not
- *   persisted); a text area's button posts a new general comment or, in reply mode (entered from a
- *   thread's Reply link), a reply to that thread. The timeline loads lazily the first time the tab is
- *   shown for each MR and again on every detail refresh; the tab title carries the human-note count.
+ *   and its user discussion threads, rendered as **native cards** (GLC-38 / iter3 B) — rounded,
+ *   subtly-shaded [RoundedCardPanel]s with a type icon per event and per-thread Reply / Resolve
+ *   [ActionLink]s. A toolbar filters (All / Events / Discussions), toggles the sort order and offers a
+ *   "+" that opens the [ComposerDialog] popup for a new general comment; a thread's Reply link opens the
+ *   same popup in reply mode. The timeline loads lazily the first time the tab is shown for each MR and
+ *   again on every detail refresh; the tab title carries the human-note count.
  *
- * Editing is done through modal dialogs; every network call (detail load, member load, update,
- * approvals, notes, approve/unapprove, comment) runs on the service's coroutine scope and only
+ * Editing is done through dialogs; every network call runs on the service's coroutine scope and only
  * touches the EDT to render. Stale results are dropped by re-checking [currentRef] on the EDT.
  *
  * @param onListReloadRequested called after a successful edit or approval change so the parent can
@@ -143,17 +152,17 @@ class MrDetailPanel(
     private var notesLoadedForRef: MrRef? = null
 
     /**
-     * Bumped on every notes (re)load and MR switch. The async upload re-apply carries the epoch it was
-     * started under and is dropped once the epoch moves on, so a slow image download from a superseded
-     * load never clobbers freshly rendered notes.
+     * Bumped on every notes (re)load and MR switch. Each card's async upload re-apply carries the epoch
+     * it was started under and is dropped once the epoch moves on, so a slow image download from a
+     * superseded load never clobbers freshly rendered cards.
      */
     private var notesEpoch: Int = 0
 
-    /** Recreated by [buildHeader]; updated by the async approvals load. */
-    private var approvalsLabel: JBLabel? = null
-    private var approvalLink: ActionLink? = null
+    /** Recreated by [buildHeader]; the async approvals load fills them (two-tone: label + muted detail). */
+    private var approvalsPrefixLabel: JBLabel? = null
+    private var approvalsDetailLabel: JBLabel? = null
 
-    /** Recreated by [buildHeader]; its state is fully derived from the MR (no async load needed). */
+    /** The contextual Merge / Set auto-merge link on the merge-readiness line; disabled while merging. */
     private var mergeLink: ActionLink? = null
 
     private val descriptionPane = CockpitHtml.createHtmlPane()
@@ -164,14 +173,11 @@ class MrDetailPanel(
     /** Shared circular-avatar cache; feeds the header people row (author, assignees, reviewers). */
     private val avatarCache = AvatarCache.getInstance()
 
-    private val notesPane = CockpitHtml.createHtmlPane { handleNotesLink(it) }
-    private val notesScroll = JBScrollPane(notesPane)
-    private val commentArea = JBTextArea(3, 0).apply {
-        lineWrap = true
-        wrapStyleWord = true
-        emptyText.text = CockpitBundle.message("detail.comment.placeholder")
+    /** The timeline's native card stack (GLC-38 / iter3 B); one [RoundedCardPanel] per event/thread. */
+    private val timelineContainer = JPanel(VerticalLayout(JBUI.scale(TIMELINE_CARD_GAP))).apply {
+        border = JBUI.Borders.empty(4, 8)
     }
-    private val commentButton = JButton(CockpitBundle.message("detail.comment.button"))
+    private val notesScroll = JBScrollPane(timelineContainer)
 
     /** The threads currently rendered in the timeline; used to resolve a Reply link to its author. */
     private var loadedThreads: List<CommentThread> = emptyList()
@@ -208,21 +214,13 @@ class MrDetailPanel(
         }
     }
 
-    /** The discussion id being replied to, or null in the general-comment mode. */
-    private var replyingToDiscussionId: String? = null
-
-    /** Label of the reply-context row ("Replying to <author>"), filled by [enterReplyMode]. */
-    private val replyContextLabel = JBLabel()
-
-    /** Row shown above the comment box while replying to a thread; hidden in general-comment mode. */
-    private val replyContextPanel = JPanel(FlowLayout(FlowLayout.LEFT, JBUI.scale(6), 0)).apply {
-        isOpaque = false
-        isVisible = false
-        add(replyContextLabel)
-        add(ActionLink(CockpitBundle.message("detail.comment.reply.cancel")) { exitReplyMode() })
+    /** Toolbar "+" that opens the composer popup for a new general comment (GLC-38 / iter3 F13). */
+    private val addCommentButton = JButton(AllIcons.General.Add).apply {
+        toolTipText = CockpitBundle.message("detail.composer.add.tooltip")
+        addActionListener { openComposer(replyToDiscussionId = null) }
     }
 
-    /** Banner shown atop the Comments tab when the MR has pending draft notes; hidden otherwise. */
+    /** Banner shown atop the timeline when the MR has pending draft notes; hidden otherwise. */
     private val draftBanner = JBLabel().apply {
         icon = AllIcons.General.Balloon
         border = JBUI.Borders.empty(4, 8)
@@ -230,11 +228,25 @@ class MrDetailPanel(
     }
     private val commentsPanel = JPanel(BorderLayout())
 
-    /** Whether the current user has approved this MR; kept for the toolbar Approve/Revoke toggle. */
+    /** Whether the current user has approved this MR; drives the toolbar Approve/Revoke toggle. */
     private var approvedByMe: Boolean = false
 
     /** The right-hand "main" card: a small tabbed pane with Info and Events & Discussions. */
     private val mainTabbedPane = JBTabbedPane()
+
+    /**
+     * The Events & Discussions tab's own title component (GLC-38 / iter3 E). A plain [JBLabel] is used
+     * as the tab component (via `setTabComponentAt`) so the literal `&` in "Events & Discussions" is
+     * painted verbatim — a mnemonic-processing tab title would otherwise swallow it. A click selects the
+     * tab (a bare label does not forward clicks to the tabbed pane on its own).
+     */
+    private val timelineTabLabel = JBLabel(CockpitBundle.message("detail.tab.timeline")).apply {
+        addMouseListener(object : MouseAdapter() {
+            override fun mouseClicked(e: MouseEvent) {
+                mainTabbedPane.selectedIndex = TIMELINE_TAB_INDEX
+            }
+        })
+    }
 
     /** Swaps the right side between the "main" card and the drill-in "pipelines" card. */
     private val cardLayout = CardLayout()
@@ -246,6 +258,9 @@ class MrDetailPanel(
     /** The whole MR view (WEST toolbar + CENTER splitter); swapped in for the placeholder in [showMr]. */
     private val contentPanel = JPanel(BorderLayout())
 
+    /** The MR tab's vertical action toolbar; kept so approve/watch toggles can refresh its state. */
+    private var mrToolbar: ActionToolbar? = null
+
     private val pipelinesPanel = PipelinesPanel(project, service)
 
     private val changesPanel = ChangesPanel(
@@ -256,21 +271,21 @@ class MrDetailPanel(
     )
 
     init {
-        // Info card content: the header + the markdown description.
+        // Info card content: the header (+ top-right edit pencil) + the markdown description.
         overviewPanel.add(headerContainer, BorderLayout.NORTH)
         overviewPanel.add(descriptionScroll, BorderLayout.CENTER)
 
-        // Events & Discussions card content: filter/sort toolbar + draft banner, timeline, comment box.
+        // Events & Discussions card: filter/sort/+ toolbar + draft banner, then the native card stack.
         val commentsNorth = JPanel(BorderLayout()).apply { isOpaque = false }
         commentsNorth.add(buildTimelineToolbar(), BorderLayout.NORTH)
         commentsNorth.add(draftBanner, BorderLayout.SOUTH)
         commentsPanel.add(commentsNorth, BorderLayout.NORTH)
         commentsPanel.add(notesScroll, BorderLayout.CENTER)
-        commentsPanel.add(buildCommentInput(), BorderLayout.SOUTH)
 
         // The "main" card: a small tabbed pane with Info | Events & Discussions.
         mainTabbedPane.addTab(CockpitBundle.message("detail.tab.overview"), overviewPanel)
         mainTabbedPane.addTab(CockpitBundle.message("detail.tab.timeline"), commentsPanel)
+        mainTabbedPane.setTabComponentAt(TIMELINE_TAB_INDEX, timelineTabLabel)
         mainTabbedPane.addChangeListener {
             if (mainTabbedPane.selectedIndex == TIMELINE_TAB_INDEX) {
                 val ref = currentRef
@@ -291,11 +306,18 @@ class MrDetailPanel(
         // Left: the changes tree (+ counter, + pending review). Right: the cards.
         splitter.firstComponent = changesPanel
         splitter.secondComponent = rightCards
+        // GLC-38 / iter3 D — root cause: OnePixelSplitter is born with myHonorMinimumSize = true, so its
+        // divider is clamped to keep both sides above their minimum width. The right side is a CardLayout
+        // whose minimum is the MAX over ALL cards (java.awt.CardLayout aggregates every child, even the
+        // hidden ones). Once the Pipelines card is shown and its combo/tree/stage-strip get populated,
+        // that card's minimum width balloons, so the CardLayout's aggregate minimum (read even while the
+        // main card is visible) balloons too and the splitter freezes the divider — the "wide dead band"
+        // JoTa saw, undraggable after entering Pipelines. Ignoring component minimums makes the divider
+        // freely draggable in every card and after Back, while the persisted proportion still applies.
+        splitter.setHonorComponentsMinimumSize(false)
 
         contentPanel.add(buildToolbar(), BorderLayout.WEST)
         contentPanel.add(splitter, BorderLayout.CENTER)
-
-        commentButton.addActionListener { onSubmitComment() }
 
         showPlaceholder()
     }
@@ -312,15 +334,16 @@ class MrDetailPanel(
     // --- Action toolbar (WEST) ----------------------------------------------------------------
 
     /**
-     * The MR tab's single vertical action toolbar (GLC-37). The MR-level actions come first —
-     * Approve/Revoke, Request changes, Refresh, then Close / Copy link / Open in browser — followed by
-     * the changed-file tree actions folded in from [ChangesPanel.treeActions]. The [splitter] is the
-     * toolbar's target component; each action's own [AnAction.update] drives its enabled state.
+     * The MR tab's single vertical action toolbar (GLC-37 / iter3 A4, G20). The MR-level actions come
+     * first — Approve/Revoke, Request changes, Watch/Unwatch, Refresh, then Close / Copy link / Open in
+     * browser — followed by the changed-file tree actions folded in from [ChangesPanel.treeActions]. The
+     * [splitter] is the toolbar's target component; each action's own [AnAction.update] drives its state.
      */
     private fun buildToolbar(): JComponent {
         val group = DefaultActionGroup().apply {
             add(approveAction())
             add(requestChangesAction())
+            add(watchAction())
             add(refreshAction())
             addSeparator()
             add(closeAction())
@@ -331,13 +354,14 @@ class MrDetailPanel(
         }
         val toolbar = ActionManager.getInstance().createActionToolbar(MR_TOOLBAR_PLACE, group, false)
         toolbar.targetComponent = splitter
+        mrToolbar = toolbar
         return toolbar.component
     }
 
     /**
-     * Approve / Revoke toggle. Reuses the header's approval logic ([onToggleApproval]) and reflects the
-     * current [approvedByMe] state: a plain check ([AllIcons.Actions.Checked]) to approve, a green tick
-     * ([AllIcons.RunConfigurations.TestState.Green2]) with a "Revoke approval" tooltip once approved.
+     * Approve / Revoke toggle (iter3 A4 / ADENDA 2). Reuses [onToggleApproval] and reflects the current
+     * [approvedByMe] state with the new-UI circled green check ([AllIcons.Status.Success]): pressed
+     * ([Toggleable] SELECTED) with a "Revoke approval" tooltip once approved, unpressed to approve.
      * Disabled until the current user and MR are known.
      */
     private fun approveAction(): AnAction = object : AnAction() {
@@ -345,13 +369,11 @@ class MrDetailPanel(
 
         override fun update(e: AnActionEvent) {
             e.presentation.isEnabled = currentRef != null && service.currentUser != null
-            if (approvedByMe) {
-                e.presentation.icon = AllIcons.RunConfigurations.TestState.Green2
-                e.presentation.text = CockpitBundle.message("detail.revokeApproval")
-            } else {
-                e.presentation.icon = AllIcons.Actions.Checked
-                e.presentation.text = CockpitBundle.message("detail.approve")
-            }
+            e.presentation.icon = AllIcons.Status.Success
+            e.presentation.text = CockpitBundle.message(
+                if (approvedByMe) "detail.revokeApproval" else "detail.approve",
+            )
+            Toggleable.setSelected(e.presentation, approvedByMe)
         }
 
         override fun actionPerformed(e: AnActionEvent) {
@@ -361,15 +383,15 @@ class MrDetailPanel(
     }
 
     /**
-     * Request changes. GitLab has no native "request changes" review state, so this is a convenience:
-     * if the MR is currently approved by me it first revokes that approval (an approval and a
-     * change-request are contradictory), then jumps to the Events & Discussions tab and focuses the
-     * comment box so the reviewer can spell out what they want changed.
+     * Request changes (iter3 A4 / ADENDA 2, icon [AllIcons.General.Error]). GitLab has no native "request
+     * changes" review state, so this is a convenience: if the MR is currently approved by me it first
+     * revokes that approval (an approval and a change-request are contradictory), then jumps to the
+     * Events & Discussions tab and opens the composer popup so the reviewer can spell out the changes.
      */
     private fun requestChangesAction(): AnAction = object : AnAction(
         CockpitBundle.message("detail.toolbar.requestChanges"),
         null,
-        AllIcons.Actions.SuggestedRefactoringBulb,
+        AllIcons.General.Error,
     ) {
         override fun getActionUpdateThread(): ActionUpdateThread = ActionUpdateThread.EDT
 
@@ -382,7 +404,32 @@ class MrDetailPanel(
             if (approvedByMe) onToggleApproval(ref, alreadyApproved = true)
             showMainCard()
             mainTabbedPane.selectedIndex = TIMELINE_TAB_INDEX
-            commentArea.requestFocusInWindow()
+            openComposer(replyToDiscussionId = null)
+        }
+    }
+
+    /**
+     * Watch / Unwatch toggle (GLC-28 moved to the toolbar in iter3 G20). Clicking flips this MR's
+     * membership of the project's watch list — a purely local, synchronous persistence (no network) — so
+     * a watched MR joins the notification scope even outside the user's role scope. An eye icon
+     * ([AllIcons.Actions.Show]) reads pressed ([Toggleable] SELECTED) while watched.
+     */
+    private fun watchAction(): AnAction = object : AnAction() {
+        override fun getActionUpdateThread(): ActionUpdateThread = ActionUpdateThread.EDT
+
+        override fun update(e: AnActionEvent) {
+            val ref = currentRef
+            e.presentation.isEnabled = ref != null
+            val watched = ref != null && service.isWatched(ref)
+            e.presentation.icon = AllIcons.Actions.Show
+            e.presentation.text = CockpitBundle.message(if (watched) "detail.unwatch" else "detail.watch")
+            Toggleable.setSelected(e.presentation, watched)
+        }
+
+        override fun actionPerformed(e: AnActionEvent) {
+            val ref = currentRef ?: return
+            service.setWatched(ref, !service.isWatched(ref))
+            mrToolbar?.updateActionsAsync()
         }
     }
 
@@ -404,13 +451,14 @@ class MrDetailPanel(
     }
 
     /**
-     * Close merge request. Enabled only while the MR is open; asks for confirmation, then sends a
-     * `state_event=close` update. On success the detail and the list are refreshed (via [applyUpdate]).
+     * Close merge request (iter3 A4 / ADENDA 2, icon [AllIcons.RunConfigurations.TestError] — the circled
+     * red X, since the platform has no `AllIcons.Status.Error` in 2025.2). Enabled only while the MR is
+     * open; asks for confirmation, then sends a `state_event=close` update.
      */
     private fun closeAction(): AnAction = object : AnAction(
         CockpitBundle.message("detail.toolbar.close"),
         null,
-        AllIcons.Actions.Cancel,
+        AllIcons.RunConfigurations.TestError,
     ) {
         override fun getActionUpdateThread(): ActionUpdateThread = ActionUpdateThread.EDT
 
@@ -421,11 +469,11 @@ class MrDetailPanel(
         override fun actionPerformed(e: AnActionEvent) = onCloseMr()
     }
 
-    /** Copies the MR's web URL to the clipboard and confirms with a balloon notification. */
+    /** Copies the MR's web URL to the clipboard (icon [AllIcons.Ide.Link]) and confirms with a balloon. */
     private fun copyLinkAction(): AnAction = object : AnAction(
         CockpitBundle.message("detail.toolbar.copyLink"),
         null,
-        AllIcons.Actions.Copy,
+        AllIcons.Ide.Link,
     ) {
         override fun getActionUpdateThread(): ActionUpdateThread = ActionUpdateThread.EDT
 
@@ -496,7 +544,6 @@ class MrDetailPanel(
     /** EDT. Kicks off a background detail load for [ref] and renders the result when it arrives. */
     fun loadDetail(ref: MrRef) {
         currentRef = ref
-        commentArea.text = ""
         setSingleMessage(CockpitBundle.message("detail.loading"))
         detailJob?.cancel()
         detailJob = service.coroutineScope.launch {
@@ -519,19 +566,19 @@ class MrDetailPanel(
 
         headerContainer.removeAll()
         headerContainer.add(buildHeader(mr), BorderLayout.CENTER)
+        headerContainer.add(buildEditCorner(mr), BorderLayout.EAST)
         setDescription(mr)
 
         // Reset the approval state until the async approvals load re-derives it (drives the toolbar toggle).
         approvedByMe = false
 
-        // Reset the comment thread for the (possibly refreshed) MR; it reloads lazily / on demand.
+        // Reset the timeline for the (possibly refreshed) MR; it reloads lazily / on demand.
         notesJob?.cancel()
         notesEpoch++
         notesLoadedForRef = null
         loadedThreads = emptyList()
         loadedTimelineNotes = emptyList()
-        exitReplyMode()
-        notesPane.text = CockpitHtml.wrapHtml("")
+        showTimelineMessage(null)
         draftBanner.isVisible = false
         setTimelineTabTitle(null)
 
@@ -553,6 +600,7 @@ class MrDetailPanel(
 
         loadApprovals(ref)
         changesPanel.onTabSelected()
+        mrToolbar?.updateActionsAsync()
         if (mainTabbedPane.selectedIndex == TIMELINE_TAB_INDEX) loadNotes(ref)
     }
 
@@ -613,14 +661,28 @@ class MrDetailPanel(
         // 4. Pipeline line (omitted when the MR has no head pipeline).
         buildPipelineLine(pres.pipelineStatus)?.let { header.add(it) }
 
-        // 5. Merge-readiness line (omitted for a non-open MR) + the "Approved by: …" line below it.
-        buildMergeLine(pres.merge)?.let { header.add(it) }
+        // 5. Merge-readiness line (two-tone + contextual Merge link) + the "Approved by: …" line below.
+        buildMergeLine(mr, pres.merge)?.let { header.add(it) }
         header.add(buildApprovalsLine())
 
-        // 6. Action row.
-        header.add(buildActionsRow(mr))
-
         return header
+    }
+
+    /**
+     * The top-right edit affordance of the Info panel (iter3 G20): a single pencil that opens the unified
+     * [EditMrDialog] (title, description, reviewers, assignee). Every other MR action now lives on the
+     * vertical toolbar, so the header carries no action-link row anymore.
+     */
+    private fun buildEditCorner(mr: GitLabMergeRequest): JComponent {
+        val button = JButton(AllIcons.Actions.Edit).apply {
+            toolTipText = CockpitBundle.message("detail.editTooltip")
+            addActionListener { onEditMr(mr) }
+        }
+        return JPanel(BorderLayout()).apply {
+            isOpaque = false
+            border = JBUI.Borders.empty(6, 4)
+            add(button, BorderLayout.NORTH)
+        }
     }
 
     /**
@@ -709,121 +771,66 @@ class MrDetailPanel(
     }
 
     /**
-     * The merge-readiness line derived from [merge]: "Ready to merge" (success) or "Merge blocked:
-     * <reason>" (warning). Null for a [MergeLineState.HIDDEN] presentation (a non-open MR), so no row
-     * is added.
+     * The merge-readiness line (iter3 G20/G21). Two-tone: "Ready to merge" in [CockpitTheme.success], or
+     * a "Merge blocked:" label in [CockpitTheme.warning] followed by the muted reason. A contextual
+     * [ActionLink] closes the line — "Merge" when the MR is mergeable, "Set auto-merge" while the pipeline
+     * still runs — in the platform link color; other blockers show no link. Null for a
+     * [MergeLineState.HIDDEN] presentation (a non-open MR), so no row is added.
      */
-    private fun buildMergeLine(merge: MergeLinePresentation): JComponent? {
-        val (text, color) = when (merge.state) {
+    private fun buildMergeLine(mr: GitLabMergeRequest, merge: MergeLinePresentation): JComponent? {
+        if (merge.state == MergeLineState.HIDDEN) return null
+        val line = flowLine()
+        when (merge.state) {
             MergeLineState.READY ->
-                CockpitBundle.message("detail.merge.ready") to CockpitTheme.success
+                line.add(JBLabel(CockpitBundle.message("detail.merge.ready")).apply { foreground = CockpitTheme.success })
             MergeLineState.BLOCKED -> {
+                line.add(
+                    JBLabel(CockpitBundle.message("detail.merge.blocked.label")).apply { foreground = CockpitTheme.warning },
+                )
                 val reason = CockpitBundle.message(merge.reasonKey ?: "merge.status.generic")
-                CockpitBundle.message("detail.merge.blocked", reason) to CockpitTheme.warning
+                line.add(JBLabel(reason).apply { foreground = CockpitTheme.muted() })
             }
             MergeLineState.HIDDEN -> return null
         }
-        val line = flowLine()
-        line.add(JBLabel(text).apply { foreground = color })
-        return line
-    }
-
-    /** The "Approved by: …" line (label only); the async approvals load fills and colors it. */
-    private fun buildApprovalsLine(): JComponent {
-        val line = flowLine()
-        val label = JBLabel(
-            CockpitBundle.message("detail.approvedBy", CockpitBundle.message("detail.approvals.loading")),
-        )
-        approvalsLabel = label
-        line.add(label)
+        buildMergeActionLink(mr)?.let { line.add(it) }
         return line
     }
 
     /**
-     * The action row: platform [ActionLink]s for Approve/Revoke, Merge, Open in browser,
-     * Watch/Unwatch and the reviewer/assignee edit dialogs, plus the icon Edit button for the
-     * title/description.
+     * The contextual Merge action link for the merge-readiness line (iter3 G20). Enabled for a mergeable
+     * MR ("Merge") or a "when pipeline succeeds" variant ("Set auto-merge"); null for every other state
+     * (already merged/closed, or blocked by conflicts/approvals/…) so no link is shown.
      */
-    private fun buildActionsRow(mr: GitLabMergeRequest): JComponent {
-        val row = flowLine()
-        row.add(buildApproveLink())
-        row.add(buildMergeLink(mr))
-        row.add(ActionLink(CockpitBundle.message("detail.openInBrowser")) { BrowserUtil.browse(mr.webUrl) })
-        row.add(buildWatchLink(mr))
-        row.add(ActionLink(CockpitBundle.message("detail.editReviewers")) { onEditReviewers(mr) })
-        row.add(ActionLink(CockpitBundle.message("detail.editAssignee")) { onEditAssignee(mr) })
-        row.add(
-            JButton(AllIcons.Actions.Edit).apply {
-                toolTipText = CockpitBundle.message("detail.editTooltip")
-                addActionListener { onEditTitleDescription(mr) }
-            },
-        )
-        return row
-    }
-
-    /**
-     * The Approve/Revoke action link, disabled until the async approvals load re-targets it in
-     * [renderApprovals]. [ActionLink.autoHideOnDisable] is turned off so the disabled link stays
-     * visible (greyed) while loading instead of vanishing.
-     */
-    private fun buildApproveLink(): ActionLink {
-        val link = ActionLink(CockpitBundle.message("detail.approve")).apply {
-            autoHideOnDisable = false
-            isEnabled = false
-        }
-        approvalLink = link
-        return link
-    }
-
-    /**
-     * Builds the Watch / Unwatch toggle (GLC-28) as an [ActionLink]. Clicking flips this MR's
-     * membership of the project's watch list — a purely local, synchronous persistence (no network) —
-     * so a watched MR joins the notification scope even when it is outside the user's role scope. The
-     * label reflects the current state both when the header is built and after each toggle.
-     */
-    private fun buildWatchLink(mr: GitLabMergeRequest): ActionLink {
-        val ref = MrRef(mr.projectId, mr.iid)
-        val link = ActionLink().apply { toolTipText = CockpitBundle.message("detail.watch.tooltip") }
-        fun refreshText() {
-            link.text = CockpitBundle.message(
-                if (service.isWatched(ref)) "detail.unwatch" else "detail.watch",
-            )
-        }
-        refreshText()
-        link.addActionListener {
-            service.setWatched(ref, !service.isWatched(ref))
-            refreshText()
-        }
-        return link
-    }
-
-    /**
-     * Builds the Merge action link for [mr] from [mergeButtonState]: enabled for a mergeable MR (or a
-     * "when pipeline succeeds" variant), otherwise disabled with the blocker reason as a tooltip (no
-     * tooltip when there is no reason, e.g. an already merged/closed MR). [ActionLink.autoHideOnDisable]
-     * is turned off so a blocked Merge link stays visible (greyed) with its tooltip.
-     */
-    private fun buildMergeLink(mr: GitLabMergeRequest): ActionLink {
-        val link = ActionLink(CockpitBundle.message("detail.merge")).apply { autoHideOnDisable = false }
+    private fun buildMergeActionLink(mr: GitLabMergeRequest): ActionLink? {
         val ref = MrRef(mr.projectId, mr.iid)
         val state = mergeButtonState(mr.state, mr.detailedMergeStatus)
-        when (state.action) {
-            MergeAction.MERGE -> {
-                link.isEnabled = true
-                link.addActionListener { onMerge(ref, mr, mergeWhenPipelineSucceeds = false) }
-            }
-            MergeAction.MERGE_WHEN_PIPELINE_SUCCEEDS -> {
-                link.text = CockpitBundle.message("detail.merge.whenPipeline")
-                link.isEnabled = true
-                link.addActionListener { onMerge(ref, mr, mergeWhenPipelineSucceeds = true) }
-            }
-            MergeAction.DISABLED -> {
-                link.isEnabled = false
-                link.toolTipText = state.reasonKey?.let { CockpitBundle.message(it) }
-            }
+        val link = when (state.action) {
+            MergeAction.MERGE ->
+                ActionLink(CockpitBundle.message("detail.merge")) { onMerge(ref, mr, mergeWhenPipelineSucceeds = false) }
+            MergeAction.MERGE_WHEN_PIPELINE_SUCCEEDS ->
+                ActionLink(CockpitBundle.message("detail.merge.setAutoMerge")) {
+                    onMerge(ref, mr, mergeWhenPipelineSucceeds = true)
+                }
+            MergeAction.DISABLED -> return null
         }
         mergeLink = link
         return link
+    }
+
+    /**
+     * The "Approved by: …" line (two labels, iter3 G21): a "Approved by:" prefix colored by approval
+     * health (green/amber) and a muted detail (the approver names, `(none)`, `(N more required)`) that
+     * the async approvals load fills.
+     */
+    private fun buildApprovalsLine(): JComponent {
+        val line = flowLine()
+        val prefix = JBLabel(CockpitBundle.message("detail.approvedBy.label"))
+        val detail = JBLabel(CockpitBundle.message("detail.approvals.loading")).apply { foreground = CockpitTheme.muted() }
+        approvalsPrefixLabel = prefix
+        approvalsDetailLabel = detail
+        line.add(prefix)
+        line.add(detail)
+        return line
     }
 
     /** `success` → `Success`: the head pipeline status with its first letter capitalized. */
@@ -887,18 +894,16 @@ class MrDetailPanel(
                     is GitLabResult.Success -> renderApprovals(result.data)
                     else -> {
                         approvedByMe = false
-                        approvalsLabel?.text = CockpitBundle.message(
-                            "detail.approvedBy",
-                            CockpitBundle.message("detail.approvals.unavailable"),
-                        )
-                        approvalLink?.isEnabled = false
+                        approvalsPrefixLabel?.foreground = UIUtil.getLabelForeground()
+                        approvalsDetailLabel?.text = CockpitBundle.message("detail.approvals.unavailable")
+                        mrToolbar?.updateActionsAsync()
                     }
                 }
             }
         }
     }
 
-    /** EDT. Fills the approvals label and re-targets the Approve/Revoke button for [approvals]. */
+    /** EDT. Fills the two-tone approvals line and re-derives [approvedByMe] for the toolbar toggle. */
     private fun renderApprovals(approvals: GitLabApprovals) {
         val names = approvals.approvedBy.joinToString(", ") { displayName(it.user) }
         val left = approvals.approvalsLeft ?: 0
@@ -906,29 +911,20 @@ class MrDetailPanel(
             append(names.ifEmpty { CockpitBundle.message("detail.approvals.none") })
             if (left > 0) append(" ").append(CockpitBundle.message("detail.approvals.left", left))
         }
-        approvalsLabel?.let { label ->
-            label.text = CockpitBundle.message("detail.approvedBy", display)
-            label.foreground = when (approvalsHealth(approvals)) {
-                ApprovalsHealth.SATISFIED -> CockpitTheme.success
-                ApprovalsHealth.PENDING -> CockpitTheme.warning
-                ApprovalsHealth.UNKNOWN -> UIUtil.getLabelForeground()
-            }
+        approvalsDetailLabel?.text = display
+        approvalsPrefixLabel?.foreground = when (approvalsHealth(approvals)) {
+            ApprovalsHealth.SATISFIED -> CockpitTheme.success
+            ApprovalsHealth.PENDING -> CockpitTheme.warning
+            ApprovalsHealth.UNKNOWN -> UIUtil.getLabelForeground()
         }
 
         val me = service.currentUser
-        val approved = me != null && approvals.approvedBy.any { it.user.id == me.id }
-        approvedByMe = approved
-        val link = approvalLink ?: return
-        link.text = CockpitBundle.message(if (approved) "detail.revokeApproval" else "detail.approve")
-        link.isEnabled = me != null
-        link.actionListeners.toList().forEach { link.removeActionListener(it) }
-        val ref = currentRef
-        if (ref != null) link.addActionListener { onToggleApproval(ref, approved) }
+        approvedByMe = me != null && approvals.approvedBy.any { it.user.id == me.id }
+        mrToolbar?.updateActionsAsync()
     }
 
     /** Approves or revokes in the background, then refreshes approvals and the list on success. */
     private fun onToggleApproval(ref: MrRef, alreadyApproved: Boolean) {
-        approvalLink?.isEnabled = false
         service.coroutineScope.launch {
             val result = if (alreadyApproved) service.unapprove(ref) else service.approve(ref)
             withContext(Dispatchers.EDT) {
@@ -938,27 +934,32 @@ class MrDetailPanel(
                         loadApprovals(ref)
                         onListReloadRequested()
                     }
-                    else -> {
-                        approvalLink?.isEnabled = true
-                        showError("detail.error.approve", result)
-                    }
+                    else -> showError("detail.error.approve", result)
                 }
             }
         }
     }
 
-    // --- Comments -----------------------------------------------------------------------------
+    // --- Timeline (Events & Discussions) ------------------------------------------------------
 
-    private fun buildCommentInput(): JComponent {
-        val panel = JPanel(BorderLayout(0, JBUI.scale(4)))
-        panel.isOpaque = false
-        panel.border = CockpitTheme.panelBorder()
-        panel.add(replyContextPanel, BorderLayout.NORTH)
-        panel.add(JBScrollPane(commentArea), BorderLayout.CENTER)
-        val buttons = JPanel(FlowLayout(FlowLayout.RIGHT, 0, 0)).apply { isOpaque = false }
-        buttons.add(commentButton)
-        panel.add(buttons, BorderLayout.SOUTH)
-        return panel
+    /** The timeline toolbar (iter3 F13): [filter combo][sort toggle] | [+ create general comment]. */
+    private fun buildTimelineToolbar(): JComponent {
+        val toolbar = JPanel(FlowLayout(FlowLayout.LEFT, JBUI.scale(6), JBUI.scale(2))).apply { isOpaque = false }
+        toolbar.add(timelineFilterCombo)
+        toolbar.add(timelineOrderButton)
+        toolbar.add(
+            JSeparator(SwingConstants.VERTICAL).apply { preferredSize = JBUI.size(6, 20) },
+        )
+        toolbar.add(addCommentButton)
+        return toolbar
+    }
+
+    /** Syncs the sort toggle's icon and tooltip with the current [timelineAscending] direction. */
+    private fun refreshOrderButton() {
+        timelineOrderButton.icon = if (timelineAscending) AllIcons.General.ArrowDown else AllIcons.General.ArrowUp
+        timelineOrderButton.toolTipText = CockpitBundle.message(
+            if (timelineAscending) "detail.timeline.order.oldest" else "detail.timeline.order.newest",
+        )
     }
 
     /**
@@ -970,9 +971,7 @@ class MrDetailPanel(
     private fun loadNotes(ref: MrRef) {
         notesLoadedForRef = ref
         notesEpoch++
-        notesPane.text = CockpitHtml.wrapHtml(
-            "<p><i>" + CockpitHtml.escapeHtml(CockpitBundle.message("detail.comment.loading")) + "</i></p>",
-        )
+        showTimelineMessage(CockpitBundle.message("detail.comment.loading"))
         setTimelineTabTitle(null)
         notesJob?.cancel()
         notesJob = service.coroutineScope.launch {
@@ -994,35 +993,12 @@ class MrDetailPanel(
                         notesLoadedForRef = null
                         loadedThreads = emptyList()
                         loadedTimelineNotes = emptyList()
-                        notesPane.text = CockpitHtml.wrapHtml(
-                            "<p><i>" +
-                                CockpitHtml.escapeHtml(
-                                    CockpitBundle.message("detail.error.notes", describe(discussionsResult)),
-                                ) +
-                                "</i></p>",
-                        )
+                        showTimelineMessage(CockpitBundle.message("detail.error.notes", describe(discussionsResult)))
                         setTimelineTabTitle(null)
                     }
                 }
             }
         }
-    }
-
-    /** The timeline toolbar: a "Show" filter combo (All / Events / Discussions) and the sort toggle. */
-    private fun buildTimelineToolbar(): JComponent {
-        val toolbar = JPanel(FlowLayout(FlowLayout.LEFT, JBUI.scale(6), JBUI.scale(2))).apply { isOpaque = false }
-        toolbar.add(JBLabel(CockpitBundle.message("detail.timeline.filter.tooltip")))
-        toolbar.add(timelineFilterCombo)
-        toolbar.add(timelineOrderButton)
-        return toolbar
-    }
-
-    /** Syncs the sort toggle's icon and tooltip with the current [timelineAscending] direction. */
-    private fun refreshOrderButton() {
-        timelineOrderButton.icon = if (timelineAscending) AllIcons.General.ArrowDown else AllIcons.General.ArrowUp
-        timelineOrderButton.toolTipText = CockpitBundle.message(
-            if (timelineAscending) "detail.timeline.order.oldest" else "detail.timeline.order.newest",
-        )
     }
 
     /** EDT. Shows or hides the pending-drafts banner based on [count]. */
@@ -1038,7 +1014,7 @@ class MrDetailPanel(
     /**
      * Called by the Changes tab after a successful "Submit review": the published drafts are now
      * regular notes and the banner is stale. Clears the banner and invalidates the notes so the
-     * Comments tab re-fetches (immediately if it is the visible tab, otherwise lazily on next show).
+     * timeline re-fetches (immediately if it is the visible tab, otherwise lazily on next show).
      */
     private fun onReviewSubmitted() {
         draftBanner.isVisible = false
@@ -1047,67 +1023,160 @@ class MrDetailPanel(
         if (mainTabbedPane.selectedIndex == TIMELINE_TAB_INDEX) loadNotes(ref)
     }
 
+    /** EDT. Clears the timeline and shows a single muted [text] (loading/error/empty), or nothing if null. */
+    private fun showTimelineMessage(text: String?) {
+        timelineContainer.removeAll()
+        if (text != null) {
+            timelineContainer.add(
+                JBLabel(text).apply { foreground = UIUtil.getContextHelpForeground() },
+            )
+        }
+        timelineContainer.revalidate()
+        timelineContainer.repaint()
+    }
+
     /**
-     * EDT. Renders the timeline for the given user [threads] and the already-loaded
-     * [loadedTimelineNotes] (its event source) as one themed HTML document, honoring the current
-     * [timelineFilter] and [timelineAscending] toggle, and updates the tab counter (total number of
-     * human notes across every thread). System notes render as compact event lines (no Reply); each
-     * discussion thread renders exactly as before (root note, indented replies, resolved/anchor tags
-     * and its `Reply` link).
+     * EDT. Rebuilds the native card stack for the given user [threads] and the already-loaded
+     * [loadedTimelineNotes] (its event source), honoring the current [timelineFilter] and
+     * [timelineAscending] toggle, and updates the tab counter (total number of human notes). System
+     * notes render as compact [buildEventCard] rows; discussion threads render as [buildDiscussionCard]s.
      */
     private fun renderTimeline(threads: List<CommentThread>) {
         loadedThreads = threads
         val noteCount = threads.sumOf { it.notes.size }
         val items = buildTimeline(loadedTimelineNotes, threads, timelineFilter, timelineAscending)
+        timelineContainer.removeAll()
         if (items.isEmpty()) {
-            notesPane.text = CockpitHtml.wrapHtml(
-                "<p><i>" + CockpitHtml.escapeHtml(CockpitBundle.message("detail.comment.empty")) + "</i></p>",
+            timelineContainer.add(
+                JBLabel(CockpitBundle.message("detail.comment.empty")).apply {
+                    foreground = UIUtil.getContextHelpForeground()
+                },
             )
-            notesPane.caretPosition = 0
-            setTimelineTabTitle(noteCount)
-            return
-        }
-        val metaColor = ColorUtil.toHtmlColor(UIUtil.getContextHelpForeground())
-        val cardColor = ColorUtil.toHtmlColor(CockpitTheme.cardBackground())
-        val body = buildString {
-            items.forEachIndexed { index, item ->
-                if (index > 0) append(CARD_SPACER)
-                when (item) {
-                    is TimelineItem.EventItem -> appendEvent(item.note, metaColor, cardColor)
-                    is TimelineItem.DiscussionItem -> appendThread(item.thread, metaColor, cardColor)
+        } else {
+            for (item in items) {
+                val card = when (item) {
+                    is TimelineItem.EventItem -> buildEventCard(item.note)
+                    is TimelineItem.DiscussionItem -> buildDiscussionCard(item.thread)
                 }
+                timelineContainer.add(card)
             }
         }
+        timelineContainer.revalidate()
+        timelineContainer.repaint()
+        notesScroll.verticalScrollBar.value = 0
+        setTimelineTabTitle(noteCount)
+    }
+
+    /**
+     * A compact event card (iter3 B6): the event's type icon, then the author (bold) and the inlined,
+     * one-line markdown body (links preserved via a mini [CockpitHtml] pane), with the muted relative
+     * date on the right.
+     */
+    private fun buildEventCard(note: GitLabNote): JComponent {
+        val card = RoundedCardPanel(BorderLayout(JBUI.scale(6), 0))
+
+        val left = JPanel(BorderLayout(JBUI.scale(6), 0)).apply { isOpaque = false }
+        left.add(JBLabel(CockpitIcons.event(eventIconKey(note.body))), BorderLayout.WEST)
+        val bodyPane = CockpitHtml.createHtmlPane().apply { border = JBUI.Borders.empty() }
+        bodyPane.text = CockpitHtml.wrapHtml(
+            "<b>" + CockpitHtml.escapeHtml(displayName(note.author)) + "</b> " + inlineMarkdown(note.body),
+        )
+        bodyPane.caretPosition = 0
+        left.add(bodyPane, BorderLayout.CENTER)
+
+        card.add(left, BorderLayout.CENTER)
+        card.add(dateLabel(note.createdAt), BorderLayout.EAST)
+        return card
+    }
+
+    /**
+     * A discussion card (iter3 B7): a header row with the root author (bold), a `Resolved` tag and a
+     * `file:line` jump link (when diff-anchored) on the left and the muted date on the right; a per-card
+     * [CockpitHtml] body pane with the root markdown and the indented, muted replies; and an actions row
+     * of real [ActionLink]s — Reply (opens the composer in reply mode) and Resolve/Unresolve (for
+     * resolvable threads). The old `cockpit:reply:` / `cockpit:goto:` HTML pseudo-links are gone; normal
+     * links in the body still open in the browser.
+     */
+    private fun buildDiscussionCard(thread: CommentThread): JComponent {
+        val card = RoundedCardPanel(VerticalLayout(JBUI.scale(4)))
+        val first = thread.notes.first()
+
+        // Header: author + tags on the left, date on the right.
+        val header = JPanel(BorderLayout()).apply { isOpaque = false }
+        val headerLeft = JPanel(FlowLayout(FlowLayout.LEFT, JBUI.scale(6), 0)).apply { isOpaque = false }
+        headerLeft.add(JBLabel(displayName(first.author)).apply { font = font.deriveFont(Font.BOLD) })
+        if (thread.resolved) {
+            headerLeft.add(
+                JBLabel("[" + CockpitBundle.message("detail.comment.thread.resolved") + "]").apply {
+                    foreground = CockpitTheme.muted()
+                },
+            )
+        }
+        threadAnchorLabel(thread)?.let { anchor ->
+            headerLeft.add(
+                ActionLink("[$anchor]") { gotoDiscussionInChanges(thread.discussionId) },
+            )
+        }
+        header.add(headerLeft, BorderLayout.WEST)
+        header.add(dateLabel(first.createdAt), BorderLayout.EAST)
+        card.add(header)
+
+        // Body: root markdown + indented muted replies, in one CockpitHtml pane (upload images resolved).
+        val bodyPane = CockpitHtml.createHtmlPane().apply { border = JBUI.Borders.empty() }
         val ref = currentRef
         val epoch = notesEpoch
         applyMarkdownUploads(
-            pane = notesPane,
-            fragment = body,
+            pane = bodyPane,
+            fragment = discussionBodyHtml(thread),
             service = service,
             projectId = ref?.projectId ?: 0L,
             projectWebUrl = currentMr?.let(::projectWebUrlOf),
             isCurrent = { currentRef == ref && notesEpoch == epoch },
         )
-        setTimelineTabTitle(noteCount)
+        card.add(bodyPane)
+
+        // Actions: Reply · Resolve/Unresolve.
+        val actions = JPanel(FlowLayout(FlowLayout.LEFT, JBUI.scale(8), 0)).apply { isOpaque = false }
+        actions.add(
+            ActionLink(CockpitBundle.message("detail.comment.thread.reply")) {
+                openComposer(replyToDiscussionId = thread.discussionId)
+            },
+        )
+        if (thread.notes.any { it.resolvable }) {
+            val key = if (thread.resolved) "diff.thread.unresolve" else "diff.thread.resolve"
+            actions.add(ActionLink(CockpitBundle.message(key)) { onToggleResolve(thread) })
+        }
+        card.add(actions)
+        return card
     }
 
-    /**
-     * Appends one system note as a "card" (GLC-36): a padded, subtly shaded [cardColor] table whose
-     * single row carries — on the left — the event's type icon (mapped from [eventIconKey] to an
-     * [com.intellij.icons.AllIcons] path rendered through the platform HTML `<icon>` tag), the author
-     * in bold and the inlined note body, and — on the right, muted — the relative date. System notes
-     * carry no Reply link.
-     */
-    private fun StringBuilder.appendEvent(note: GitLabNote, metaColor: String, cardColor: String) {
-        append("<table width=\"100%\" cellpadding=\"8\" cellspacing=\"0\" bgcolor=\"").append(cardColor).append("\">")
-        append("<tr><td>")
-        append("<icon src=\"").append(eventIconSrc(eventIconKey(note.body))).append("\">&nbsp;")
-        append("<b>").append(CockpitHtml.escapeHtml(displayName(note.author))).append("</b> ")
-        append(inlineMarkdown(note.body))
-        append("</td><td align=\"right\" valign=\"top\"><span style=\"color:").append(metaColor).append(";\">")
-        append(CockpitHtml.escapeHtml(formatRelative(note.createdAt)))
-        append("</span></td></tr></table>")
+    /** Builds the root-markdown-plus-indented-replies HTML fragment for a discussion card body. */
+    private fun discussionBodyHtml(thread: CommentThread): String {
+        val notes = thread.notes
+        val metaColor = ColorUtil.toHtmlColor(CockpitTheme.muted())
+        return buildString {
+            append(CockpitHtml.stripBody(MarkdownRenderer.toHtml(notes.first().body)))
+            if (notes.size > 1) {
+                append("<blockquote>")
+                for (reply in notes.drop(1)) {
+                    append("<div style=\"color:").append(metaColor).append(";\">")
+                    append(CockpitHtml.escapeHtml(displayName(reply.author)))
+                    append(" &middot; ")
+                    append(CockpitHtml.escapeHtml(formatRelative(reply.createdAt)))
+                    append("</div>")
+                    append(CockpitHtml.stripBody(MarkdownRenderer.toHtml(reply.body)))
+                }
+                append("</blockquote>")
+            }
+        }
     }
+
+    /** A right-aligned, muted relative-date label for a card header. */
+    private fun dateLabel(createdAt: String): JComponent =
+        JBLabel(formatRelative(createdAt)).apply {
+            foreground = CockpitTheme.muted()
+            verticalAlignment = SwingConstants.TOP
+        }
 
     /**
      * Renders a system note [body] as inline HTML: a single-paragraph markdown result is unwrapped
@@ -1123,99 +1192,19 @@ class MrDetailPanel(
         }
     }
 
-    /**
-     * Appends one discussion thread as a "card" (GLC-36): a padded, subtly shaded [cardColor] table.
-     * The top row carries the root author in bold plus the resolved/anchor tags on the left and the
-     * muted relative date on the right; the body row below (same card) holds the root note's markdown,
-     * the indented replies and the `Reply` link.
-     */
-    private fun StringBuilder.appendThread(thread: CommentThread, metaColor: String, cardColor: String) {
-        val notes = thread.notes
-        val first = notes.first()
-        append("<table width=\"100%\" cellpadding=\"8\" cellspacing=\"0\" bgcolor=\"").append(cardColor).append("\">")
-        // Top row: author (bold) + resolved/anchor tags | relative date (right, muted).
-        append("<tr><td><b>").append(CockpitHtml.escapeHtml(displayName(first.author))).append("</b>")
-        if (thread.resolved) {
-            append("&nbsp;&nbsp;[")
-                .append(CockpitHtml.escapeHtml(CockpitBundle.message("detail.comment.thread.resolved")))
-                .append("]")
-        }
-        threadAnchorLabel(thread)?.let { anchor ->
-            append("&nbsp;&nbsp;[<a href=\"").append(GOTO_LINK_PREFIX).append(thread.discussionId).append("\">")
-                .append(CockpitHtml.escapeHtml(anchor)).append("</a>]")
-        }
-        append("</td><td align=\"right\" valign=\"top\"><span style=\"color:").append(metaColor).append(";\">")
-        append(CockpitHtml.escapeHtml(formatRelative(first.createdAt)))
-        append("</span></td></tr>")
-        // Body row (same card): root markdown, indented replies, Reply link.
-        append("<tr><td colspan=\"2\">")
-        append(CockpitHtml.stripBody(MarkdownRenderer.toHtml(first.body)))
-        if (notes.size > 1) {
-            append("<blockquote>")
-            for (reply in notes.drop(1)) {
-                append("<div style=\"color:").append(metaColor).append(";\">")
-                append(CockpitHtml.escapeHtml(displayName(reply.author)))
-                append(" &middot; ")
-                append(CockpitHtml.escapeHtml(formatRelative(reply.createdAt)))
-                append("</div>")
-                append(CockpitHtml.stripBody(MarkdownRenderer.toHtml(reply.body)))
-            }
-            append("</blockquote>")
-        }
-        append("<p><a href=\"").append(REPLY_LINK_PREFIX).append(thread.discussionId).append("\">")
-        append(CockpitHtml.escapeHtml(CockpitBundle.message("detail.comment.thread.reply")))
-        append("</a></p>")
-        append("</td></tr></table>")
-    }
-
-    /**
-     * Posts the comment box's content: a reply to the active thread when in reply mode
-     * ([replyingToDiscussionId] set), otherwise a new general note. On success the box is cleared,
-     * reply mode is left and the thread is reloaded.
-     */
-    private fun onSubmitComment() {
+    /** Toggles a timeline thread's resolution off the EDT, then reloads the timeline on success. */
+    private fun onToggleResolve(thread: CommentThread) {
         val ref = currentRef ?: return
-        val text = commentArea.text.trim()
-        if (text.isEmpty()) return
-        val discussionId = replyingToDiscussionId
-        commentButton.isEnabled = false
         service.coroutineScope.launch {
-            val result: GitLabResult<*> =
-                if (discussionId != null) service.replyToDiscussion(ref, discussionId, text)
-                else service.addNote(ref, text)
+            val result = service.setDiscussionResolved(ref, thread.discussionId, !thread.resolved)
             withContext(Dispatchers.EDT) {
-                commentButton.isEnabled = true
                 if (currentRef != ref) return@withContext
                 when (result) {
-                    is GitLabResult.Success -> {
-                        commentArea.text = ""
-                        exitReplyMode()
-                        loadNotes(ref)
-                    }
+                    is GitLabResult.Success -> loadNotes(ref)
                     else -> showError("detail.error.comment", result)
                 }
             }
         }
-    }
-
-    // --- Reply mode ---------------------------------------------------------------------------
-
-    /**
-     * Notes-pane hyperlink handler. A `cockpit:reply:<id>` link switches the comment box into reply
-     * mode for that thread; a `cockpit:goto:<id>` link (a diff-anchored thread's `[file:line]` tag)
-     * jumps to that thread inside the Changes tab's diff. Both are consumed (return true); any other
-     * href is left to the default browser handling (returns false).
-     */
-    private fun handleNotesLink(href: String): Boolean {
-        if (href.startsWith(REPLY_LINK_PREFIX)) {
-            enterReplyMode(href.removePrefix(REPLY_LINK_PREFIX))
-            return true
-        }
-        if (href.startsWith(GOTO_LINK_PREFIX)) {
-            gotoDiscussionInChanges(href.removePrefix(GOTO_LINK_PREFIX))
-            return true
-        }
-        return false
     }
 
     /**
@@ -1227,72 +1216,124 @@ class MrDetailPanel(
         changesPanel.revealDiscussion(discussionId)
     }
 
-    /** EDT. Switches the shared comment box to reply-to-thread mode for [discussionId]. */
-    private fun enterReplyMode(discussionId: String) {
-        val thread = loadedThreads.firstOrNull { it.discussionId == discussionId } ?: return
-        replyingToDiscussionId = discussionId
-        val author = thread.notes.firstOrNull()?.author?.let(::displayName).orEmpty()
-        replyContextLabel.text = CockpitBundle.message("detail.comment.replyingTo", author)
-        replyContextPanel.isVisible = true
-        commentButton.text = CockpitBundle.message("detail.comment.reply.button")
-        commentArea.emptyText.text = CockpitBundle.message("detail.comment.reply.placeholder")
-        commentArea.requestFocusInWindow()
-        revalidate()
-        repaint()
-    }
+    // --- Composer popup (iter3 F) -------------------------------------------------------------
 
-    /** EDT. Returns the comment box to general-comment mode (banner hidden, button back to Comment). */
-    private fun exitReplyMode() {
-        replyingToDiscussionId = null
-        replyContextPanel.isVisible = false
-        commentButton.text = CockpitBundle.message("detail.comment.button")
-        commentArea.emptyText.text = CockpitBundle.message("detail.comment.placeholder")
-        revalidate()
-        repaint()
+    /**
+     * Opens the non-modal [ComposerDialog] popup. With [replyToDiscussionId] null it composes a new
+     * general comment; otherwise it replies to that thread (its title names the thread's author). The
+     * three exits map to the documented semantics — Submit publishes directly, Submit with "Start
+     * review" or Save Draft creates a draft note — via [submitComposer] / [saveDraftComposer].
+     */
+    private fun openComposer(replyToDiscussionId: String?) {
+        val ref = currentRef ?: return
+        val dialogTitle = if (replyToDiscussionId != null) {
+            val author = loadedThreads.firstOrNull { it.discussionId == replyToDiscussionId }
+                ?.notes?.firstOrNull()?.author?.let(::displayName).orEmpty()
+            CockpitBundle.message("detail.composer.title.reply", author)
+        } else {
+            CockpitBundle.message("detail.composer.title.general")
+        }
+        ComposerDialog(
+            project,
+            dialogTitle,
+            onSubmit = { text, startReview -> submitComposer(ref, replyToDiscussionId, text, startReview) },
+            onSaveDraft = { text -> saveDraftComposer(ref, text) },
+        ).show()
     }
 
     /**
-     * Sets the timeline tab's title with the human-note count. A null (loading/error) or zero count
-     * shows the plain "Events & Discussions" title — the `(0)` suffix is suppressed so an MR with no
-     * comments does not read as "zero".
+     * Submit path of the composer. Without "Start review": publishes directly — a reply to the thread in
+     * reply mode ([replyToDiscussion]), otherwise a new general note ([addNote]). With "Start review":
+     * creates a draft note that begins the review ([createDraftNote]). On success the timeline reloads.
+     */
+    private fun submitComposer(ref: MrRef, discussionId: String?, text: String, startReview: Boolean) {
+        service.coroutineScope.launch {
+            val result: GitLabResult<*> = when {
+                startReview -> service.createDraftNote(ref, text)
+                discussionId != null -> service.replyToDiscussion(ref, discussionId, text)
+                else -> service.addNote(ref, text)
+            }
+            withContext(Dispatchers.EDT) {
+                if (currentRef != ref) return@withContext
+                when (result) {
+                    is GitLabResult.Success -> loadNotes(ref)
+                    else -> showError("detail.error.comment", result)
+                }
+            }
+        }
+    }
+
+    /**
+     * Save-Draft path of the composer: always creates a (general) draft note ([createDraftNote]) — a
+     * reply-mode draft is kept as a general draft since GitLab's draft API this plugin wires has no
+     * threaded-reply draft. On success the timeline reloads (the pending-drafts banner reflects it).
+     */
+    private fun saveDraftComposer(ref: MrRef, text: String) {
+        service.coroutineScope.launch {
+            val result = service.createDraftNote(ref, text)
+            withContext(Dispatchers.EDT) {
+                if (currentRef != ref) return@withContext
+                when (result) {
+                    is GitLabResult.Success -> loadNotes(ref)
+                    else -> showError("detail.error.comment", result)
+                }
+            }
+        }
+    }
+
+    /**
+     * Sets the timeline tab's title (on its plain-label tab component) with the human-note count. A null
+     * (loading/error) or zero count shows the plain "Events & Discussions" title — the `(0)` suffix is
+     * suppressed so an MR with no comments does not read as "zero".
      */
     private fun setTimelineTabTitle(count: Int?) {
-        val title = if (count == null || count == 0) {
+        timelineTabLabel.text = if (count == null || count == 0) {
             CockpitBundle.message("detail.tab.timeline")
         } else {
             CockpitBundle.message("detail.tab.timelineCount", count)
         }
-        mainTabbedPane.setTitleAt(TIMELINE_TAB_INDEX, title)
     }
 
     // --- Edit actions -------------------------------------------------------------------------
 
-    /** No network before opening: title/description are already in [mr]. */
-    private fun onEditTitleDescription(mr: GitLabMergeRequest) {
-        val dialog = EditMrDialog(project, mr.title, mr.description.orEmpty())
+    /**
+     * Opens the unified Edit dialog (iter3 G20): title + description + reviewers/assignee rows. The
+     * reviewer/assignee rows reuse the existing pickers ([EditReviewersDialog] / [EditAssigneeDialog])
+     * as a sub-step; OK applies the staged title, description, reviewers and assignee in one update.
+     */
+    private fun onEditMr(mr: GitLabMergeRequest) {
+        val dialog = EditMrDialog(
+            project,
+            mr,
+            pickReviewers = { current, onPicked ->
+                withMembers(mr.projectId) { members ->
+                    val picker = EditReviewersDialog(project, members, current.map { it.id }.toSet())
+                    if (picker.showAndGet()) {
+                        val ids = picker.selectedIds().toSet()
+                        onPicked(members.filter { it.id in ids })
+                    }
+                }
+            },
+            pickAssignee = { current, onPicked ->
+                withMembers(mr.projectId) { members ->
+                    val picker = EditAssigneeDialog(project, members, current?.id)
+                    if (picker.showAndGet()) {
+                        val id = picker.selectedIds().firstOrNull()
+                        onPicked(members.firstOrNull { it.id == id })
+                    }
+                }
+            },
+        )
         if (dialog.showAndGet()) {
             applyUpdate(
                 MrRef(mr.projectId, mr.iid),
-                MergeRequestUpdate(title = dialog.editedTitle, description = dialog.editedDescription),
+                MergeRequestUpdate(
+                    title = dialog.editedTitle,
+                    description = dialog.editedDescription,
+                    reviewerIds = dialog.reviewerIds,
+                    assigneeIds = dialog.assigneeIds,
+                ),
             )
-        }
-    }
-
-    private fun onEditReviewers(mr: GitLabMergeRequest) {
-        withMembers(mr.projectId) { members ->
-            val dialog = EditReviewersDialog(project, members, mr.reviewers.map { it.id }.toSet())
-            if (dialog.showAndGet()) {
-                applyUpdate(MrRef(mr.projectId, mr.iid), MergeRequestUpdate(reviewerIds = dialog.selectedIds()))
-            }
-        }
-    }
-
-    private fun onEditAssignee(mr: GitLabMergeRequest) {
-        withMembers(mr.projectId) { members ->
-            val dialog = EditAssigneeDialog(project, members, mr.assignees.firstOrNull()?.id)
-            if (dialog.showAndGet()) {
-                applyUpdate(MrRef(mr.projectId, mr.iid), MergeRequestUpdate(assigneeIds = dialog.selectedIds()))
-            }
         }
     }
 
@@ -1361,17 +1402,31 @@ class MrDetailPanel(
 
     // --- Edit dialogs -------------------------------------------------------------------------
 
+    /**
+     * The unified Edit Merge Request dialog (iter3 G20, Kotlin UI DSL v2). Title and description are
+     * edited inline; the Assignees and Reviewers rows show the current people and an "Edit…" button that
+     * opens the existing pickers as a sub-step (via the injected [pickReviewers] / [pickAssignee]),
+     * staging the picked people into [reviewerIds] / [assigneeIds]. Branch/label/draft editing is out of
+     * scope (the plugin's update API does not cover it). OK returns the staged fields to the caller.
+     */
     private class EditMrDialog(
         project: Project,
-        initialTitle: String,
-        initialDescription: String,
+        mr: GitLabMergeRequest,
+        private val pickReviewers: (List<GitLabUser>, (List<GitLabUser>) -> Unit) -> Unit,
+        private val pickAssignee: (GitLabUser?, (GitLabUser?) -> Unit) -> Unit,
     ) : DialogWrapper(project) {
 
-        private val titleField = JBTextField(initialTitle, 40)
-        private val descriptionArea = JBTextArea(initialDescription, 14, 60).apply {
+        private val titleField = JBTextField(mr.title, 40)
+        private val descriptionArea = JBTextArea(mr.description.orEmpty(), 12, 60).apply {
             lineWrap = true
             wrapStyleWord = true
         }
+
+        private var stagedReviewers: List<GitLabUser> = mr.reviewers
+        private var stagedAssignee: GitLabUser? = mr.assignees.firstOrNull()
+
+        private val reviewersLabel = JBLabel(peopleText(stagedReviewers))
+        private val assigneeLabel = JBLabel(personText(stagedAssignee))
 
         init {
             title = CockpitBundle.message("dialog.editMr.title")
@@ -1386,19 +1441,47 @@ class MrDetailPanel(
                 cell(JBScrollPane(descriptionArea).apply { preferredSize = CockpitTheme.EDIT_MR_DIALOG_SIZE })
                     .align(Align.FILL)
             }.resizableRow()
+            row(CockpitBundle.message("dialog.editMr.assigneeLabel")) {
+                cell(assigneeLabel).align(AlignX.FILL)
+                button(CockpitBundle.message("dialog.editMr.editButton")) {
+                    pickAssignee(stagedAssignee) { picked ->
+                        stagedAssignee = picked
+                        assigneeLabel.text = personText(picked)
+                    }
+                }
+            }
+            row(CockpitBundle.message("dialog.editMr.reviewersLabel")) {
+                cell(reviewersLabel).align(AlignX.FILL)
+                button(CockpitBundle.message("dialog.editMr.editButton")) {
+                    pickReviewers(stagedReviewers) { picked ->
+                        stagedReviewers = picked
+                        reviewersLabel.text = peopleText(picked)
+                    }
+                }
+            }
         }
 
         override fun getPreferredFocusedComponent(): JComponent = titleField
 
         val editedTitle: String get() = titleField.text
         val editedDescription: String get() = descriptionArea.text
+        val reviewerIds: List<Long> get() = stagedReviewers.map { it.id }
+        val assigneeIds: List<Long> get() = stagedAssignee?.let { listOf(it.id) } ?: emptyList()
+
+        private fun peopleText(users: List<GitLabUser>): String =
+            users.takeIf { it.isNotEmpty() }?.joinToString(", ") { displayName(it) }
+                ?: CockpitBundle.message("detail.none")
+
+        private fun personText(user: GitLabUser?): String =
+            user?.let { displayName(it) } ?: CockpitBundle.message("detail.none")
     }
 
     /**
      * Reviewer picker with an incremental search field over a [CheckBoxList]. The selection state
-     * lives in a pure [ReviewerSelectionModel], so a member checked while unfiltered stays checked
-     * even after a search hides it — the dialog is glue that repopulates the visible rows on each
-     * keystroke and forwards toggles to the model. [selectedIds] just reads the model.
+     * lives in a pure [dev.jota.gitlabcockpit.core.ReviewerSelectionModel], so a member checked while
+     * unfiltered stays checked even after a search hides it — the dialog is glue that repopulates the
+     * visible rows on each keystroke and forwards toggles to the model. [selectedIds] just reads the
+     * model.
      */
     private class EditReviewersDialog(
         project: Project,
@@ -1406,7 +1489,7 @@ class MrDetailPanel(
         currentReviewerIds: Set<Long>,
     ) : DialogWrapper(project) {
 
-        private val model = ReviewerSelectionModel(members, currentReviewerIds)
+        private val model = dev.jota.gitlabcockpit.core.ReviewerSelectionModel(members, currentReviewerIds)
         private val searchField = SearchTextField()
         private val checkList = CheckBoxList<GitLabUser>()
 
@@ -1449,8 +1532,7 @@ class MrDetailPanel(
      * Assignee picker: an incremental search field over a single-selection [JBList] whose first row
      * is always the fixed "None" option (null), kept visible regardless of the filter. Typing filters
      * the members below it via [filterMembers]; the current assignee is preselected, a double click
-     * confirms, and [selectedIds] returns the picked user's id (empty for "None"). The `selectedIds`
-     * contract is unchanged from the previous combo-based dialog.
+     * confirms, and [selectedIds] returns the picked user's id (empty for "None").
      */
     private class EditAssigneeDialog(
         project: Project,
@@ -1576,6 +1658,131 @@ class MrDetailPanel(
         }
     }
 
+    /**
+     * The non-modal composer popup (iter3 F14). A markdown-format toolbar wraps the textarea selection
+     * (via [wrapMarkdown]); a "Start review" checkbox flips Submit's meaning. The three exits are:
+     *
+     * - **Submit** (no "Start review"): publishes the note/reply directly (the current flow).
+     * - **Submit** with "Start review": creates a draft note that begins the review.
+     * - **Save Draft**: always creates a draft note.
+     * - **Cancel** / Esc: closes without sending.
+     *
+     * The dialog itself is pure UI: [onSubmit] / [onSaveDraft] carry the text (and the "Start review"
+     * flag) to the panel, which performs the network call. The textarea takes focus on open.
+     */
+    private class ComposerDialog(
+        project: Project,
+        dialogTitle: String,
+        private val onSubmit: (text: String, startReview: Boolean) -> Unit,
+        private val onSaveDraft: (text: String) -> Unit,
+    ) : DialogWrapper(project) {
+
+        private val area = JBTextArea(COMPOSER_ROWS, 60).apply {
+            lineWrap = true
+            wrapStyleWord = true
+        }
+        private val startReviewCheck = JBCheckBox(CockpitBundle.message("detail.composer.startReview"))
+
+        init {
+            title = dialogTitle
+            isModal = false
+            init()
+            setOKButtonText(CockpitBundle.message("detail.composer.submit"))
+        }
+
+        override fun createCenterPanel(): JComponent = panel {
+            row { cell(buildFormatToolbar()) }
+            row {
+                cell(JBScrollPane(area)).align(Align.FILL)
+            }.resizableRow()
+            row { cell(startReviewCheck) }
+        }.apply { preferredSize = CockpitTheme.EDIT_MR_DIALOG_SIZE }
+
+        /** The markdown-format toolbar: B / I / S / inline code / code block / quote / link. */
+        private fun buildFormatToolbar(): JComponent {
+            val bar = JPanel(FlowLayout(FlowLayout.LEFT, JBUI.scale(2), 0)).apply { isOpaque = false }
+            bar.add(formatButton("B", "detail.composer.format.bold", MarkdownMarker.BOLD, Font.BOLD))
+            bar.add(formatButton("I", "detail.composer.format.italic", MarkdownMarker.ITALIC, Font.ITALIC))
+            bar.add(formatButton("S", "detail.composer.format.strike", MarkdownMarker.STRIKE, Font.PLAIN))
+            bar.add(formatButton("</>", "detail.composer.format.code", MarkdownMarker.CODE, Font.PLAIN))
+            bar.add(formatButton("{ }", "detail.composer.format.codeBlock", MarkdownMarker.CODE_BLOCK, Font.PLAIN))
+            bar.add(formatButton(">", "detail.composer.format.quote", MarkdownMarker.QUOTE, Font.PLAIN))
+            val linkButton = JButton(AllIcons.Ide.Link).apply {
+                toolTipText = CockpitBundle.message("detail.composer.format.link")
+                addActionListener { applyFormat(MarkdownMarker.LINK) }
+            }
+            bar.add(linkButton)
+            return bar
+        }
+
+        private fun formatButton(text: String, tooltipKey: String, marker: MarkdownMarker, style: Int): JButton =
+            JButton(text).apply {
+                toolTipText = CockpitBundle.message(tooltipKey)
+                if (style != Font.PLAIN) font = font.deriveFont(style)
+                margin = JBUI.emptyInsets()
+                addActionListener { applyFormat(marker) }
+            }
+
+        /** Applies [marker] to the current selection and restores the caret/selection the wrap yields. */
+        private fun applyFormat(marker: MarkdownMarker) {
+            val result = wrapMarkdown(area.text, area.selectionStart, area.selectionEnd, marker)
+            area.text = result.text
+            area.select(result.selectionStart, result.selectionEnd)
+            area.requestFocusInWindow()
+        }
+
+        override fun getPreferredFocusedComponent(): JComponent = area
+
+        override fun createActions(): Array<Action> = arrayOf(okAction, saveDraftAction, cancelAction)
+
+        /** Save Draft: creates a draft note regardless of the "Start review" checkbox. */
+        private val saveDraftAction: Action = object : DialogWrapperAction(
+            CockpitBundle.message("detail.composer.saveDraft"),
+        ) {
+            override fun doAction(e: java.awt.event.ActionEvent?) {
+                val text = area.text.trim()
+                if (text.isEmpty()) return
+                onSaveDraft(text)
+                close(OK_EXIT_CODE)
+            }
+        }
+
+        override fun doOKAction() {
+            val text = area.text.trim()
+            if (text.isEmpty()) return
+            onSubmit(text, startReviewCheck.isSelected)
+            super.doOKAction()
+        }
+    }
+
+    /**
+     * A rounded, subtly-shaded timeline card (iter3 B5). Paints a [CockpitTheme.cardBackground] fill and
+     * a 1px [JBColor.border] outline with a [CARD_ARC] corner radius — the [DiffThreadPanel] visual
+     * pattern, kept independent of it — then lets its children paint on top over the 8px padding.
+     */
+    private class RoundedCardPanel(layout: java.awt.LayoutManager) : JPanel(layout) {
+        init {
+            isOpaque = false
+            border = JBUI.Borders.empty(8)
+        }
+
+        override fun paintComponent(g: Graphics) {
+            val g2 = g.create() as Graphics2D
+            try {
+                g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON)
+                val arc = JBUI.scale(CARD_ARC).toFloat()
+                val rect = RoundRectangle2D.Float(0.5f, 0.5f, width - 1f, height - 1f, arc, arc)
+                g2.color = CockpitTheme.cardBackground()
+                g2.fill(rect)
+                g2.color = JBColor.border()
+                g2.draw(rect)
+            } finally {
+                g2.dispose()
+            }
+            super.paintComponent(g)
+        }
+    }
+
     companion object {
         /** Index of the Events & Discussions tab inside the "main" card's small tabbed pane (Info = 0). */
         private const val TIMELINE_TAB_INDEX = 1
@@ -1598,6 +1805,15 @@ class MrDetailPanel(
         /** Gap (unscaled px) between adjacent avatars in the header people row. */
         private const val AVATAR_ROW_GAP = 4
 
+        /** Vertical gap (unscaled px) between two native timeline cards (iter3 B). */
+        private const val TIMELINE_CARD_GAP = 8
+
+        /** Corner radius (unscaled px) of a timeline card's rounded border/background (iter3 B5). */
+        private const val CARD_ARC = 8
+
+        /** Rows of the composer popup's textarea (iter3 F14). */
+        private const val COMPOSER_ROWS = 8
+
         /** Separator between the Overview date parts (a spaced middle dot U+00B7). */
         private const val DATE_SEPARATOR = " · "
 
@@ -1607,32 +1823,6 @@ class MrDetailPanel(
             TimelineFilter.EVENTS -> CockpitBundle.message("detail.timeline.filter.events")
             TimelineFilter.DISCUSSIONS -> CockpitBundle.message("detail.timeline.filter.discussions")
         }
-
-        /**
-         * Maps an [eventIconKey] to the reflective `AllIcons` path the platform HTML `<icon src>` tag
-         * resolves. Every path is verified to exist in the 2025.2 platform.
-         */
-        private fun eventIconSrc(key: String): String = when (key) {
-            "commit" -> "AllIcons.Vcs.CommitNode"
-            "assign" -> "AllIcons.General.User"
-            "review" -> "AllIcons.General.User"
-            "approve" -> "AllIcons.RunConfigurations.TestState.Green2"
-            "merge" -> "AllIcons.Vcs.Merge"
-            "state" -> "AllIcons.General.Note"
-            else -> "AllIcons.General.Note"
-        }
-
-        /**
-         * Vertical gap rendered between two timeline cards (GLC-36). A short small-font line renders
-         * reliably in Swing's HTMLEditorKit where CSS margins between tables do not.
-         */
-        private const val CARD_SPACER = "<div style=\"font-size:8px\">&nbsp;</div>"
-
-        /** Href scheme of a thread's Reply link; the discussion id follows the prefix. */
-        private const val REPLY_LINK_PREFIX = "cockpit:reply:"
-
-        /** Href scheme of a diff-anchored thread's "jump to diff" link; the discussion id follows. */
-        private const val GOTO_LINK_PREFIX = "cockpit:goto:"
 
         /** For header rows: prefer the display name, fall back to the username. */
         private fun displayName(user: GitLabUser): String = user.name.ifBlank { user.username }

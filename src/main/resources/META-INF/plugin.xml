@@ -43,9 +43,13 @@
             instance="dev.jota.gitlabcockpit.settings.ui.GitLabCockpitConfigurable"
             id="dev.jota.gitlabcockpit.settings"
             displayName="Cockpit for GitLab"/>
+        <!-- canCloseContents lets the per-MR tabs be closed (X, middle click, context menu). Without it
+             the platform disables every close affordance even for a closeable Content (GLC-38 / iter3 C);
+             the list tab stays non-closeable via its own Content.isCloseable=false. -->
         <toolWindow
             id="GitLab Cockpit"
             anchor="right"
+            canCloseContents="true"
             factoryClass="dev.jota.gitlabcockpit.ui.CockpitToolWindowFactory"
             icon="/icons/toolwindow.svg"/>
         <notificationGroup

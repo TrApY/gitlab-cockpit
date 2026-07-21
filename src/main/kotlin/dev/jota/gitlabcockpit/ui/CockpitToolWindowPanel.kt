@@ -34,6 +34,7 @@ import dev.jota.gitlabcockpit.core.MrNotificationsWatcher
 import dev.jota.gitlabcockpit.core.MrRef
 import dev.jota.gitlabcockpit.core.RoleFilter
 import dev.jota.gitlabcockpit.core.filterByTitle
+import dev.jota.gitlabcockpit.core.mrRowTooltip
 import dev.jota.gitlabcockpit.core.mrTabLabel
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -55,6 +56,7 @@ import javax.swing.JPanel
 import javax.swing.JPopupMenu
 import javax.swing.KeyStroke
 import javax.swing.ListSelectionModel
+import javax.swing.ToolTipManager
 
 /**
  * The tool window panel: a filter toolbar over a list of merge requests. All data loading runs on
@@ -175,7 +177,26 @@ class CockpitToolWindowPanel(
     /** Shared row renderer; its [MrListCellRenderer.showProject] is toggled by [render] per loaded mode. */
     private val mrCellRenderer = MrListCellRenderer(project, avatarCache, enrichment) { mrList.repaint() }
 
-    private val mrList: JBList<GitLabMergeRequest> = JBList(listModel).apply {
+    /**
+     * The MR list. A [JBList] subclass so its rows can carry a per-row tooltip (GLC-38 / iter3 G17):
+     * a cell renderer's avatars/badges never fire tooltips on their own, so [getToolTipText] maps the
+     * hovered point to its row and composes the row's people/comment tooltip via [mrRowTooltip].
+     */
+    private val mrList: JBList<GitLabMergeRequest> = object : JBList<GitLabMergeRequest>(listModel) {
+        override fun getToolTipText(event: MouseEvent): String? {
+            val index = locationToIndex(event.point)
+            if (index < 0) return null
+            val bounds = getCellBounds(index, index) ?: return null
+            if (!bounds.contains(event.point)) return null
+            val mr = model.getElementAt(index) ?: return null
+            return mrRowTooltip(
+                mr,
+                authorLabel = CockpitBundle.message("toolwindow.mr.tooltip.author"),
+                reviewersLabel = CockpitBundle.message("toolwindow.mr.tooltip.reviewers"),
+                commentsWord = CockpitBundle.message("toolwindow.mr.tooltip.comments"),
+            )
+        }
+    }.apply {
         selectionMode = ListSelectionModel.SINGLE_SELECTION
         cellRenderer = mrCellRenderer
     }
@@ -248,6 +269,9 @@ class CockpitToolWindowPanel(
         })
 
         installOpenActions()
+
+        // Enable per-row tooltips on the MR list (JList does not register with the manager on its own).
+        ToolTipManager.sharedInstance().registerComponent(mrList)
 
         // Initial load when the tool window is first opened.
         reload(invalidateCache = false)

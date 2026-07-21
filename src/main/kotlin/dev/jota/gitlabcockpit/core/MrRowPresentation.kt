@@ -1,6 +1,7 @@
 package dev.jota.gitlabcockpit.core
 
 import dev.jota.gitlabcockpit.api.GitLabMergeRequest
+import dev.jota.gitlabcockpit.api.GitLabUser
 
 /**
  * How a first-line text run should be painted. The renderer maps each style to a concrete color; the
@@ -84,4 +85,30 @@ fun mrRowPresentation(
         targetBranch = mr.targetBranch,
         reviewerOverflow = overflow,
     )
+}
+
+/**
+ * Composes the tooltip for an MR row's right column (GLC-38 / iter3 G17), describing the people and
+ * comment badge painted there so hovering an otherwise-anonymous avatar tells you who it is:
+ * `Author: <name> · Reviewers: <a>, <b> · <n> comments`. The reviewers and the comment count are
+ * omitted when empty/zero (the author is always present), so an MR with no reviewers and no comments
+ * reads as just `Author: <name>`. Names fall back to the username when blank; the label words are
+ * injected (defaulting to their English forms) so the function needs no message bundle to be tested.
+ * Pure and platform-free.
+ */
+fun mrRowTooltip(
+    mr: GitLabMergeRequest,
+    authorLabel: String = "Author",
+    reviewersLabel: String = "Reviewers",
+    commentsWord: String = "comments",
+): String {
+    fun name(user: GitLabUser): String = user.name.ifBlank { user.username }
+    return buildList {
+        add("$authorLabel: ${name(mr.author)}")
+        if (mr.reviewers.isNotEmpty()) {
+            add("$reviewersLabel: ${mr.reviewers.joinToString(", ") { name(it) }}")
+        }
+        val notes = mr.userNotesCount ?: 0
+        if (notes > 0) add("$notes $commentsWord")
+    }.joinToString(META_SEPARATOR)
 }

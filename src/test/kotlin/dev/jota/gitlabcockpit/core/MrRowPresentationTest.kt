@@ -117,4 +117,34 @@ class MrRowPresentationTest {
         assertEquals(0, p.reviewerOverflow)
         assertFalse(p.reviewerOverflow > 0)
     }
+
+    // --- mrRowTooltip (G17) -------------------------------------------------------------------
+
+    @Test
+    fun `tooltip lists author reviewers and comment count`() {
+        val value = mr(
+            authorName = "Alex Marin",
+            reviewers = listOf(
+                GitLabUser(id = 2, username = "sandra", name = "Sandra Camero"),
+                GitLabUser(id = 3, username = "jota", name = "José Tomás"),
+            ),
+        ).copy(userNotesCount = 4)
+
+        assertEquals(
+            "Author: Alex Marin · Reviewers: Sandra Camero, José Tomás · 4 comments",
+            mrRowTooltip(value),
+        )
+    }
+
+    @Test
+    fun `tooltip omits reviewers and comments when there are none`() {
+        assertEquals("Author: José Tomás", mrRowTooltip(mr()))
+    }
+
+    @Test
+    fun `tooltip falls back to the username when a name is blank`() {
+        val value = mr(authorName = "", authorUsername = "jota")
+
+        assertEquals("Author: jota", mrRowTooltip(value))
+    }
 }
