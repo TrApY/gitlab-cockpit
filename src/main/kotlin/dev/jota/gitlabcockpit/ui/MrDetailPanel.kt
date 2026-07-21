@@ -2,6 +2,7 @@ package dev.jota.gitlabcockpit.ui
 
 import com.intellij.ide.BrowserUtil
 import com.intellij.icons.AllIcons
+import com.intellij.openapi.Disposable
 import com.intellij.openapi.application.EDT
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.ui.ComboBox
@@ -102,12 +103,16 @@ import javax.swing.event.DocumentEvent
  *
  * @param onListReloadRequested called after a successful edit or approval change so the parent can
  * silently refresh the MR list (e.g. so the "reviewer, not approved" filter reflects the change).
+ *
+ * As a per-MR tool-window tab (GLC-35) each panel is its own [Disposable]: the tab's content disposer
+ * is this panel, so closing the tab (or the project) cancels its in-flight loads and those of its
+ * embedded Pipelines/Changes tabs.
  */
 class MrDetailPanel(
     private val project: Project,
     private val service: CockpitProjectService,
     private val onListReloadRequested: () -> Unit,
-) : JPanel(BorderLayout()) {
+) : JPanel(BorderLayout()), Disposable {
 
     /** Ref of the MR currently displayed (or being loaded); null when showing the placeholder. */
     var currentRef: MrRef? = null
@@ -260,9 +265,15 @@ class MrDetailPanel(
         setSingleMessage(CockpitBundle.message("detail.placeholder"))
     }
 
-    /** EDT. Moves keyboard focus into the detail's tab area (e.g. after opening an MR from the list). */
-    fun focusContent() {
-        tabbedPane.requestFocusInWindow()
+    /**
+     * Cancels this panel's in-flight loads and those of its embedded tabs when its tab (or the project)
+     * is closed. [ChangesPanel.clear] / [PipelinesPanel.clear] cancel their own coroutine jobs.
+     */
+    override fun dispose() {
+        detailJob?.cancel()
+        notesJob?.cancel()
+        pipelinesPanel.clear()
+        changesPanel.clear()
     }
 
     /** EDT. Kicks off a background detail load for [ref] and renders the result when it arrives. */

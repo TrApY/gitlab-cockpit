@@ -25,6 +25,11 @@ import dev.jota.gitlabcockpit.core.ThreadSide
  * thread on the caret's `(side, 1-based line)` reusing ChangesPanel's new-thread flow;
  * [CockpitDiffExtension] moves it onto each editor as user-data. Null (the default) leaves the action
  * disabled — e.g. for tests that build a context without the panel.
+ *
+ * [onFileReviewed] is invoked (on the EDT) right after [CockpitDiffExtension] auto-marks this file
+ * reviewed when its viewer is created, so the owning [dev.jota.gitlabcockpit.ui.ChangesPanel] can
+ * refresh its tree and reviewed counter while they are visible. Null (the default) means "nothing to
+ * refresh" — the file is still marked in the persistent store regardless.
  */
 data class CockpitDiffContext(
     val mrRef: MrRef,
@@ -34,6 +39,7 @@ data class CockpitDiffContext(
     val projectWebUrl: String?,
     var revealDiscussionId: String? = null,
     val openNewThread: ((side: ThreadSide, line1Based: Int) -> Unit)? = null,
+    val onFileReviewed: (() -> Unit)? = null,
 ) {
     companion object {
         /** The request user-data slot [CockpitDiffExtension] looks for. */

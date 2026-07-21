@@ -9,9 +9,9 @@ import com.intellij.openapi.editor.event.DocumentListener
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.ui.ComboBox
 import com.intellij.openapi.wm.ToolWindow
+import com.intellij.openapi.util.Key
 import com.intellij.ui.CollectionListModel
 import com.intellij.ui.DoubleClickListener
-import com.intellij.ui.OnePixelSplitter
 import com.intellij.ui.PopupHandler
 import com.intellij.ui.SearchTextField
 import com.intellij.ui.TextFieldWithAutoCompletion
@@ -20,6 +20,7 @@ import com.intellij.ui.components.JBCheckBox
 import com.intellij.ui.components.JBList
 import com.intellij.ui.components.JBPanel
 import com.intellij.ui.components.JBScrollPane
+import com.intellij.ui.content.ContentFactory
 import com.intellij.util.Alarm
 import com.intellij.util.ui.JBUI
 import dev.jota.gitlabcockpit.CockpitBundle
@@ -33,6 +34,7 @@ import dev.jota.gitlabcockpit.core.MrNotificationsWatcher
 import dev.jota.gitlabcockpit.core.MrRef
 import dev.jota.gitlabcockpit.core.RoleFilter
 import dev.jota.gitlabcockpit.core.filterByTitle
+import dev.jota.gitlabcockpit.core.mrTabLabel
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -60,7 +62,7 @@ import javax.swing.ListSelectionModel
  * Auto-refreshes every 60s while the tool window is visible; also loads once on open and on demand.
  */
 class CockpitToolWindowPanel(
-    project: Project,
+    private val project: Project,
     private val toolWindow: ToolWindow,
 ) : JBPanel<CockpitToolWindowPanel>(BorderLayout()), Disposable {
 
@@ -185,16 +187,6 @@ class CockpitToolWindowPanel(
      */
     private var loadedMrs: List<GitLabMergeRequest> = emptyList()
 
-    private val detailPanel = MrDetailPanel(project, service, onListReloadRequested = { reloadSilently() })
-
-    private val splitter = OnePixelSplitter(true, SPLITTER_PROPORTION_KEY, 0.45f).apply {
-        firstComponent = JBScrollPane(mrList)
-        secondComponent = detailPanel
-    }
-
-    /** Guards the selection listener while the list is repopulated and its selection restored. */
-    private var suppressSelectionEvents = false
-
     private var loadJob: Job? = null
 
     private val autoRefreshJob: Job = service.coroutineScope.launch {
@@ -211,12 +203,7 @@ class CockpitToolWindowPanel(
 
     init {
         add(buildToolbar(), BorderLayout.NORTH)
-        add(splitter, BorderLayout.CENTER)
-
-        mrList.addListSelectionListener { event ->
-            if (suppressSelectionEvents || event.valueIsAdjusting) return@addListSelectionListener
-            reconcileDetailWithSelection()
-        }
+        add(JBScrollPane(mrList), BorderLayout.CENTER)
 
         roleCombo.addActionListener {
             // In "All projects" mode the ALL role is not valid; bounce it to I_AM_AUTHOR. Setting the
@@ -311,11 +298,32 @@ class CockpitToolWindowPanel(
         })
     }
 
-    /** Double-click / Enter on a row: show the selected MR in the detail pane and move focus to it. */
+    /**
+     * Double-click / Enter on a row: open (or re-select) the MR's own closeable tab. Tabs are keyed by
+     * [MrRef] so a second open of the same MR just re-selects its existing tab instead of duplicating
+     * it; a fresh tab loads that MR into its own [MrDetailPanel] and takes focus.
+     */
     private fun openSelected() {
-        if (mrList.selectedValue == null) return
-        reconcileDetailWithSelection()
-        detailPanel.focusContent()
+        val mr = mrList.selectedValue ?: return
+        val ref = MrRef(mr.projectId, mr.iid)
+        val contentManager = toolWindow.contentManager
+
+        val existing = contentManager.contents.firstOrNull { it.getUserData(MR_TAB_REF_KEY) == ref }
+        if (existing != null) {
+            contentManager.setSelectedContent(existing, true)
+            return
+        }
+
+        val detail = MrDetailPanel(project, service, onListReloadRequested = { reloadSilently() })
+        val content = ContentFactory.getInstance()
+            .createContent(detail, mrTabLabel(mr.iid, mr.title), false)
+        content.isCloseable = true
+        content.description = mr.title
+        content.putUserData(MR_TAB_REF_KEY, ref)
+        content.setDisposer(detail)
+        contentManager.addContent(content)
+        contentManager.setSelectedContent(content, true)
+        detail.loadDetail(ref)
     }
 
     /** Opens the selected MR's GitLab page in the external browser. */
@@ -392,17 +400,6 @@ class CockpitToolWindowPanel(
         }
     }
 
-    /** EDT. Loads/clears the detail to match the current list selection. */
-    private fun reconcileDetailWithSelection() {
-        val selected = mrList.selectedValue
-        when {
-            selected == null -> detailPanel.showPlaceholder()
-            MrRef(selected.projectId, selected.iid) != detailPanel.currentRef ->
-                detailPanel.loadDetail(MrRef(selected.projectId, selected.iid))
-            // Same MR already shown → leave the detail untouched.
-        }
-    }
-
     /** Must be called on the EDT. [showProject] mirrors the load's "All projects" mode for the rows. */
     private fun render(state: CockpitState, showProject: Boolean) {
         mrCellRenderer.showProject = showProject
@@ -433,14 +430,11 @@ class CockpitToolWindowPanel(
     private fun applyDisplayedList() {
         val previousRef = mrList.selectedValue?.let { MrRef(it.projectId, it.iid) }
         val displayed = filterByTitle(loadedMrs, titleSearchField.text)
-        suppressSelectionEvents = true
         listModel.replaceAll(displayed)
         val restoreIndex = previousRef?.let { ref ->
             displayed.indexOfFirst { MrRef(it.projectId, it.iid) == ref }
         } ?: -1
         if (restoreIndex >= 0) mrList.selectedIndex = restoreIndex
-        suppressSelectionEvents = false
-        reconcileDetailWithSelection()
     }
 
     /**
@@ -508,7 +502,9 @@ class CockpitToolWindowPanel(
         private const val USER_FILTER_DEBOUNCE_MS = 500
         private const val TITLE_FILTER_DEBOUNCE_MS = 300
         private const val TITLE_FIELD_COLUMNS = 16
-        private const val SPLITTER_PROPORTION_KEY = "dev.jota.gitlabcockpit.detail.splitter"
+
+        /** Content user-data slot keying each per-MR tab by its [MrRef], so re-opens re-select it. */
+        private val MR_TAB_REF_KEY: Key<MrRef> = Key.create("dev.jota.gitlabcockpit.toolwindow.mrTabRef")
 
         private fun roleLabel(role: RoleFilter): String = when (role) {
             RoleFilter.ALL -> CockpitBundle.message("toolwindow.filter.role.all")

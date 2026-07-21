@@ -8,7 +8,9 @@ import com.intellij.diff.tools.util.side.TwosideTextDiffViewer
 import com.intellij.diff.util.Side
 import com.intellij.openapi.Disposable
 import com.intellij.openapi.editor.Editor
+import com.intellij.openapi.project.Project
 import com.intellij.openapi.util.Disposer
+import dev.jota.gitlabcockpit.core.ReviewedFiles
 import dev.jota.gitlabcockpit.core.ThreadSide
 
 /**
@@ -25,6 +27,11 @@ import dev.jota.gitlabcockpit.core.ThreadSide
  * works even on a file with no threads. Only when the file *has* threads does it also install the
  * inline [DiffThreadsRenderer] and stamp a [CockpitThreadNavigator] (nothing to navigate otherwise).
  * Any other viewer (unified, binary…) is left untouched.
+ *
+ * Showing a cockpit diff also *auto-marks* its file reviewed (GLC-35): opening a file's diff is the
+ * user reviewing it, so [ReviewedFiles] records it (keyed at the MR's head SHA) as soon as the viewer
+ * exists, and the owning Changes tab is asked to refresh its tree/counter via
+ * [CockpitDiffContext.onFileReviewed].
  */
 class CockpitDiffExtension : DiffExtension() {
 
@@ -37,6 +44,8 @@ class CockpitDiffExtension : DiffExtension() {
         if (viewer !is TwosideTextDiffViewer) return
         val project = context.project ?: return
 
+        autoMarkReviewed(project, cockpitContext)
+
         cockpitContext.openNewThread?.let { openThread -> stampCommentHandles(viewer, openThread) }
 
         if (cockpitContext.discussions.isNotEmpty()) {
@@ -44,6 +53,21 @@ class CockpitDiffExtension : DiffExtension() {
             renderer.install()
             stampNavigator(viewer, renderer)
         }
+    }
+
+    /**
+     * Records the shown file as reviewed for its MR at the diff's head SHA, then lets the owning
+     * Changes tab refresh its tree/counter. The path is the file's display path (`new_path`, or
+     * `old_path` for a deleted file), matching the tree's file keys.
+     */
+    private fun autoMarkReviewed(
+        project: Project,
+        cockpitContext: CockpitDiffContext,
+    ) {
+        val file = cockpitContext.file
+        val path = if (file.deletedFile) file.oldPath else file.newPath
+        ReviewedFiles.getInstance(project).mark(cockpitContext.mrRef, cockpitContext.refs.headSha, path)
+        cockpitContext.onFileReviewed?.invoke()
     }
 
     /**

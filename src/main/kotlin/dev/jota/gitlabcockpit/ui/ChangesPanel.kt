@@ -29,11 +29,14 @@ import com.intellij.openapi.ui.ComboBox
 import com.intellij.openapi.ui.DialogWrapper
 import com.intellij.openapi.ui.Messages
 import com.intellij.openapi.ui.ValidationInfo
+import com.intellij.openapi.vcs.FileStatus
 import com.intellij.ui.CollectionListModel
 import com.intellij.ui.ColorUtil
 import com.intellij.ui.ColoredTreeCellRenderer
 import com.intellij.ui.DoubleClickListener
 import com.intellij.ui.OnePixelSplitter
+import com.intellij.ui.PopupHandler
+import com.intellij.ui.RowIcon
 import com.intellij.ui.SimpleTextAttributes
 import com.intellij.ui.components.ActionLink
 import com.intellij.ui.components.JBCheckBox
@@ -64,6 +67,7 @@ import dev.jota.gitlabcockpit.core.DiffLineMap
 import dev.jota.gitlabcockpit.core.FileNode
 import dev.jota.gitlabcockpit.core.LinePosition
 import dev.jota.gitlabcockpit.core.MrRef
+import dev.jota.gitlabcockpit.core.ReviewedFiles
 import dev.jota.gitlabcockpit.core.ThreadSide
 import dev.jota.gitlabcockpit.core.buildLineMap
 import dev.jota.gitlabcockpit.core.chainIndex
@@ -78,14 +82,19 @@ import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.awt.BorderLayout
+import java.awt.Color
+import java.awt.Component
 import java.awt.FlowLayout
 import java.awt.Font
+import java.awt.event.KeyEvent
 import java.awt.event.MouseEvent
-import javax.swing.Icon
 import javax.swing.JButton
 import javax.swing.JComponent
+import javax.swing.JMenuItem
 import javax.swing.JPanel
+import javax.swing.JPopupMenu
 import javax.swing.JTree
+import javax.swing.KeyStroke
 import javax.swing.ListSelectionModel
 import javax.swing.tree.DefaultMutableTreeNode
 import javax.swing.tree.DefaultTreeModel
@@ -164,6 +173,9 @@ class ChangesPanel(
     private var deleteJob: Job? = null
     private var resolveJob: Job? = null
 
+    /** Per-MR reviewed-file store (GLC-35): drives the tree's muted+tick rendering and the counter. */
+    private val reviewedFiles = ReviewedFiles.getInstance(project)
+
     private val rootNode = DefaultMutableTreeNode()
     private val treeModel = DefaultTreeModel(rootNode)
     private val tree = Tree(treeModel).apply {
@@ -171,6 +183,13 @@ class ChangesPanel(
         showsRootHandles = true
         selectionModel.selectionMode = TreeSelectionModel.SINGLE_TREE_SELECTION
         cellRenderer = FileTreeRenderer()
+    }
+
+    /** Muted "N of M files reviewed" footer under the tree; hidden until a change is loaded. */
+    private val reviewedCountLabel = JBLabel().apply {
+        foreground = UIUtil.getContextHelpForeground()
+        border = JBUI.Borders.empty(2, 8)
+        isVisible = false
     }
 
     private val discussionListModel = CollectionListModel<GitLabDiscussion>()
@@ -209,8 +228,12 @@ class ChangesPanel(
     private val pendingReviewPanel = JPanel(BorderLayout())
 
     init {
+        val treePanel = JPanel(BorderLayout()).apply {
+            add(JBScrollPane(tree), BorderLayout.CENTER)
+            add(reviewedCountLabel, BorderLayout.SOUTH)
+        }
         val splitter = OnePixelSplitter(true, 0.6f).apply {
-            firstComponent = JBScrollPane(tree)
+            firstComponent = treePanel
             secondComponent = buildBottomPanel()
         }
         add(splitter, BorderLayout.CENTER)
@@ -232,6 +255,18 @@ class ChangesPanel(
                 return true
             }
         }.installOn(tree)
+
+        // Manual reviewed toggle: Space on the selected file, or a right-click menu (GLC-35).
+        tree.registerKeyboardAction(
+            { toggleReviewedForSelection() },
+            KeyStroke.getKeyStroke(KeyEvent.VK_SPACE, 0),
+            JComponent.WHEN_FOCUSED,
+        )
+        tree.addMouseListener(object : PopupHandler() {
+            override fun invokePopup(comp: Component, x: Int, y: Int) {
+                showReviewedContextMenu(comp, x, y)
+            }
+        })
 
         discussionList.addListSelectionListener { event ->
             if (!event.valueIsAdjusting) {
@@ -383,6 +418,8 @@ class ChangesPanel(
         currentDrafts = emptyList()
         draftsRowsPanel.removeAll()
         pendingReviewPanel.isVisible = false
+        reviewedCountLabel.isVisible = false
+        reviewedCountLabel.text = ""
     }
 
     // --- Loading ------------------------------------------------------------------------------
@@ -438,12 +475,94 @@ class ChangesPanel(
         newThreadButton.isEnabled = false
         showFileComments(null)
         onFileCountChanged(files.size)
+        updateReviewedCounter()
     }
 
     private fun toTreeNode(node: FileNode): DefaultMutableTreeNode {
         val treeNode = DefaultMutableTreeNode(node)
         for (child in node.children) treeNode.add(toTreeNode(child))
         return treeNode
+    }
+
+    // --- Reviewed state (GLC-35) --------------------------------------------------------------
+
+    /** A changed file's tree/review key: its `new_path`, or `old_path` for a deleted file. */
+    private fun treePathOf(file: GitLabDiffFile): String =
+        if (file.deletedFile) file.oldPath else file.newPath
+
+    /** Whether [path] is reviewed for the current MR at its head SHA (false when either is unknown). */
+    private fun isPathReviewed(path: String): Boolean {
+        val ref = currentRef ?: return false
+        val sha = diffRefs?.headSha ?: return false
+        return reviewedFiles.isReviewed(ref, sha, path)
+    }
+
+    /** EDT. Refreshes the muted "N of M files reviewed" footer (hidden when there is no change). */
+    private fun updateReviewedCounter() {
+        val ref = currentRef
+        val sha = diffRefs?.headSha
+        if (ref == null || sha == null || loadedFiles.isEmpty()) {
+            reviewedCountLabel.isVisible = false
+            reviewedCountLabel.text = ""
+            return
+        }
+        val paths = loadedFiles.map { treePathOf(it) }
+        val reviewed = reviewedFiles.reviewedCount(ref, sha, paths)
+        reviewedCountLabel.text = CockpitBundle.message("changes.reviewed.count", reviewed, paths.size)
+        reviewedCountLabel.isVisible = true
+    }
+
+    /** Space on the selected file leaf: flip its reviewed state, then repaint the tree and counter. */
+    private fun toggleReviewedForSelection() {
+        val node = tree.lastSelectedPathComponent as? DefaultMutableTreeNode ?: return
+        val fileNode = node.userObject as? FileNode ?: return
+        if (fileNode.file == null) return
+        val ref = currentRef ?: return
+        val sha = diffRefs?.headSha ?: return
+        reviewedFiles.toggle(ref, sha, fileNode.path)
+        tree.repaint()
+        updateReviewedCounter()
+    }
+
+    /** Right-click on a file leaf: a single "Mark as (not) reviewed" item reflecting its state. */
+    private fun showReviewedContextMenu(comp: Component, x: Int, y: Int) {
+        val path = tree.getPathForLocation(x, y) ?: return
+        val node = path.lastPathComponent as? DefaultMutableTreeNode ?: return
+        val fileNode = node.userObject as? FileNode ?: return
+        if (fileNode.file == null) return
+        tree.selectionPath = path
+        val ref = currentRef ?: return
+        val sha = diffRefs?.headSha ?: return
+        val reviewed = reviewedFiles.isReviewed(ref, sha, fileNode.path)
+        val item = JMenuItem(
+            CockpitBundle.message(
+                if (reviewed) "changes.file.markNotReviewed" else "changes.file.markReviewed",
+            ),
+        ).apply { addActionListener { setReviewed(fileNode.path, !reviewed) } }
+        JPopupMenu().apply { add(item) }.show(comp, x, y)
+    }
+
+    /** Sets [path]'s reviewed state to [reviewed] (idempotent), then repaints the tree and counter. */
+    private fun setReviewed(path: String, reviewed: Boolean) {
+        val ref = currentRef ?: return
+        val sha = diffRefs?.headSha ?: return
+        if (reviewed) {
+            reviewedFiles.mark(ref, sha, path)
+        } else if (reviewedFiles.isReviewed(ref, sha, path)) {
+            reviewedFiles.toggle(ref, sha, path)
+        }
+        tree.repaint()
+        updateReviewedCounter()
+    }
+
+    /**
+     * EDT callback for [CockpitDiffContext.onFileReviewed]: the diff extension just auto-marked a file
+     * reviewed, so repaint the tree and refresh the counter if this tab is still bound to an MR.
+     */
+    private fun refreshReviewedAfterAutoMark() {
+        if (currentRef == null) return
+        tree.repaint()
+        updateReviewedCounter()
     }
 
     // --- Diff in the editor -------------------------------------------------------------------
@@ -594,6 +713,7 @@ class ChangesPanel(
                 projectWebUrl = webUrl,
                 revealDiscussionId = revealDiscussionId,
                 openNewThread = { side, line -> openNewThreadDialog(file, refs, side, line) },
+                onFileReviewed = { refreshReviewedAfterAutoMark() },
             ),
         )
         return request
@@ -1028,15 +1148,32 @@ class ChangesPanel(
             if (data.isDir) {
                 icon = AllIcons.Nodes.Folder
                 append(data.name)
-            } else {
-                data.file?.let { icon = iconForChange(changeTypeOf(it)) }
-                append(data.name)
-                val count = discussionsByFilePath[data.path]?.size ?: 0
-                if (count > 0) {
-                    append("  " + CockpitBundle.message("changes.file.comments", count), SimpleTextAttributes.GRAYED_ATTRIBUTES)
-                }
+                return
+            }
+            val file = data.file
+            val reviewed = file != null && isPathReviewed(data.path)
+            // File icon comes from its type; a reviewed file adds a tick badge next to it and mutes the
+            // name, otherwise the change type tints the name (added/deleted/renamed).
+            val typeIcon = FileTypeManager.getInstance().getFileTypeByFileName(data.name).icon
+                ?: AllIcons.FileTypes.Any_type
+            icon = if (reviewed) RowIcon(typeIcon, AllIcons.Actions.Checked) else typeIcon
+            append(data.name, nameAttributes(file, reviewed))
+            val count = discussionsByFilePath[data.path]?.size ?: 0
+            if (count > 0) {
+                append(
+                    "  " + CockpitBundle.message("changes.file.comments", count),
+                    SimpleTextAttributes.GRAYED_ATTRIBUTES,
+                )
             }
         }
+    }
+
+    /** Name attributes for a file leaf: muted when reviewed, else tinted by its change type. */
+    private fun nameAttributes(file: GitLabDiffFile?, reviewed: Boolean): SimpleTextAttributes {
+        if (reviewed) return SimpleTextAttributes.GRAYED_ATTRIBUTES
+        val color = file?.let { colorForChange(changeTypeOf(it)) }
+            ?: return SimpleTextAttributes.REGULAR_ATTRIBUTES
+        return SimpleTextAttributes(SimpleTextAttributes.STYLE_PLAIN, color)
     }
 
     /**
@@ -1158,14 +1295,16 @@ class ChangesPanel(
     }
 
     companion object {
-        /** Maps a file's change type to its tree icon. */
-        private fun iconForChange(type: ChangeType): Icon = when (type) {
-            ChangeType.ADDED -> AllIcons.Actions.AddFile
-            // AllIcons.Actions.DeleteFile does not exist in 2025.2; General.Remove (a minus) is the
-            // closest stable equivalent for a removed file.
-            ChangeType.DELETED -> AllIcons.General.Remove
-            ChangeType.RENAMED -> AllIcons.Actions.Copy
-            ChangeType.MODIFIED -> AllIcons.Actions.Edit
+        /**
+         * Name color for a change type: added/deleted/renamed map to the IDE's VCS [FileStatus] colors
+         * (with the plugin palette as a fallback when the active theme leaves one unset); a plain
+         * modification returns null so the name keeps the tree's default foreground.
+         */
+        private fun colorForChange(type: ChangeType): Color? = when (type) {
+            ChangeType.ADDED -> FileStatus.ADDED.color ?: CockpitTheme.success
+            ChangeType.DELETED -> FileStatus.DELETED.color ?: CockpitTheme.danger
+            ChangeType.RENAMED -> FileStatus.MODIFIED.color ?: CockpitTheme.info
+            ChangeType.MODIFIED -> null
         }
 
         /** The position of a discussion's first positioned, non-system note (or null). */
