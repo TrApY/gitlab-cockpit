@@ -1,3 +1,4 @@
+import org.jetbrains.changelog.Changelog
 import org.jetbrains.intellij.platform.gradle.TestFrameworkType
 
 plugins {
@@ -28,6 +29,20 @@ intellijPlatform {
             sinceBuild = providers.gradleProperty("pluginSinceBuild")
             // Sin tope superior: el plugin se instala from-disk en IDEs futuros sin re-empaquetar
             untilBuild = provider { null }
+        }
+
+        // "What's New" del Marketplace: la sección de CHANGELOG.md de la versión publicada
+        // (fallback a Unreleased mientras esa sección no exista). Hasta 0.12.0 las notas se
+        // ponían a mano en el Marketplace tras publicar; desde 0.12.1 salen del changelog.
+        // Evaluado eager (String, no provider): un lambda capturaría la extensión changelog,
+        // que arrastra Project y rompe la configuration cache activada en gradle.properties.
+        changeNotes = with(changelog) {
+            renderItem(
+                (getOrNull(project.version.toString()) ?: getUnreleased())
+                    .withHeader(false)
+                    .withEmptySections(false),
+                Changelog.OutputType.HTML,
+            )
         }
     }
 
