@@ -86,6 +86,14 @@ class MarkdownFormattingTest {
     }
 
     @Test
+    fun `link with no selection inserts the full template and selects the text placeholder`() {
+        val r = wrapMarkdown("", 0, 0, MarkdownMarker.LINK)
+
+        assertEquals("[text](url)", r.text)
+        assertEquals("text", r.text.substring(r.selectionStart, r.selectionEnd))
+    }
+
+    @Test
     fun `strikethrough wraps with a double tilde`() {
         val r = wrapMarkdown("gone", 0, 4, MarkdownMarker.STRIKE)
 

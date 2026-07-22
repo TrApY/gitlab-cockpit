@@ -2482,36 +2482,39 @@ class MrDetailPanel(
      * flag) to the panel, which performs the network call. The textarea takes focus on open.
      */
     /**
-     * The markdown-format button bar shared by the comment composer and the Edit MR description
-     * (GLC-52): B / I / S / inline code / code block / quote / link, each wrapping the [area]'s
-     * current selection via [wrapMarkdown] and restoring the selection the wrap yields.
+     * The markdown-format bar shared by the comment composer and the Edit MR description (GLC-52):
+     * bold / italic / strike / inline code / code block / quote / link as a real [ActionToolbar]
+     * (GLC-53 — platform hover highlight for free, like the reference), each action wrapping the
+     * [area]'s current selection via [wrapMarkdown] and restoring the selection the wrap yields.
      */
     private class MarkdownFormatBar(
         private val area: JBTextArea,
-    ) : JPanel(FlowLayout(FlowLayout.LEFT, JBUI.scale(2), 0)) {
+    ) : JPanel(BorderLayout()) {
         init {
             isOpaque = false
-            add(formatButton("B", "detail.composer.format.bold", MarkdownMarker.BOLD, Font.BOLD))
-            add(formatButton("I", "detail.composer.format.italic", MarkdownMarker.ITALIC, Font.ITALIC))
-            add(formatButton("S", "detail.composer.format.strike", MarkdownMarker.STRIKE, Font.PLAIN))
-            add(formatButton("</>", "detail.composer.format.code", MarkdownMarker.CODE, Font.PLAIN))
-            add(formatButton("{ }", "detail.composer.format.codeBlock", MarkdownMarker.CODE_BLOCK, Font.PLAIN))
-            add(formatButton(">", "detail.composer.format.quote", MarkdownMarker.QUOTE, Font.PLAIN))
-            add(
-                JButton(CockpitIcons.copyLink).apply {
-                    toolTipText = CockpitBundle.message("detail.composer.format.link")
-                    margin = JBUI.emptyInsets()
-                    addActionListener { applyFormat(MarkdownMarker.LINK) }
-                },
+            val group = DefaultActionGroup(
+                formatAction("detail.composer.format.bold", CockpitIcons.formatBold, MarkdownMarker.BOLD),
+                formatAction("detail.composer.format.italic", CockpitIcons.formatItalic, MarkdownMarker.ITALIC),
+                formatAction("detail.composer.format.strike", CockpitIcons.formatStrike, MarkdownMarker.STRIKE),
+                formatAction("detail.composer.format.code", CockpitIcons.formatCode, MarkdownMarker.CODE),
+                formatAction(
+                    "detail.composer.format.codeBlock",
+                    CockpitIcons.formatCodeBlock,
+                    MarkdownMarker.CODE_BLOCK,
+                ),
+                formatAction("detail.composer.format.quote", CockpitIcons.formatQuote, MarkdownMarker.QUOTE),
+                formatAction("detail.composer.format.link", CockpitIcons.copyLink, MarkdownMarker.LINK),
             )
+            val toolbar = ActionManager.getInstance().createActionToolbar(TOOLBAR_PLACE, group, true)
+            toolbar.targetComponent = area
+            toolbar.component.isOpaque = false
+            add(toolbar.component, BorderLayout.WEST)
         }
 
-        private fun formatButton(text: String, tooltipKey: String, marker: MarkdownMarker, style: Int): JButton =
-            JButton(text).apply {
-                toolTipText = CockpitBundle.message(tooltipKey)
-                if (style != Font.PLAIN) font = font.deriveFont(style)
-                margin = JBUI.emptyInsets()
-                addActionListener { applyFormat(marker) }
+        private fun formatAction(tooltipKey: String, icon: Icon, marker: MarkdownMarker): AnAction =
+            object : AnAction(CockpitBundle.message(tooltipKey), null, icon) {
+                override fun getActionUpdateThread(): ActionUpdateThread = ActionUpdateThread.BGT
+                override fun actionPerformed(e: AnActionEvent) = applyFormat(marker)
             }
 
         /** Applies [marker] to the current selection and restores the caret/selection the wrap yields. */
@@ -2520,6 +2523,11 @@ class MrDetailPanel(
             area.text = result.text
             area.select(result.selectionStart, result.selectionEnd)
             area.requestFocusInWindow()
+        }
+
+        companion object {
+            /** The toolbar "place" id for the shared markdown format bar. */
+            private const val TOOLBAR_PLACE = "GitLabCockpitMarkdownFormatBar"
         }
     }
 

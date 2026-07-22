@@ -77,6 +77,18 @@ object CockpitIcons {
     val copyLink: Icon = IconLoader.getIcon("/icons/collab/copyLink.svg", CockpitIcons::class.java)
 
     /**
+     * Markdown format-bar icons (GLC-53): bold/italic/strike/code from the IntelliJ Markdown plugin's
+     * New-UI editor-action set (vendored, Apache-2.0 — see icons/markdown/README.md); quote and
+     * codeBlock are original companions drawn in the same style.
+     */
+    val formatBold: Icon = IconLoader.getIcon("/icons/markdown/bold.svg", CockpitIcons::class.java)
+    val formatItalic: Icon = IconLoader.getIcon("/icons/markdown/italic.svg", CockpitIcons::class.java)
+    val formatStrike: Icon = IconLoader.getIcon("/icons/markdown/strikeThrough.svg", CockpitIcons::class.java)
+    val formatCode: Icon = IconLoader.getIcon("/icons/markdown/codeSpan.svg", CockpitIcons::class.java)
+    val formatCodeBlock: Icon = IconLoader.getIcon("/icons/markdown/codeBlock.svg", CockpitIcons::class.java)
+    val formatQuote: Icon = IconLoader.getIcon("/icons/markdown/quote.svg", CockpitIcons::class.java)
+
+    /**
      * Maps a timeline [eventIconKey] to the concrete [Icon] a native event card paints (GLC-38 / iter3
      * B). The counterpart of the old HTML `<icon src>` mapping, now that the timeline is built from Swing
      * components instead of one HTML document. Every icon is verified to exist in the 2025.2 platform.

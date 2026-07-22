@@ -20,6 +20,9 @@ data class WrapResult(val text: String, val selectionStart: Int, val selectionEn
 /** The `[url]` placeholder [MarkdownMarker.LINK] leaves selected so the caller can type the address. */
 private const val LINK_PLACEHOLDER = "url"
 
+/** The `text` placeholder an empty-selection link template leaves selected (GLC-53). */
+private const val LINK_TEXT_PLACEHOLDER = "text"
+
 /**
  * Wraps the `[selStart, selEnd)` selection of [text] with the markdown syntax for [marker] and returns
  * the rewritten text plus the selection to restore. Pure and platform-free (GLC-38 / iter3 F14):
@@ -87,8 +90,18 @@ private fun quote(before: String, selected: String, after: String, from: Int): W
     return WrapResult(text, from, from + quoted.length)
 }
 
-/** Builds `[selected](url)` and selects the literal `url` placeholder so it can be typed over. */
+/**
+ * Builds `[selected](url)` and selects the literal `url` placeholder so it can be typed over. An
+ * empty selection yields the full `[text](url)` template with the `text` placeholder selected instead
+ * (GLC-53) — mirroring the reference's link template, where you type the text first and then move on
+ * to the url.
+ */
 private fun link(before: String, selected: String, after: String, from: Int): WrapResult {
+    if (selected.isEmpty()) {
+        val text = before + "[" + LINK_TEXT_PLACEHOLDER + "](" + LINK_PLACEHOLDER + ")" + after
+        val textStart = from + 1
+        return WrapResult(text, textStart, textStart + LINK_TEXT_PLACEHOLDER.length)
+    }
     val head = "[$selected]("
     val text = before + head + LINK_PLACEHOLDER + ")" + after
     val urlStart = from + head.length
