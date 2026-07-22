@@ -187,6 +187,13 @@ class MrDetailPanel(
     private var approvalsPrefixLabel: JBLabel? = null
     private var approvalsDetailLabel: JBLabel? = null
 
+    /**
+     * The Info header's "Pipeline status" value label (GLC-43 B), recreated by [buildPipelineLine]. The
+     * pipelines card's live poll updates it through [updatePipelineStatusLine] when the head pipeline's
+     * aggregate status changes; null when the MR has no head pipeline (no line was built).
+     */
+    private var pipelineStatusLabel: JBLabel? = null
+
     /** The header's read-only label-chips line (GLC-42); recreated by [buildHeader], re-colored async. */
     private var labelsLine: JPanel? = null
 
@@ -327,7 +334,9 @@ class MrDetailPanel(
     /** The MR tab's vertical action toolbar; kept so approve/watch toggles can refresh its state. */
     private var mrToolbar: ActionToolbar? = null
 
-    private val pipelinesPanel = PipelinesPanel(project, service)
+    private val pipelinesPanel = PipelinesPanel(project, service) { status ->
+        updatePipelineStatusLine(status)
+    }
 
     private val changesPanel = ChangesPanel(
         project,
@@ -388,13 +397,20 @@ class MrDetailPanel(
         showPlaceholder()
     }
 
-    /** Shows the "main" card (Info | Events & Discussions). */
-    private fun showMainCard() = cardLayout.show(rightCards, CARD_MAIN)
+    /** Shows the "main" card (Info | Events & Discussions), stopping the pipelines card's live poll. */
+    private fun showMainCard() {
+        pipelinesPanel.onCardHidden()
+        cardLayout.show(rightCards, CARD_MAIN)
+    }
 
-    /** Shows the "pipelines" drill-in card, loading its pipelines the first time it is shown. */
+    /**
+     * Shows the "pipelines" drill-in card, loading its pipelines the first time it is shown and starting
+     * its live-status poll (GLC-43 B) while it stays visible.
+     */
     private fun showPipelinesCard() {
         cardLayout.show(rightCards, CARD_PIPELINES)
         pipelinesPanel.onTabSelected()
+        pipelinesPanel.onCardShown()
     }
 
     // --- Action toolbar (WEST) ----------------------------------------------------------------
@@ -450,15 +466,21 @@ class MrDetailPanel(
     }
 
     /**
-     * Request changes (iter3 A4 / ADENDA 2, icon [AllIcons.General.Error]). GitLab has no native "request
-     * changes" review state, so this is a convenience: if the MR is currently approved by me it first
-     * revokes that approval (an approval and a change-request are contradictory), then jumps to the
-     * Events & Discussions tab and opens the composer popup so the reviewer can spell out the changes.
+     * Request changes (iter3 A4 / ADENDA 2; icon [AllIcons.Vcs.History] — GLC-43 C12). GitLab has no
+     * native "request changes" review state, so this is a convenience: if the MR is currently approved
+     * by me it first revokes that approval (an approval and a change-request are contradictory), then
+     * jumps to the Events & Discussions tab and opens the composer popup so the reviewer can spell out
+     * the changes.
+     *
+     * The icon is the platform's monochrome history/clock (`vcs/history.svg`, New UI
+     * `expui/general/history.svg`) — the "waiting for updates" semantics of the reference — deliberately
+     * **not** the old circled-red [AllIcons.General.Error], which read as an error and was
+     * indistinguishable from the circled-red Close action's icon.
      */
     private fun requestChangesAction(): AnAction = object : AnAction(
         CockpitBundle.message("detail.toolbar.requestChanges"),
         null,
-        AllIcons.General.Error,
+        AllIcons.Vcs.History,
     ) {
         override fun getActionUpdateThread(): ActionUpdateThread = ActionUpdateThread.EDT
 
@@ -615,11 +637,12 @@ class MrDetailPanel(
         override fun actionPerformed(e: AnActionEvent) = onCloseMr()
     }
 
-    /** Copies the MR's web URL to the clipboard (icon [AllIcons.Ide.Link]) and confirms with a balloon. */
+    /** Copies the MR's web URL to the clipboard (icon [CockpitIcons.copyLink], the chain glyph — GLC-43
+     * C13) and confirms with a balloon. */
     private fun copyLinkAction(): AnAction = object : AnAction(
         CockpitBundle.message("detail.toolbar.copyLink"),
         null,
-        AllIcons.Ide.Link,
+        CockpitIcons.copyLink,
     ) {
         override fun getActionUpdateThread(): ActionUpdateThread = ActionUpdateThread.EDT
 
@@ -915,6 +938,7 @@ class MrDetailPanel(
      * card. Null when [status] is null (the MR has no head pipeline), so no empty row is added.
      */
     private fun buildPipelineLine(status: String?): JComponent? {
+        pipelineStatusLabel = null
         if (status == null) return null
         val line = flowLine()
         line.add(JBLabel(CockpitBundle.message("detail.pipeline.status")))
@@ -929,8 +953,21 @@ class MrDetailPanel(
                 showPipelinesCard()
             }
         })
+        pipelineStatusLabel = statusLabel
         line.add(statusLabel)
         return line
+    }
+
+    /**
+     * EDT. Updates the Info header's "Pipeline status" value to [status] (GLC-43 B) — text, status icon
+     * and color — when the pipelines card's live poll reports the head pipeline's aggregate status
+     * changed. A no-op when the MR has no head-pipeline line ([pipelineStatusLabel] null).
+     */
+    private fun updatePipelineStatusLine(status: String) {
+        val label = pipelineStatusLabel ?: return
+        label.text = pipelineStatusText(status)
+        label.icon = CockpitIcons.status(status)
+        label.foreground = CockpitTheme.statusColor(status)
     }
 
     /**
@@ -1404,7 +1441,7 @@ class MrDetailPanel(
             panel.add(cardIconButton(AllIcons.Actions.Edit, null, "detail.comment.action.edit") { openEditComposer(note) })
             panel.add(cardIconButton(AllIcons.Actions.GC, null, "detail.comment.action.delete") { onDeleteNote(note) })
         }
-        panel.add(cardIconButton(AllIcons.Ide.Link, null, "detail.comment.action.copyLink") { onCopyCommentLink(note) })
+        panel.add(cardIconButton(CockpitIcons.copyLink, null, "detail.comment.action.copyLink") { onCopyCommentLink(note) })
     }
 
     /**
@@ -2321,7 +2358,7 @@ class MrDetailPanel(
             bar.add(formatButton("</>", "detail.composer.format.code", MarkdownMarker.CODE, Font.PLAIN))
             bar.add(formatButton("{ }", "detail.composer.format.codeBlock", MarkdownMarker.CODE_BLOCK, Font.PLAIN))
             bar.add(formatButton(">", "detail.composer.format.quote", MarkdownMarker.QUOTE, Font.PLAIN))
-            val linkButton = JButton(AllIcons.Ide.Link).apply {
+            val linkButton = JButton(CockpitIcons.copyLink).apply {
                 toolTipText = CockpitBundle.message("detail.composer.format.link")
                 addActionListener { applyFormat(MarkdownMarker.LINK) }
             }

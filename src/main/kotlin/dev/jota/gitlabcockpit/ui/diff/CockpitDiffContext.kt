@@ -30,6 +30,11 @@ import dev.jota.gitlabcockpit.core.ThreadSide
  * reviewed when its viewer is created, so the owning [dev.jota.gitlabcockpit.ui.ChangesPanel] can
  * refresh its tree and reviewed counter while they are visible. Null (the default) means "nothing to
  * refresh" — the file is still marked in the persistent store regardless.
+ *
+ * [onFileShown] is invoked (on the EDT) on the same per-file hook (GLC-43 C14), each time a file's diff
+ * viewer is created — including when the platform's next/previous-file navigation walks the diff chain.
+ * The owning Changes tab uses it to keep the tree's selection + scroll in step with the file on screen,
+ * without stealing focus from the diff editor. Null (the default) means "don't sync".
  */
 data class CockpitDiffContext(
     val mrRef: MrRef,
@@ -40,6 +45,7 @@ data class CockpitDiffContext(
     var revealDiscussionId: String? = null,
     val openNewThread: ((side: ThreadSide, line1Based: Int) -> Unit)? = null,
     val onFileReviewed: (() -> Unit)? = null,
+    val onFileShown: (() -> Unit)? = null,
 ) {
     companion object {
         /** The request user-data slot [CockpitDiffExtension] looks for. */

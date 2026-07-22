@@ -69,6 +69,14 @@ object CockpitIcons {
     val addEmojiHovered: Icon = IconLoader.getIcon("/icons/collab/addEmojiHovered.svg", CockpitIcons::class.java)
 
     /**
+     * The chain-link "copy link" glyph (GLC-43 C13): a real interlocking-links icon, unlike the
+     * platform's `AllIcons.Ide.Link` (a double-chevron `»`, not a chain). Vendored from the bundled
+     * Markdown plugin's New-UI `link.svg` so every copy-link / insert-link affordance — the MR toolbar,
+     * a discussion card's hover row and the composer's link button — shares one consistent chain icon.
+     */
+    val copyLink: Icon = IconLoader.getIcon("/icons/collab/copyLink.svg", CockpitIcons::class.java)
+
+    /**
      * Maps a timeline [eventIconKey] to the concrete [Icon] a native event card paints (GLC-38 / iter3
      * B). The counterpart of the old HTML `<icon src>` mapping, now that the timeline is built from Swing
      * components instead of one HTML document. Every icon is verified to exist in the 2025.2 platform.

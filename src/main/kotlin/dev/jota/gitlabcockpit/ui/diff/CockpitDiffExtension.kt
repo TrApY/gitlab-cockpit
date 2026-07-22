@@ -45,6 +45,9 @@ class CockpitDiffExtension : DiffExtension() {
         val project = context.project ?: return
 
         autoMarkReviewed(project, cockpitContext)
+        // GLC-43 C14: keep the Changes tree selection following the file whose diff is now shown (the
+        // same per-file hook as auto-mark-reviewed, so chain next/previous navigation drives it too).
+        cockpitContext.onFileShown?.invoke()
 
         cockpitContext.openNewThread?.let { openThread -> stampCommentHandles(viewer, openThread) }
 

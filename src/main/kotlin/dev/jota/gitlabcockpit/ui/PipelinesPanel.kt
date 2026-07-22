@@ -3,6 +3,7 @@ package dev.jota.gitlabcockpit.ui
 import com.intellij.icons.AllIcons
 import com.intellij.ide.BrowserUtil
 import com.intellij.openapi.application.EDT
+import com.intellij.openapi.fileEditor.FileEditorManager
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.ui.ComboBox
 import com.intellij.openapi.ui.Messages
@@ -22,18 +23,25 @@ import dev.jota.gitlabcockpit.api.GitLabResult
 import dev.jota.gitlabcockpit.core.CockpitProjectService
 import dev.jota.gitlabcockpit.core.MrRef
 import dev.jota.gitlabcockpit.core.StageGroup
+import dev.jota.gitlabcockpit.core.aggregateStatus
 import dev.jota.gitlabcockpit.core.groupByStage
 import dev.jota.gitlabcockpit.core.isJobCancelable
 import dev.jota.gitlabcockpit.core.isJobPlayable
 import dev.jota.gitlabcockpit.core.isJobRetryable
+import dev.jota.gitlabcockpit.core.isPipelineLive
 import dev.jota.gitlabcockpit.core.mergeHeadPipeline
+import dev.jota.gitlabcockpit.core.stagesToExpand
+import dev.jota.gitlabcockpit.ui.log.JobLogVirtualFile
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.awt.BorderLayout
 import java.awt.Component
 import java.awt.FlowLayout
+import java.awt.event.HierarchyEvent
 import java.awt.event.MouseEvent
 import javax.swing.JButton
 import javax.swing.JComponent
@@ -68,10 +76,24 @@ private data class JobNodeData(val job: GitLabJob)
  * with [Dispatchers.EDT] and dropped when stale (re-checking [currentRef] and the selected pipeline).
  * Pipelines load lazily the first time the tab is shown for an MR ([onTabSelected]) and again after
  * every detail refresh ([setMr]).
+ *
+ * **Live status (GLC-43 B).** While the card is showing ([onCardShown] / [onCardHidden] driven by the
+ * detail panel's card switch, plus a [HierarchyEvent.SHOWING_CHANGED] guard for the tool window being
+ * hidden) and the selected pipeline is still alive ([isPipelineLive]), a poll every
+ * [POLL_INTERVAL_MS]ms reloads that pipeline's jobs — and the pipeline list every
+ * [PIPELINE_LIST_EVERY] cycles — and updates the combo / strip / tree **in place**, preserving the
+ * tree's per-stage expansion ([stagesToExpand]) and the current selection. The loop stops the moment
+ * the card is hidden, the panel is unbound/cleared, the tool window stops showing, or the pipeline
+ * turns terminal (one last pass first). When the polled pipeline is the head one and its aggregate
+ * status changes, [onHeadPipelineStatusChange] lets the detail's Info "Pipeline status" line follow.
+ *
+ * @param onHeadPipelineStatusChange invoked (EDT) with the head pipeline's new aggregate status when a
+ *   poll detects it changed; used to refresh the Info card's pipeline line.
  */
 class PipelinesPanel(
     private val project: Project,
     private val service: CockpitProjectService,
+    private val onHeadPipelineStatusChange: (String) -> Unit = {},
 ) : JPanel(BorderLayout()) {
 
     /** Ref of the MR currently displayed; null when cleared. */
@@ -101,6 +123,18 @@ class PipelinesPanel(
     private var pipelinesJob: Job? = null
     private var jobsJob: Job? = null
     private var actionJob: Job? = null
+
+    /** The live-status poll loop (GLC-43 B); non-null/active only while the card is visibly polling. */
+    private var pollJob: Job? = null
+
+    /** Whether the pipelines card is the one currently shown (set by [onCardShown] / [onCardHidden]). */
+    private var cardVisible = false
+
+    /** The jobs last rendered into the tree; the poll's start guard reads their liveness. */
+    private var lastRenderedJobs: List<GitLabJob> = emptyList()
+
+    /** Last head-pipeline aggregate status reported to the detail, so only real changes fire the callback. */
+    private var lastHeadAggregate: String? = null
 
     private val pipelineCombo = ComboBox<GitLabPipeline>().apply {
         renderer = textCellRenderer<GitLabPipeline>("") { pipelineLabel(it) }
@@ -156,6 +190,14 @@ class PipelinesPanel(
             }
         }.installOn(tree)
 
+        // GLC-43 B: no timer may survive the tool window being hidden. When this panel stops showing,
+        // the poll loop is cancelled; when it shows again it resumes if the card is up and still alive.
+        addHierarchyListener { event ->
+            if (event.changeFlags and HierarchyEvent.SHOWING_CHANGED.toLong() != 0L) {
+                if (isShowing) maybeStartPolling() else stopPolling()
+            }
+        }
+
         clear()
     }
 
@@ -191,6 +233,9 @@ class PipelinesPanel(
         this.headPipeline = headPipeline
         loadedForRef = null
         selectedPipelineId = null
+        stopPolling()
+        lastRenderedJobs = emptyList()
+        lastHeadAggregate = headPipeline?.status
         pipelinesJob?.cancel()
         jobsJob?.cancel()
         actionJob?.cancel()
@@ -207,6 +252,9 @@ class PipelinesPanel(
         headPipeline = null
         loadedForRef = null
         selectedPipelineId = null
+        stopPolling()
+        lastRenderedJobs = emptyList()
+        lastHeadAggregate = null
         pipelinesJob?.cancel()
         jobsJob?.cancel()
         actionJob?.cancel()
@@ -214,6 +262,92 @@ class PipelinesPanel(
         runButton.isEnabled = false
         refreshButton.isEnabled = false
         tree.emptyText.text = ""
+    }
+
+    // --- Live status polling (GLC-43 B) -------------------------------------------------------
+
+    /** Called by the detail panel when the pipelines card becomes the shown one; may start polling. */
+    fun onCardShown() {
+        cardVisible = true
+        maybeStartPolling()
+    }
+
+    /** Called by the detail panel when the pipelines card is hidden (Back / another card); stops polling. */
+    fun onCardHidden() {
+        cardVisible = false
+        stopPolling()
+    }
+
+    /** Cancels the live-status poll loop; a no-op when nothing is polling. */
+    private fun stopPolling() {
+        pollJob?.cancel()
+        pollJob = null
+    }
+
+    /**
+     * Starts the poll loop when everything lines up: the card is the shown one, the panel is actually
+     * showing on screen, a pipeline is selected and the last rendered jobs are still alive (or not yet
+     * loaded — the first pass then decides). Idempotent: a poll already running is left alone.
+     */
+    private fun maybeStartPolling() {
+        if (!cardVisible || !isShowing) return
+        if (pollJob?.isActive == true) return
+        val pipeline = pipelineCombo.selectedItem as? GitLabPipeline ?: return
+        if (lastRenderedJobs.isNotEmpty() && !isPipelineLive(lastRenderedJobs)) return
+        startPollingLoop(pipeline.id)
+    }
+
+    /**
+     * The 5-second poll loop for [pipelineId]. Each cycle reloads that pipeline's jobs (and, every
+     * [PIPELINE_LIST_EVERY] cycles, the pipeline list) off the EDT and applies them in place on the EDT;
+     * it stops when the panel became stale/hidden or the pipeline turned terminal (after that final
+     * pass). A transient job-load error keeps the loop alive for the next cycle.
+     */
+    private fun startPollingLoop(pipelineId: Long) {
+        pollJob?.cancel()
+        pollJob = service.coroutineScope.launch {
+            var cycle = 0
+            while (isActive) {
+                delay(POLL_INTERVAL_MS)
+                cycle++
+                val ref = currentRef ?: break
+                if (selectedPipelineId != pipelineId) break
+                if (cycle % PIPELINE_LIST_EVERY == 0) {
+                    val listResult = service.getMrPipelines(ref)
+                    withContext(Dispatchers.EDT) {
+                        if (currentRef == ref && selectedPipelineId == pipelineId &&
+                            listResult is GitLabResult.Success
+                        ) {
+                            refreshPipelinesInPlace(mergeHeadPipeline(listResult.data, headPipeline))
+                        }
+                    }
+                }
+                val jobsResult = service.getPipelineJobs(ref.projectId, pipelineId)
+                val stop = withContext(Dispatchers.EDT) {
+                    if (currentRef != ref || selectedPipelineId != pipelineId) return@withContext true
+                    if (!cardVisible || !isShowing) return@withContext true
+                    when (jobsResult) {
+                        is GitLabResult.Success -> {
+                            refreshJobsInPlace(jobsResult.data)
+                            maybeReportHeadStatus(pipelineId, jobsResult.data)
+                            !isPipelineLive(jobsResult.data)
+                        }
+                        else -> false
+                    }
+                }
+                if (stop) break
+            }
+        }
+    }
+
+    /** EDT. Fires [onHeadPipelineStatusChange] when the polled head pipeline's aggregate status changed. */
+    private fun maybeReportHeadStatus(pipelineId: Long, jobs: List<GitLabJob>) {
+        if (pipelineId != headPipeline?.id) return
+        val aggregate = aggregateStatus(jobs)
+        if (aggregate != lastHeadAggregate) {
+            lastHeadAggregate = aggregate
+            onHeadPipelineStatusChange(aggregate)
+        }
     }
 
     /** Called when the Pipelines tab becomes visible; loads pipelines the first time per MR. */
@@ -278,6 +412,8 @@ class PipelinesPanel(
 
     private fun loadJobs(pipeline: GitLabPipeline) {
         val ref = currentRef ?: return
+        // A (re)load re-targets the tree; cancel any live poll — renderJobs restarts it for this pipeline.
+        stopPolling()
         rootNode.removeAllChildren()
         treeModel.reload()
         stageStrip.removeAll()
@@ -298,23 +434,112 @@ class PipelinesPanel(
         }
     }
 
-    /** EDT. Builds the stage → job tree and the stage strip, auto-expanding failed stages. */
+    /**
+     * EDT. First render of a pipeline's jobs: builds the stage → job tree and the stage strip,
+     * auto-expanding failed stages, and resets the selection. Records the jobs and (re)starts live
+     * polling if the card is up and the pipeline is still alive.
+     */
     private fun renderJobs(jobs: List<GitLabJob>) {
         val stages = groupByStage(jobs)
+        rebuildStageNodes(stages)
+        treeModel.reload()
+        expandStages(stagesToExpand(emptySet(), stages))
+        tree.emptyText.text = if (jobs.isEmpty()) CockpitBundle.message("pipelines.jobs.empty") else ""
+        renderStageStrip(stages)
+        lastRenderedJobs = jobs
+        maybeStartPolling()
+    }
 
+    /**
+     * EDT. In-place refresh of the selected pipeline's jobs (GLC-43 B): rebuilds the tree/strip while
+     * **preserving** the per-stage expansion the user had ([stagesToExpand] folds it with the failed
+     * auto-expand rule) and the current selection (by job id, else by stage name). Never touches the
+     * combo or restarts polling — that is the loop's job.
+     */
+    private fun refreshJobsInPlace(jobs: List<GitLabJob>) {
+        val stages = groupByStage(jobs)
+        val previouslyExpanded = expandedStageNames()
+        val selectedJobId = selectedJobId()
+        val selectedStage = selectedStageName()
+        rebuildStageNodes(stages)
+        treeModel.reload()
+        expandStages(stagesToExpand(previouslyExpanded, stages))
+        restoreSelection(selectedJobId, selectedStage)
+        tree.emptyText.text = if (jobs.isEmpty()) CockpitBundle.message("pipelines.jobs.empty") else ""
+        renderStageStrip(stages)
+        lastRenderedJobs = jobs
+    }
+
+    /** EDT. In-place refresh of the pipeline combo (GLC-43 B): keeps the selected pipeline by id. */
+    private fun refreshPipelinesInPlace(pipelines: List<GitLabPipeline>) {
+        if (pipelines.isEmpty()) return
+        val selected = selectedPipelineId
+        suppressComboEvents = true
+        pipelineCombo.removeAllItems()
+        pipelines.forEach { pipelineCombo.addItem(it) }
+        val target = pipelines.firstOrNull { it.id == selected } ?: pipelines.first()
+        pipelineCombo.selectedItem = target
+        suppressComboEvents = false
+        updatePipelineButtons(target.status)
+    }
+
+    /** EDT. Rebuilds the stage → job nodes under the (cleared) root; no reload/expansion. */
+    private fun rebuildStageNodes(stages: List<StageGroup>) {
         rootNode.removeAllChildren()
-        val failedStagePaths = mutableListOf<TreePath>()
         for (stage in stages) {
             val stageNode = DefaultMutableTreeNode(StageNodeData(stage))
             for (job in stage.jobs) stageNode.add(DefaultMutableTreeNode(JobNodeData(job)))
             rootNode.add(stageNode)
-            if (stage.status == "failed") failedStagePaths.add(TreePath(arrayOf<Any>(rootNode, stageNode)))
         }
-        treeModel.reload()
-        failedStagePaths.forEach { tree.expandPath(it) }
-        tree.emptyText.text = if (jobs.isEmpty()) CockpitBundle.message("pipelines.jobs.empty") else ""
+    }
 
-        renderStageStrip(stages)
+    /** EDT. Expands every top-level stage node whose name is in [names]. */
+    private fun expandStages(names: Set<String>) {
+        for (index in 0 until rootNode.childCount) {
+            val node = rootNode.getChildAt(index) as? DefaultMutableTreeNode ?: continue
+            val stage = (node.userObject as? StageNodeData)?.stage ?: continue
+            if (stage.name in names) tree.expandPath(TreePath(node.path))
+        }
+    }
+
+    /** EDT. The names of the stage nodes currently expanded in the tree. */
+    private fun expandedStageNames(): Set<String> {
+        val result = mutableSetOf<String>()
+        for (index in 0 until rootNode.childCount) {
+            val node = rootNode.getChildAt(index) as? DefaultMutableTreeNode ?: continue
+            val stage = (node.userObject as? StageNodeData)?.stage ?: continue
+            if (tree.isExpanded(TreePath(node.path))) result.add(stage.name)
+        }
+        return result
+    }
+
+    private fun selectedJobId(): Long? =
+        ((tree.lastSelectedPathComponent as? DefaultMutableTreeNode)?.userObject as? JobNodeData)?.job?.id
+
+    private fun selectedStageName(): String? =
+        ((tree.lastSelectedPathComponent as? DefaultMutableTreeNode)?.userObject as? StageNodeData)?.stage?.name
+
+    /** EDT. Reselects the job (by id) or stage (by name) that was selected before an in-place refresh. */
+    private fun restoreSelection(jobId: Long?, stageName: String?) {
+        val target = when {
+            jobId != null -> findNode { (it.userObject as? JobNodeData)?.job?.id == jobId }
+            stageName != null -> findNode { (it.userObject as? StageNodeData)?.stage?.name == stageName }
+            else -> null
+        } ?: return
+        tree.selectionPath = TreePath(target.path)
+    }
+
+    /** Depth-first (2 levels: stage → job) search for the first node matching [match]. */
+    private fun findNode(match: (DefaultMutableTreeNode) -> Boolean): DefaultMutableTreeNode? {
+        for (index in 0 until rootNode.childCount) {
+            val stageNode = rootNode.getChildAt(index) as? DefaultMutableTreeNode ?: continue
+            if (match(stageNode)) return stageNode
+            for (childIndex in 0 until stageNode.childCount) {
+                val jobNode = stageNode.getChildAt(childIndex) as? DefaultMutableTreeNode ?: continue
+                if (match(jobNode)) return jobNode
+            }
+        }
+        return null
     }
 
     private fun renderStageStrip(stages: List<StageGroup>) {
@@ -477,21 +702,26 @@ class PipelinesPanel(
         )
     }
 
-    /** Opens the non-modal streaming log viewer for [job]. */
+    /**
+     * Opens [job]'s streaming log as an editor tab (GLC-43 A): a read-only [JobLogVirtualFile] handed to
+     * the [FileEditorManager], whose [JobLogFileEditor] wraps the reused [JobLogConsole]. Opening the
+     * same job again reuses its tab (the file's identity is the job id), and the tab outlives the tool
+     * window / MR tab because it lives in the editor.
+     */
     private fun openJobLog(job: GitLabJob) {
         val ref = currentRef ?: return
-        JobLogDialog(project, service, ref.projectId, job).show()
+        FileEditorManager.getInstance(project).openFile(JobLogVirtualFile(ref.projectId, job, ref), true)
     }
 
     /**
-     * Opens the log viewer for a whole [stage]: a single-job stage reuses [openJobLog], a multi-job
-     * stage opens the tabbed [StageLogsDialog]. An empty stage does nothing.
+     * Opens a log tab for **every** job of [stage] (stages hold few jobs), each its own editor tab; the
+     * last one lands focused. An empty stage does nothing.
      */
     private fun openStageLogs(stage: StageGroup) {
         val ref = currentRef ?: return
-        when {
-            stage.jobs.size == 1 -> openJobLog(stage.jobs.first())
-            stage.jobs.isNotEmpty() -> StageLogsDialog(project, service, ref.projectId, stage).show()
+        val manager = FileEditorManager.getInstance(project)
+        for (job in stage.jobs) {
+            manager.openFile(JobLogVirtualFile(ref.projectId, job, ref), true)
         }
     }
 
@@ -579,6 +809,12 @@ class PipelinesPanel(
     }
 
     companion object {
+        /** GLC-43 B: live-status poll cadence (5s) while the pipelines card is showing and alive. */
+        private const val POLL_INTERVAL_MS = 5000L
+
+        /** GLC-43 B: refresh the pipeline list (combo) every this many poll cycles; jobs every cycle. */
+        private const val PIPELINE_LIST_EVERY = 3
+
         /**
          * `#id · status · ref · when` for the pipeline combo. The `ref` segment is dropped entirely
          * when the pipeline has no ref (external pipelines), so no doubled separator is left behind.

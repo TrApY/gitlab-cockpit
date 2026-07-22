@@ -96,6 +96,7 @@ import javax.swing.JTree
 import javax.swing.KeyStroke
 import javax.swing.tree.DefaultMutableTreeNode
 import javax.swing.tree.DefaultTreeModel
+import javax.swing.tree.TreePath
 import javax.swing.tree.TreeSelectionModel
 
 /**
@@ -808,6 +809,7 @@ class ChangesPanel(
                     revealDiscussionId = revealDiscussionId,
                     openNewThread = { side, line -> openNewThreadDialog(file, refs, side, line) },
                     onFileReviewed = { refreshReviewedAfterAutoMark() },
+                    onFileShown = { syncTreeToShownFile(file) },
                 ),
             )
         }
@@ -838,6 +840,24 @@ class ChangesPanel(
         val targetPath = if (file.deletedFile) file.oldPath else file.newPath
         val node = findFileNode(rootNode, targetPath) ?: return
         TreeUtil.selectNode(tree, node)
+    }
+
+    /**
+     * EDT callback for [CockpitDiffContext.onFileShown] (GLC-43 C14): keep the tree in step with the
+     * file whose diff is on screen as the user walks the diff chain (next/previous file). Selects the
+     * file's leaf and scrolls it into view **without requesting focus**, so the diff editor keeps the
+     * keyboard — only the visual selection follows. A no-op when the tab was unbound or the node is gone
+     * (a stale chain after a reload). Because the selection now tracks the shown file, the manual
+     * reviewed toggle (Space / right-click) acts on that file — which is what the user expects.
+     */
+    private fun syncTreeToShownFile(file: GitLabDiffFile) {
+        if (currentRef == null) return
+        val targetPath = if (file.deletedFile) file.oldPath else file.newPath
+        val node = findFileNode(rootNode, targetPath) ?: return
+        val path = TreePath(node.path)
+        if (tree.selectionPath == path) return
+        tree.selectionPath = path
+        tree.scrollPathToVisible(path)
     }
 
     /** Depth-first search for the file leaf whose [FileNode.path] equals [path]. */

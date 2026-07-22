@@ -65,6 +65,28 @@ fun aggregateStatus(jobs: List<GitLabJob>): String {
     return "success"
 }
 
+/**
+ * Whether a pipeline is still *alive* — worth polling — i.e. at least one of its [jobs] has not
+ * finished (`created` / `pending` / `running`, exactly the [isJobCancelable] set). A pipeline with no
+ * such job is terminal (all jobs `success` / `failed` / `canceled` / `manual` / `skipped`), so the
+ * live-status poller does one last pass and stops. An empty job list is not live (nothing running).
+ * Pure so the poller's start/stop decision (GLC-43 B) is unit-testable without Swing or the network.
+ */
+fun isPipelineLive(jobs: List<GitLabJob>): Boolean = jobs.any { isJobCancelable(it.status) }
+
+/**
+ * Which stage names the pipelines tree should show expanded after an in-place refresh (GLC-43 B): a
+ * stage is expanded when it is `failed` (the auto-expand rule of the first render) **or** it was
+ * [previouslyExpanded] by the user and still exists among [stages]. Keeping the set keyed by stage
+ * *name* (not by node identity) survives the tree rebuild the 5-second poll does, so a running
+ * pipeline never collapses a stage the user opened. Pure and platform-free for a direct unit test.
+ */
+fun stagesToExpand(previouslyExpanded: Set<String>, stages: List<StageGroup>): Set<String> =
+    stages.asSequence()
+        .filter { it.status == "failed" || it.name in previouslyExpanded }
+        .map { it.name }
+        .toSet()
+
 /** A job whose [status] allows a retry: it has finished (`failed` / `canceled` / `success`). */
 fun isJobRetryable(status: String): Boolean = status in RETRYABLE_STATUSES
 

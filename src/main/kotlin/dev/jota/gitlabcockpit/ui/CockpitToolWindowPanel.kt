@@ -191,8 +191,9 @@ class CockpitToolWindowPanel(
             val mr = model.getElementAt(index) ?: return null
             return mrRowTooltip(
                 mr,
-                authorLabel = CockpitBundle.message("toolwindow.mr.tooltip.author"),
-                reviewersLabel = CockpitBundle.message("toolwindow.mr.tooltip.reviewers"),
+                authorLabel = CockpitBundle.message("detail.role.author"),
+                assigneeLabel = CockpitBundle.message("detail.role.assignee"),
+                reviewerLabel = CockpitBundle.message("detail.role.reviewer"),
                 commentsWord = CockpitBundle.message("toolwindow.mr.tooltip.comments"),
             )
         }

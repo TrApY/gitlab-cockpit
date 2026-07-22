@@ -26,19 +26,26 @@ data class MrRowSegment(val text: String, val style: MrSegmentStyle)
  * a list of styled runs (an optional draft prefix, the title, an optional conflicts suffix); [line2]
  * is the fully-composed muted metadata line without the branches (all one color, hence a plain
  * string); [sourceBranch] / [targetBranch] are carried separately so the renderer can paint them as
- * rounded chips (GLC-37) rather than inline text; [reviewerOverflow] is how many reviewers exceed the
- * avatars actually shown, i.e. the `+N` badge count (0 when none).
+ * rounded chips (GLC-37) rather than inline text.
  *
  * All the composition rules live here — the draft/conflict decoration, the author display fallback,
- * the optional `group/project` prefix, the `iid`/date tail, and the reviewer overflow — so they are
+ * the optional `group/project` prefix, the `iid`/date tail, and the avatar people — so they are
  * unit-testable without Swing. See [mrRowPresentation].
+ *
+ * [avatarUsers] are the row's right-column avatars: the MR's **deduplicated** participants (author,
+ * assignees, reviewers — via [mrParticipants], the same dedup the Info header uses), in that order,
+ * capped at the shown maximum; [avatarOverflow] is how many participants exceed that cap, i.e. the
+ * `+N` badge count (0 when none). This replaces the old "author + up to 2 reviewers, no dedup, no
+ * assignees" row so a user who is e.g. both author and reviewer no longer shows twice and assignees
+ * are no longer dropped (GLC-43 C10).
  */
 data class MrRowPresentation(
     val line1: List<MrRowSegment>,
     val line2: String,
     val sourceBranch: String,
     val targetBranch: String,
-    val reviewerOverflow: Int,
+    val avatarUsers: List<GitLabUser>,
+    val avatarOverflow: Int,
 )
 
 /** Separator between the metadata parts of [MrRowPresentation.line2]. */
@@ -49,17 +56,18 @@ private const val META_SEPARATOR = " · " // " · "
  * line 2 is prefixed with the MR's `group/project` label (via [projectLabelOf]) so identically-titled
  * MRs in different projects can be told apart. [relativeUpdatedAt] is the already-formatted relative
  * timestamp the renderer supplies (kept out of here so the composition is deterministic and
- * time-independent). [maxReviewerAvatars] is how many reviewers the row shows as avatars; reviewers
- * beyond that feed [MrRowPresentation.reviewerOverflow].
+ * time-independent). [maxAvatars] is how many participant avatars the row shows; participants beyond
+ * that feed [MrRowPresentation.avatarOverflow].
  *
  * [draftPrefix] and [conflictsSuffix] are injected (defaulting to their English forms) so the
  * function needs no message bundle to be tested; the renderer passes the localized variants.
+ * [maxAvatars] is how many participant avatars the row shows before the `+N` badge takes over.
  */
 fun mrRowPresentation(
     mr: GitLabMergeRequest,
     showProject: Boolean,
     relativeUpdatedAt: String,
-    maxReviewerAvatars: Int = 2,
+    maxAvatars: Int = 3,
     draftPrefix: String = "Draft: ",
     conflictsSuffix: String = " · conflicts",
 ): MrRowPresentation {
@@ -76,37 +84,45 @@ fun mrRowPresentation(
         add(relativeUpdatedAt)
     }
 
-    val overflow = (mr.reviewers.size - maxReviewerAvatars).coerceAtLeast(0)
+    val participants = mrParticipants(mr.author, mr.assignees, mr.reviewers)
 
     return MrRowPresentation(
         line1 = line1,
         line2 = parts.joinToString(META_SEPARATOR),
         sourceBranch = mr.sourceBranch,
         targetBranch = mr.targetBranch,
-        reviewerOverflow = overflow,
+        avatarUsers = participants.take(maxAvatars).map { it.user },
+        avatarOverflow = (participants.size - maxAvatars).coerceAtLeast(0),
     )
 }
 
 /**
- * Composes the tooltip for an MR row's right column (GLC-38 / iter3 G17), describing the people and
- * comment badge painted there so hovering an otherwise-anonymous avatar tells you who it is:
- * `Author: <name> · Reviewers: <a>, <b> · <n> comments`. The reviewers and the comment count are
- * omitted when empty/zero (the author is always present), so an MR with no reviewers and no comments
- * reads as just `Author: <name>`. Names fall back to the username when blank; the label words are
- * injected (defaulting to their English forms) so the function needs no message bundle to be tested.
- * Pure and platform-free.
+ * Composes the tooltip for an MR row's right column (GLC-38 / iter3 G17; roles added in GLC-43 C10),
+ * describing the people and comment badge painted there so hovering an otherwise-anonymous avatar tells
+ * you who it is. It is built from the **same deduplicated participants** the row's avatars are ([mrParticipants]),
+ * each with its combined roles, so it never disagrees with what is shown:
+ * `Alex Marin (Author, Reviewer) · Sandra Camero (Assignee) · <n> comments`. Every participant is listed
+ * (author first), so a lone author reads as just `José Tomás (Author)`; the comment count is appended
+ * only when non-zero. Names fall back to the username when blank; the role words are injected
+ * (defaulting to their English forms) so the function needs no message bundle to be tested. Pure and
+ * platform-free.
  */
 fun mrRowTooltip(
     mr: GitLabMergeRequest,
     authorLabel: String = "Author",
-    reviewersLabel: String = "Reviewers",
+    assigneeLabel: String = "Assignee",
+    reviewerLabel: String = "Reviewer",
     commentsWord: String = "comments",
 ): String {
     fun name(user: GitLabUser): String = user.name.ifBlank { user.username }
+    fun roleLabel(role: MrRole): String = when (role) {
+        MrRole.AUTHOR -> authorLabel
+        MrRole.ASSIGNEE -> assigneeLabel
+        MrRole.REVIEWER -> reviewerLabel
+    }
     return buildList {
-        add("$authorLabel: ${name(mr.author)}")
-        if (mr.reviewers.isNotEmpty()) {
-            add("$reviewersLabel: ${mr.reviewers.joinToString(", ") { name(it) }}")
+        for (participant in mrParticipants(mr.author, mr.assignees, mr.reviewers)) {
+            add("${name(participant.user)} (${participant.roles.joinToString(", ") { roleLabel(it) }})")
         }
         val notes = mr.userNotesCount ?: 0
         if (notes > 0) add("$notes $commentsWord")

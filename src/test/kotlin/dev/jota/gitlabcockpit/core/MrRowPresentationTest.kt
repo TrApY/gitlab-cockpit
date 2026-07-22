@@ -19,6 +19,7 @@ class MrRowPresentationTest {
         authorName: String = "José Tomás",
         authorUsername: String = "jota",
         reviewers: List<GitLabUser> = emptyList(),
+        assignees: List<GitLabUser> = emptyList(),
         references: GitLabReferences? = null,
     ): GitLabMergeRequest = GitLabMergeRequest(
         iid = iid,
@@ -33,6 +34,7 @@ class MrRowPresentationTest {
         hasConflicts = hasConflicts,
         author = GitLabUser(id = 1, username = authorUsername, name = authorName),
         reviewers = reviewers,
+        assignees = assignees,
         references = references,
     )
 
@@ -103,48 +105,72 @@ class MrRowPresentationTest {
     }
 
     @Test
-    fun `reviewer overflow counts reviewers beyond the shown avatars`() {
-        val threeReviewers = mr(reviewers = listOf(reviewer(1), reviewer(2), reviewer(3)))
+    fun `avatar users are the deduplicated participants capped at three, author first`() {
+        // Author (id 1) is also a reviewer → appears once; plus one assignee and one more reviewer.
+        val author = GitLabUser(id = 1, username = "jota", name = "José Tomás")
+        val assignee = GitLabUser(id = 2, username = "sandra", name = "Sandra Camero")
+        val other = GitLabUser(id = 3, username = "alex", name = "Alex Marin")
+        val value = mr(
+            authorName = "José Tomás",
+            authorUsername = "jota",
+            assignees = listOf(assignee),
+            reviewers = listOf(author, other),
+        )
 
-        assertEquals(1, mrRowPresentation(threeReviewers, showProject = false, relativeUpdatedAt = "2h ago").reviewerOverflow)
+        val p = mrRowPresentation(value, showProject = false, relativeUpdatedAt = "2h ago")
+
+        assertEquals(listOf(author, assignee, other), p.avatarUsers)
+        assertEquals(0, p.avatarOverflow)
     }
 
     @Test
-    fun `no reviewer overflow when at or under the avatar limit`() {
-        val twoReviewers = mr(reviewers = listOf(reviewer(1), reviewer(2)))
-        val p = mrRowPresentation(twoReviewers, showProject = false, relativeUpdatedAt = "2h ago")
+    fun `avatar overflow counts participants beyond the three shown`() {
+        val value = mr(
+            reviewers = listOf(reviewer(2), reviewer(3), reviewer(4), reviewer(5)),
+        ) // author + 4 reviewers = 5 participants → 3 shown, +2
 
-        assertEquals(0, p.reviewerOverflow)
-        assertFalse(p.reviewerOverflow > 0)
+        val p = mrRowPresentation(value, showProject = false, relativeUpdatedAt = "2h ago")
+
+        assertEquals(3, p.avatarUsers.size)
+        assertEquals(2, p.avatarOverflow)
     }
 
-    // --- mrRowTooltip (G17) -------------------------------------------------------------------
+    @Test
+    fun `no avatar overflow at or under the limit`() {
+        val value = mr(reviewers = listOf(reviewer(2), reviewer(3))) // author + 2 = 3 participants
+        val p = mrRowPresentation(value, showProject = false, relativeUpdatedAt = "2h ago")
+
+        assertEquals(0, p.avatarOverflow)
+        assertFalse(p.avatarOverflow > 0)
+    }
+
+    // --- mrRowTooltip (G17, roles in C10) -----------------------------------------------------
 
     @Test
-    fun `tooltip lists author reviewers and comment count`() {
+    fun `tooltip lists each deduplicated participant with roles then the comment count`() {
+        // Alex Marin (id 1) is author AND reviewer → one entry with both roles; Sandra is the assignee.
         val value = mr(
             authorName = "Alex Marin",
-            reviewers = listOf(
-                GitLabUser(id = 2, username = "sandra", name = "Sandra Camero"),
-                GitLabUser(id = 3, username = "jota", name = "José Tomás"),
-            ),
+            authorUsername = "alex",
+            assignees = listOf(GitLabUser(id = 2, username = "sandra", name = "Sandra Camero")),
+            reviewers = listOf(GitLabUser(id = 1, username = "alex", name = "Alex Marin")),
         ).copy(userNotesCount = 4)
 
         assertEquals(
-            "Author: Alex Marin · Reviewers: Sandra Camero, José Tomás · 4 comments",
+            "Alex Marin (Author, Reviewer) · Sandra Camero (Assignee) · 4 comments",
             mrRowTooltip(value),
         )
     }
 
     @Test
-    fun `tooltip omits reviewers and comments when there are none`() {
-        assertEquals("Author: José Tomás", mrRowTooltip(mr()))
+    fun `tooltip of a lone author is just the author with the author role`() {
+        assertEquals("José Tomás (Author)", mrRowTooltip(mr()))
     }
 
     @Test
     fun `tooltip falls back to the username when a name is blank`() {
         val value = mr(authorName = "", authorUsername = "jota")
 
-        assertEquals("Author: jota", mrRowTooltip(value))
+        assertEquals("jota (Author)", mrRowTooltip(value))
     }
 }

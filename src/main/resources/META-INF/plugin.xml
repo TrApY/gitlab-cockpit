@@ -66,5 +66,14 @@
             implementation="dev.jota.gitlabcockpit.ui.diff.CockpitDiffExtension"/>
         <postStartupActivity
             implementation="dev.jota.gitlabcockpit.core.BackgroundNotificationsPoller"/>
+        <!-- Job logs open as editor tabs (GLC-43 A): the provider accepts only our JobLogVirtualFile and
+             hides the default editor for it; the icon provider paints the tab glyph from the job status
+             and the tab-title provider drops the .gitlab-log extension for a clean "<job> #<id>" title. -->
+        <fileEditorProvider
+            implementation="dev.jota.gitlabcockpit.ui.log.JobLogFileEditorProvider"/>
+        <fileIconProvider
+            implementation="dev.jota.gitlabcockpit.ui.log.JobLogIconProvider"/>
+        <editorTabTitleProvider
+            implementation="dev.jota.gitlabcockpit.ui.log.JobLogTabTitleProvider"/>
     </extensions>
 </idea-plugin>

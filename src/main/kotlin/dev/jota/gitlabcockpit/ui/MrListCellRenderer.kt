@@ -106,14 +106,12 @@ class MrListCellRenderer(
 
     private val commentsLabel = JLabel().apply { iconTextGap = JBUI.scale(2) }
 
-    /** The author's circular avatar: its own fixed element, one [RIGHT_GAP] gap from the comments badge. */
-    private val authorLabel = JLabel()
-
     /**
-     * Up to [MAX_REVIEWER_AVATARS] reviewer avatars, laid out left-to-right with a small *positive*
+     * Up to [MAX_AVATARS] participant avatars (deduplicated author + assignees + reviewers, from
+     * [mrRowPresentation]'s `avatarUsers` — GLC-43 C10), laid out left-to-right with a small *positive*
      * gap ([AVATAR_GAP]) — no negative overlap, so no avatar paints on top of another.
      */
-    private val reviewersPanel = JPanel(FlowLayout(FlowLayout.LEFT, JBUI.scale(AVATAR_GAP), 0)).apply {
+    private val avatarsPanel = JPanel(FlowLayout(FlowLayout.LEFT, JBUI.scale(AVATAR_GAP), 0)).apply {
         isOpaque = false
     }
 
@@ -121,18 +119,17 @@ class MrListCellRenderer(
 
     /**
      * The right column: one horizontal row of fixed-size elements, each separated by a [RIGHT_GAP]
-     * gap — `[pipeline icon] [comments badge] [author avatar] [reviewer avatars] [+N]`. [FlowLayout]
-     * honors every child's `preferredSize` (nothing is compressed) and centers them vertically in the
-     * [ROW_HEIGHT] row; the column reports its own preferred width, so the center text column is the
-     * one that gives way and truncates (ellipsis) when the row is narrow.
+     * gap — `[pipeline icon] [comments badge] [participant avatars] [+N]`. [FlowLayout] honors every
+     * child's `preferredSize` (nothing is compressed) and centers them vertically in the [ROW_HEIGHT]
+     * row; the column reports its own preferred width, so the center text column is the one that gives
+     * way and truncates (ellipsis) when the row is narrow.
      */
     private val rightColumn = JPanel(FlowLayout(FlowLayout.RIGHT, JBUI.scale(RIGHT_GAP), 0)).apply {
         isOpaque = false
         add(conflictsLabel)
         add(statusLabel)
         add(commentsLabel)
-        add(authorLabel)
-        add(reviewersPanel)
+        add(avatarsPanel)
         add(overflowLabel)
     }
 
@@ -167,7 +164,7 @@ class MrListCellRenderer(
             mr = value,
             showProject = showProject,
             relativeUpdatedAt = formatRelative(value.updatedAt),
-            maxReviewerAvatars = MAX_REVIEWER_AVATARS,
+            maxAvatars = MAX_AVATARS,
             draftPrefix = draftPrefix,
             conflictsSuffix = conflictsSuffix,
         )
@@ -211,16 +208,14 @@ class MrListCellRenderer(
             commentsLabel.isVisible = false
         }
 
-        authorLabel.icon = avatarCache.icon(value.author, AVATAR_SIZE) { repaintList() }
-
-        reviewersPanel.removeAll()
-        for (reviewer in value.reviewers.take(MAX_REVIEWER_AVATARS)) {
-            reviewersPanel.add(JLabel(avatarCache.icon(reviewer, AVATAR_SIZE) { repaintList() }))
+        avatarsPanel.removeAll()
+        for (user in presentation.avatarUsers) {
+            avatarsPanel.add(JLabel(avatarCache.icon(user, AVATAR_SIZE) { repaintList() }))
         }
-        reviewersPanel.isVisible = value.reviewers.isNotEmpty()
+        avatarsPanel.isVisible = presentation.avatarUsers.isNotEmpty()
 
-        if (presentation.reviewerOverflow > 0) {
-            overflowLabel.text = "+${presentation.reviewerOverflow}"
+        if (presentation.avatarOverflow > 0) {
+            overflowLabel.text = "+${presentation.avatarOverflow}"
             overflowLabel.foreground = muted
             overflowLabel.isVisible = true
         } else {
@@ -288,7 +283,7 @@ class MrListCellRenderer(
         /** Arrow rendered between the source and target branch chips. */
         private const val BRANCH_ARROW = "→"
 
-        /** How many reviewers are shown as avatars before the `+N` badge takes over. */
-        private const val MAX_REVIEWER_AVATARS = 2
+        /** How many participant avatars are shown before the `+N` badge takes over. */
+        private const val MAX_AVATARS = 3
     }
 }

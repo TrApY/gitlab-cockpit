@@ -255,4 +255,69 @@ class PipelineModelTest {
         val head = pipeline(9)
         assertEquals(listOf(head, pipeline(1)), mergeHeadPipeline(list, head))
     }
+
+    // --- isPipelineLive (GLC-43 B) ------------------------------------------------------------
+
+    @Test
+    fun `isPipelineLive is true when any job is created pending or running`() {
+        assertTrue(isPipelineLive(listOf(job("a", "build", "success"), job("b", "test", "running"))))
+        assertTrue(isPipelineLive(listOf(job("a", "build", "pending"))))
+        assertTrue(isPipelineLive(listOf(job("a", "build", "created"))))
+    }
+
+    @Test
+    fun `isPipelineLive is false when every job is terminal`() {
+        assertFalse(
+            isPipelineLive(
+                listOf(
+                    job("a", "build", "success"),
+                    job("b", "test", "failed"),
+                    job("c", "deploy", "canceled"),
+                    job("d", "manual", "manual"),
+                    job("e", "opt", "skipped"),
+                ),
+            ),
+        )
+    }
+
+    @Test
+    fun `isPipelineLive is false for an empty pipeline`() {
+        assertFalse(isPipelineLive(emptyList()))
+    }
+
+    // --- stagesToExpand (GLC-43 B) ------------------------------------------------------------
+
+    @Test
+    fun `stagesToExpand keeps a failed stage even when it was not previously expanded`() {
+        val stages = listOf(
+            StageGroup("build", listOf(job("a", "build", "success")), "success"),
+            StageGroup("test", listOf(job("b", "test", "failed")), "failed"),
+        )
+        assertEquals(setOf("test"), stagesToExpand(emptySet(), stages))
+    }
+
+    @Test
+    fun `stagesToExpand keeps a previously expanded stage that still exists`() {
+        val stages = listOf(
+            StageGroup("build", listOf(job("a", "build", "success")), "success"),
+            StageGroup("test", listOf(job("b", "test", "running")), "running"),
+        )
+        assertEquals(setOf("build"), stagesToExpand(setOf("build"), stages))
+    }
+
+    @Test
+    fun `stagesToExpand drops a previously expanded stage that no longer exists`() {
+        val stages = listOf(StageGroup("build", listOf(job("a", "build", "success")), "success"))
+        assertEquals(emptySet<String>(), stagesToExpand(setOf("gone"), stages))
+    }
+
+    @Test
+    fun `stagesToExpand unions the failed and previously expanded sets`() {
+        val stages = listOf(
+            StageGroup("build", listOf(job("a", "build", "success")), "success"),
+            StageGroup("test", listOf(job("b", "test", "running")), "running"),
+            StageGroup("deploy", listOf(job("c", "deploy", "failed")), "failed"),
+        )
+        assertEquals(setOf("build", "deploy"), stagesToExpand(setOf("build"), stages))
+    }
 }

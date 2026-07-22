@@ -65,9 +65,6 @@ object CockpitTheme {
     /** Preferred size of the new-diff-thread dialog. */
     val NEW_THREAD_DIALOG_SIZE = JBUI.size(520, 360)
 
-    /** Preferred size of the job/stage log viewer dialogs. */
-    val LOG_DIALOG_SIZE = JBUI.size(900, 600)
-
     /**
      * Background for a timeline "card" — a subtle one-step shift off the panel background so each
      * event or discussion reads as its own block without needing a divider. A function rather than a
