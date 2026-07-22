@@ -9,9 +9,11 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.runBlocking
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertSame
+import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.awt.image.BufferedImage
 import java.io.ByteArrayOutputStream
@@ -98,5 +100,36 @@ class AvatarCacheTest {
         assertNotNull(first)
         assertSame(first, second)
         assertEquals(1, calls.get())
+    }
+
+    @Test
+    fun `corrupt bytes on disk are purged and re-downloaded after the failure window`() = runBlocking {
+        val dir = tempDir()
+        val calls = AtomicInteger(0)
+        val png = pngBytes()
+        val now = AtomicLong(0L)
+        // The downloader always serves a valid PNG; the poison is a pre-existing corrupt disk file.
+        val loader = AvatarLoader(scope, { calls.incrementAndGet(); png }, dir) { now.get() }
+
+        // Seed the disk cache with a file that is not a decodable image (a truncated/rotten avatar).
+        val diskFile = dir.resolve("${AvatarLoader.sha1(avatarUrl)}.png")
+        Files.write(diskFile, byteArrayOf(1, 2, 3, 4, 5))
+
+        // First read serves the corrupt bytes, fails to render, deletes the poisoned file and does not
+        // hit the network (the bytes came from disk).
+        assertNull(loader.ensureLoaded(withAvatar, 16))
+        assertEquals(0, calls.get())
+        assertFalse(Files.exists(diskFile))
+
+        // Within the failure window the URL is skipped (still placeholder, still no download).
+        assertNull(loader.ensureLoaded(withAvatar, 16))
+        assertEquals(0, calls.get())
+
+        // After the window the file is gone, so a fresh download runs and now renders successfully.
+        now.set(11 * 60 * 1000L)
+        val icon = loader.ensureLoaded(withAvatar, 16)
+        assertNotNull(icon)
+        assertEquals(1, calls.get())
+        assertTrue(Files.exists(diskFile))
     }
 }

@@ -3,6 +3,7 @@ package dev.jota.gitlabcockpit.core
 import dev.jota.gitlabcockpit.api.GitLabDiffFile
 import dev.jota.gitlabcockpit.api.GitLabDiscussion
 import dev.jota.gitlabcockpit.api.GitLabDiscussionNote
+import dev.jota.gitlabcockpit.api.GitLabMrVersion
 import dev.jota.gitlabcockpit.api.GitLabUser
 import dev.jota.gitlabcockpit.api.NotePosition
 import org.junit.Assert.assertEquals
@@ -203,5 +204,48 @@ class ChangesModelTest {
         val byFile = discussionsByFile(listOf(first, second))
 
         assertEquals(listOf("a", "b"), byFile.getValue("src/App.kt").map { it.id })
+    }
+
+    // --- Changes version selector (GLC-41) ----------------------------------------------------
+
+    private fun version(id: Long) = GitLabMrVersion(
+        id = id,
+        headCommitSha = "head$id",
+        baseCommitSha = "base$id",
+        startCommitSha = "start$id",
+        createdAt = "2026-07-1${id}T10:00:00Z",
+    )
+
+    @Test
+    fun `changesViews prepends All changes and numbers versions oldest-first`() {
+        // GitLab returns versions newest-first: v30 is the newest push, v10 the oldest.
+        val views = changesViews(listOf(version(30), version(20), version(10)))
+
+        assertEquals(4, views.size)
+        assertEquals(ChangesView.AllChanges, views[0])
+        // Newest-first order is preserved, but the label ordinal counts from the oldest: newest = N.
+        val first = views[1] as ChangesView.Version
+        val second = views[2] as ChangesView.Version
+        val third = views[3] as ChangesView.Version
+        assertEquals(30L, first.version.id)
+        assertEquals(3, first.ordinal)
+        assertEquals(20L, second.version.id)
+        assertEquals(2, second.ordinal)
+        assertEquals(10L, third.version.id)
+        assertEquals(1, third.ordinal)
+    }
+
+    @Test
+    fun `changesViews on no versions is just All changes`() {
+        assertEquals(listOf(ChangesView.AllChanges), changesViews(emptyList()))
+    }
+
+    @Test
+    fun `versionRefs maps the version SHAs onto base head and start`() {
+        val refs = versionRefs(version(7))
+
+        assertEquals("base7", refs.baseSha)
+        assertEquals("head7", refs.headSha)
+        assertEquals("start7", refs.startSha)
     }
 }

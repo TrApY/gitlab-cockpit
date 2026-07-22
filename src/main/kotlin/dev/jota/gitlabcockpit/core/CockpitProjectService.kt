@@ -14,6 +14,7 @@ import dev.jota.gitlabcockpit.api.GitLabDiscussionNote
 import dev.jota.gitlabcockpit.api.GitLabDraftNote
 import dev.jota.gitlabcockpit.api.GitLabJob
 import dev.jota.gitlabcockpit.api.GitLabMergeRequest
+import dev.jota.gitlabcockpit.api.GitLabMrVersion
 import dev.jota.gitlabcockpit.api.GitLabNote
 import dev.jota.gitlabcockpit.api.GitLabPipeline
 import dev.jota.gitlabcockpit.api.GitLabProject
@@ -339,6 +340,16 @@ class CockpitProjectService(
             )
             client.createDiffDiscussion(ref.projectId, ref.iid, body, position)
         }
+
+    // --- MR diff versions (GLC-41) ------------------------------------------------------------
+
+    /** The MR's diff-version history (newest-first), for the "changes per version" selector. */
+    suspend fun getMrVersions(ref: MrRef): GitLabResult<List<GitLabMrVersion>> =
+        withClientAndProject { client, _ -> client.getMrVersions(ref.projectId, ref.iid) }
+
+    /** The changed files of a single diff [versionId] of [ref], for the version-scoped file tree. */
+    suspend fun getMrVersionDiffs(ref: MrRef, versionId: Long): GitLabResult<List<GitLabDiffFile>> =
+        withClientAndProject { client, _ -> client.getMrVersionDiffs(ref.projectId, ref.iid, versionId) }
 
     // --- Draft notes, review submission & resolution (F4b) ------------------------------------
 

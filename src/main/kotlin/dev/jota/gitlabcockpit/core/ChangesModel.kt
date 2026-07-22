@@ -1,7 +1,9 @@
 package dev.jota.gitlabcockpit.core
 
+import dev.jota.gitlabcockpit.api.DiffRefs
 import dev.jota.gitlabcockpit.api.GitLabDiffFile
 import dev.jota.gitlabcockpit.api.GitLabDiscussion
+import dev.jota.gitlabcockpit.api.GitLabMrVersion
 
 /**
  * How a file changed in a merge request. Derived from a [GitLabDiffFile]'s boolean flags by
@@ -78,6 +80,48 @@ fun discussionsByFile(discussions: List<GitLabDiscussion>): Map<String, List<Git
     }
     return byFile
 }
+
+// --- Changes version selector (GLC-41) --------------------------------------------------------
+
+/**
+ * A selectable entry in the Changes panel's version selector: either the default [AllChanges] view
+ * (the MR's full diff at its current head) or a concrete diff [Version]. [Version.ordinal] is the
+ * 1-based version number counting from the *oldest* push, so the newest version has the highest
+ * number ("Version N") — the human-friendly numbering GitLab's own UI uses.
+ */
+sealed interface ChangesView {
+    object AllChanges : ChangesView
+    data class Version(val version: GitLabMrVersion, val ordinal: Int) : ChangesView
+}
+
+/**
+ * Builds the version-selector options from the MR's diff [versions] as GitLab returns them
+ * (newest-first): "All changes" first, then one [ChangesView.Version] per version in the same
+ * newest-first order, each numbered so the oldest is "Version 1" and the newest is "Version N".
+ * An empty [versions] yields just [ChangesView.AllChanges].
+ */
+fun changesViews(versions: List<GitLabMrVersion>): List<ChangesView> {
+    val count = versions.size
+    return buildList {
+        add(ChangesView.AllChanges)
+        versions.forEachIndexed { index, version ->
+            // newest-first input: index 0 is the newest push → the highest ordinal (N).
+            add(ChangesView.Version(version, count - index))
+        }
+    }
+}
+
+/**
+ * The [DiffRefs] a concrete diff [version] is viewed at: base = its `base_commit_sha`, head = its
+ * `head_commit_sha`, start = its `start_commit_sha`. Returned as a [DiffRefs] so the existing
+ * base/head `getRawFile` diff flow consumes a version exactly like the MR's current diff.
+ */
+fun versionRefs(version: GitLabMrVersion): DiffRefs =
+    DiffRefs(
+        baseSha = version.baseCommitSha,
+        headSha = version.headCommitSha,
+        startSha = version.startCommitSha,
+    )
 
 /** Mutable scaffold used only while assembling the tree; converted to an immutable [FileNode]. */
 private class MutableNode(val name: String, val path: String, val isDir: Boolean) {
