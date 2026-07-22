@@ -2030,10 +2030,9 @@ class MrDetailPanel(
     ) : DialogWrapper(project) {
 
         private val titleField = JBTextField(stripDraftPrefix(mr.title), 40)
-        private val descriptionArea = JBTextArea(mr.description.orEmpty(), 12, 60).apply {
-            lineWrap = true
-            wrapStyleWord = true
-        }
+
+        /** The rich markdown description (GLC-54): a real editor with live-template placeholders. */
+        private val descriptionArea = MarkdownEditorField(project, mr.description.orEmpty())
 
         /** The MR's original target branch, for change detection (GLC-52). */
         private val originalTargetBranch: String = mr.targetBranch
@@ -2046,11 +2045,19 @@ class MrDetailPanel(
         private val originalSquash: Boolean = mr.squash
         private val squashCheck = JBCheckBox(CockpitBundle.message("dialog.editMr.squashLabel"), originalSquash)
 
-        /** Read-only "field" showing the source branch — informative, like the reference. */
-        private val sourceBranchField = JBTextField(mr.sourceBranch).apply { isEditable = false }
+        /** Read-only "field" showing the source branch — greyed like the reference's disabled fields. */
+        private val sourceBranchField = JBTextField(mr.sourceBranch).apply {
+            isEditable = false
+            isEnabled = false
+        }
 
-        /** Read-only "field" showing the MR's `group/project`; row omitted when unknown. */
-        private val sourceRepoField = projectPath?.let { JBTextField(it).apply { isEditable = false } }
+        /** Read-only "field" showing the MR's `group/project`; greyed; row omitted when unknown. */
+        private val sourceRepoField = projectPath?.let {
+            JBTextField(it).apply {
+                isEditable = false
+                isEnabled = false
+            }
+        }
 
         /** The preloaded member roster, empty until [loadRoster] lands in-modal (see the class KDoc). */
         private var roster: List<GitLabUser> = emptyList()
@@ -2116,7 +2123,8 @@ class MrDetailPanel(
                 cell(MarkdownFormatBar(descriptionArea))
             }
             row {
-                cell(JBScrollPane(descriptionArea).apply { preferredSize = CockpitTheme.EDIT_MR_DIALOG_SIZE })
+                // The editor field scrolls itself; sized like the old scroll wrapper.
+                cell(descriptionArea.apply { preferredSize = CockpitTheme.EDIT_MR_DIALOG_SIZE })
                     .align(Align.FILL)
             }.resizableRow()
             row(CockpitBundle.message("dialog.editMr.labelsLabel")) {
@@ -2488,7 +2496,7 @@ class MrDetailPanel(
      * [area]'s current selection via [wrapMarkdown] and restoring the selection the wrap yields.
      */
     private class MarkdownFormatBar(
-        private val area: JBTextArea,
+        private val field: MarkdownEditorField,
     ) : JPanel(BorderLayout()) {
         init {
             isOpaque = false
@@ -2504,9 +2512,11 @@ class MrDetailPanel(
                 ),
                 formatAction("detail.composer.format.quote", CockpitIcons.formatQuote, MarkdownMarker.QUOTE),
                 formatAction("detail.composer.format.link", CockpitIcons.copyLink, MarkdownMarker.LINK),
+                tableAction(),
+                emojiAction(),
             )
             val toolbar = ActionManager.getInstance().createActionToolbar(TOOLBAR_PLACE, group, true)
-            toolbar.targetComponent = area
+            toolbar.targetComponent = field
             toolbar.component.isOpaque = false
             add(toolbar.component, BorderLayout.WEST)
         }
@@ -2514,16 +2524,44 @@ class MrDetailPanel(
         private fun formatAction(tooltipKey: String, icon: Icon, marker: MarkdownMarker): AnAction =
             object : AnAction(CockpitBundle.message(tooltipKey), null, icon) {
                 override fun getActionUpdateThread(): ActionUpdateThread = ActionUpdateThread.BGT
-                override fun actionPerformed(e: AnActionEvent) = applyFormat(marker)
+                override fun actionPerformed(e: AnActionEvent) = field.applyMarker(marker)
             }
 
-        /** Applies [marker] to the current selection and restores the caret/selection the wrap yields. */
-        private fun applyFormat(marker: MarkdownMarker) {
-            val result = wrapMarkdown(area.text, area.selectionStart, area.selectionEnd, marker)
-            area.text = result.text
-            area.select(result.selectionStart, result.selectionEnd)
-            area.requestFocusInWindow()
-        }
+        /** Inserts the 2×2 table live template with a Tab stop per cell (GLC-54). */
+        private fun tableAction(): AnAction =
+            object : AnAction(CockpitBundle.message("detail.composer.format.table"), null, CockpitIcons.formatTable) {
+                override fun getActionUpdateThread(): ActionUpdateThread = ActionUpdateThread.BGT
+                override fun actionPerformed(e: AnActionEvent) = field.insertTable()
+            }
+
+        /** Opens the emoji grid (the reactions set) and inserts the pick at the caret (GLC-54). */
+        private fun emojiAction(): AnAction =
+            object : AnAction(CockpitBundle.message("detail.composer.format.emoji"), null, CockpitIcons.addEmoji) {
+                override fun getActionUpdateThread(): ActionUpdateThread = ActionUpdateThread.BGT
+                override fun actionPerformed(e: AnActionEvent) {
+                    val row = JPanel(FlowLayout(FlowLayout.CENTER, JBUI.scale(2), JBUI.scale(2)))
+                        .apply { isOpaque = false }
+                    lateinit var popup: JBPopup
+                    for ((name, emoji) in AwardEmoji.STANDARD) {
+                        row.add(
+                            JButton(emoji).apply {
+                                toolTipText = name
+                                margin = JBUI.insets(2)
+                                addActionListener {
+                                    popup.closeOk(null)
+                                    field.insertAtCaret(emoji)
+                                }
+                            },
+                        )
+                    }
+                    popup = JBPopupFactory.getInstance()
+                        .createComponentPopupBuilder(row, null)
+                        .setRequestFocus(true)
+                        .createPopup()
+                    val anchor = e.inputEvent?.component as? JComponent ?: field
+                    popup.showUnderneathOf(anchor)
+                }
+            }
 
         companion object {
             /** The toolbar "place" id for the shared markdown format bar. */
@@ -2540,10 +2578,8 @@ class MrDetailPanel(
         private val editMode: Boolean = false,
     ) : DialogWrapper(project) {
 
-        private val area = JBTextArea(initialText, COMPOSER_ROWS, 60).apply {
-            lineWrap = true
-            wrapStyleWord = true
-        }
+        /** The rich markdown input (GLC-54): a real editor with live-template placeholders. */
+        private val area = MarkdownEditorField(project, initialText)
         private val startReviewCheck = JBCheckBox(CockpitBundle.message("detail.composer.startReview"))
 
         init {
@@ -2556,7 +2592,8 @@ class MrDetailPanel(
         override fun createCenterPanel(): JComponent = panel {
             row { cell(MarkdownFormatBar(area)) }
             row {
-                cell(JBScrollPane(area)).align(Align.FILL)
+                // The editor field scrolls itself when multiline; no JBScrollPane wrapper needed.
+                cell(area).align(Align.FILL)
             }.resizableRow()
             // Edit mode publishes the change directly — there is no draft/"start review" flow.
             if (!editMode) row { cell(startReviewCheck) }

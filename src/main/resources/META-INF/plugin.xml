@@ -48,7 +48,7 @@
              the list tab stays non-closeable via its own Content.isCloseable=false. -->
         <toolWindow
             id="GitLab Cockpit"
-            anchor="right"
+            anchor="bottom"
             canCloseContents="true"
             factoryClass="dev.jota.gitlabcockpit.ui.CockpitToolWindowFactory"
             icon="/icons/toolwindow.svg"/>

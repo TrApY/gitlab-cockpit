@@ -87,6 +87,7 @@ object CockpitIcons {
     val formatCode: Icon = IconLoader.getIcon("/icons/markdown/codeSpan.svg", CockpitIcons::class.java)
     val formatCodeBlock: Icon = IconLoader.getIcon("/icons/markdown/codeBlock.svg", CockpitIcons::class.java)
     val formatQuote: Icon = IconLoader.getIcon("/icons/markdown/quote.svg", CockpitIcons::class.java)
+    val formatTable: Icon = IconLoader.getIcon("/icons/markdown/table.svg", CockpitIcons::class.java)
 
     /**
      * Maps a timeline [eventIconKey] to the concrete [Icon] a native event card paints (GLC-38 / iter3
