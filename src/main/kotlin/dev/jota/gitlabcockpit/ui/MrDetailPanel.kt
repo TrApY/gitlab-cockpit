@@ -15,6 +15,7 @@ import com.intellij.openapi.actionSystem.Toggleable
 import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.application.EDT
 import com.intellij.openapi.application.ModalityState
+import com.intellij.openapi.application.asContextElement
 import com.intellij.openapi.ide.CopyPasteManager
 import com.intellij.openapi.progress.ProgressIndicator
 import com.intellij.openapi.progress.Task
@@ -1917,10 +1918,14 @@ class MrDetailPanel(
      * the MR's project rather than the git-resolved one.
      */
     private fun withMembers(projectId: Long, onLoaded: (List<GitLabUser>) -> Unit) {
+        // Capture the caller's modality (we are on the EDT, possibly inside a modal dialog): plain
+        // Dispatchers.EDT resumes with NON_MODAL, which the platform DEFERS while a modal is open —
+        // the picker would only appear after closing the Edit MR dialog (GLC-49).
+        val modality = ModalityState.current()
         cursor = Cursor.getPredefinedCursor(Cursor.WAIT_CURSOR)
         service.coroutineScope.launch {
             val result = service.getMembers(projectId)
-            withContext(Dispatchers.EDT) {
+            withContext(Dispatchers.EDT + modality.asContextElement()) {
                 cursor = Cursor.getDefaultCursor()
                 when (result) {
                     is GitLabResult.Success -> onLoaded(result.data)
@@ -1936,10 +1941,12 @@ class MrDetailPanel(
      * projects" mode, the picker lists the labels of the MR's project rather than the git-resolved one.
      */
     private fun withLabels(projectId: Long, onLoaded: (List<GitLabLabel>) -> Unit) {
+        // Same modality capture as [withMembers] (GLC-49): resume inside the open modal, not after it.
+        val modality = ModalityState.current()
         cursor = Cursor.getPredefinedCursor(Cursor.WAIT_CURSOR)
         service.coroutineScope.launch {
             val result = service.getProjectLabels(projectId)
-            withContext(Dispatchers.EDT) {
+            withContext(Dispatchers.EDT + modality.asContextElement()) {
                 cursor = Cursor.getDefaultCursor()
                 when (result) {
                     is GitLabResult.Success -> onLoaded(result.data)
