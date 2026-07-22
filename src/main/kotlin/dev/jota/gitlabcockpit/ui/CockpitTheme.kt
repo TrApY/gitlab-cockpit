@@ -4,7 +4,10 @@ import com.intellij.ui.ColorUtil
 import com.intellij.ui.JBColor
 import com.intellij.util.ui.JBUI
 import com.intellij.util.ui.UIUtil
+import dev.jota.gitlabcockpit.core.EmojiCatalog
 import java.awt.Color
+import java.awt.Font
+import java.awt.GraphicsEnvironment
 
 /**
  * Single source of visual style for the plugin: the semantic status palette, the one status→color
@@ -64,6 +67,22 @@ object CockpitTheme {
 
     /** Preferred size of the Edit-MR "+" member-search popup (search field + candidate list, GLC-50). */
     val MEMBER_POPUP_SIZE = JBUI.size(260, 240)
+
+    /** Preferred size of the composer's searchable emoji catalog popup (GLC-56). */
+    val EMOJI_POPUP_SIZE = JBUI.size(380, 340)
+
+    /** First installed emoji-capable font family from [EmojiCatalog.PREFERRED_FONTS], if any. */
+    private val emojiFamily: String? by lazy {
+        val available = GraphicsEnvironment.getLocalGraphicsEnvironment().availableFontFamilyNames.toSet()
+        EmojiCatalog.PREFERRED_FONTS.firstOrNull { it in available }
+    }
+
+    /**
+     * [base] switched to the platform-preferred color-emoji font at the same size (GLC-56, the same
+     * font list the IDE's own reaction picker uses) — emojis render in color instead of monochrome
+     * fallback glyphs, notably on Linux. Returns [base] untouched when none of the fonts is installed.
+     */
+    fun emojiFont(base: Font): Font = emojiFamily?.let { Font(it, Font.PLAIN, base.size) } ?: base
 
     /** Preferred size of the edit-title/description dialog's description area. */
     val EDIT_MR_DIALOG_SIZE = JBUI.size(560, 300)

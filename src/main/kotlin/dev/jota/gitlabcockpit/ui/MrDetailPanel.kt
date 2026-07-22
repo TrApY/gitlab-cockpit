@@ -64,6 +64,7 @@ import dev.jota.gitlabcockpit.core.COCKPIT_NOTIFICATION_GROUP
 import dev.jota.gitlabcockpit.core.CheckoutTarget
 import dev.jota.gitlabcockpit.core.Closing
 import dev.jota.gitlabcockpit.core.CockpitProjectService
+import dev.jota.gitlabcockpit.core.EmojiCatalog
 import dev.jota.gitlabcockpit.core.CommentThread
 import dev.jota.gitlabcockpit.core.LabelSelectionModel
 import dev.jota.gitlabcockpit.core.MarkdownMarker
@@ -114,6 +115,7 @@ import java.awt.Cursor
 import java.awt.Dimension
 import java.awt.Rectangle
 import java.awt.FlowLayout
+import java.awt.GridLayout
 import java.awt.Font
 import java.awt.Graphics
 import java.awt.Graphics2D
@@ -130,6 +132,7 @@ import java.awt.event.WindowEvent
 import java.awt.geom.RoundRectangle2D
 import java.util.concurrent.ConcurrentHashMap
 import javax.swing.Action
+import javax.swing.BoxLayout
 import javax.swing.Icon
 import javax.swing.JButton
 import javax.swing.JComponent
@@ -1646,6 +1649,7 @@ class MrDetailPanel(
                 JButton(emoji).apply {
                     toolTipText = name
                     margin = JBUI.insets(2)
+                    font = CockpitTheme.emojiFont(font)
                     addActionListener {
                         popup.closeOk(null)
                         toggleReaction(note, name, mine, onChanged)
@@ -2534,28 +2538,83 @@ class MrDetailPanel(
                 override fun actionPerformed(e: AnActionEvent) = field.insertTable()
             }
 
-        /** Opens the emoji grid (the reactions set) and inserts the pick at the caret (GLC-54). */
+        /**
+         * Opens the full searchable emoji catalog (GLC-56, like the reference's picker): search field
+         * on top, category sections below (a flat result grid while typing), click inserts at the
+         * caret and closes.
+         */
         private fun emojiAction(): AnAction =
             object : AnAction(CockpitBundle.message("detail.composer.format.emoji"), null, CockpitIcons.addEmoji) {
                 override fun getActionUpdateThread(): ActionUpdateThread = ActionUpdateThread.BGT
                 override fun actionPerformed(e: AnActionEvent) {
-                    val row = JPanel(FlowLayout(FlowLayout.CENTER, JBUI.scale(2), JBUI.scale(2)))
-                        .apply { isOpaque = false }
+                    val searchField = SearchTextField()
+                    val grid = JPanel().apply {
+                        layout = BoxLayout(this, BoxLayout.Y_AXIS)
+                        isOpaque = false
+                    }
                     lateinit var popup: JBPopup
-                    for ((name, emoji) in AwardEmoji.STANDARD) {
-                        row.add(
-                            JButton(emoji).apply {
-                                toolTipText = name
-                                margin = JBUI.insets(2)
-                                addActionListener {
-                                    popup.closeOk(null)
-                                    field.insertAtCaret(emoji)
-                                }
+
+                    fun emojiButton(entry: EmojiCatalog.Entry) = JButton(entry.emoji).apply {
+                        toolTipText = entry.name
+                        margin = JBUI.insets(2)
+                        isContentAreaFilled = false
+                        isBorderPainted = false
+                        font = CockpitTheme.emojiFont(font)
+                        addActionListener {
+                            popup.closeOk(null)
+                            field.insertAtCaret(entry.emoji)
+                        }
+                    }
+
+                    fun section(entries: List<EmojiCatalog.Entry>) =
+                        JPanel(GridLayout(0, EMOJI_COLUMNS, JBUI.scale(2), JBUI.scale(2))).apply {
+                            isOpaque = false
+                            alignmentX = Component.LEFT_ALIGNMENT
+                            entries.forEach { add(emojiButton(it)) }
+                        }
+
+                    fun repopulate() {
+                        grid.removeAll()
+                        val query = searchField.text
+                        if (query.isBlank()) {
+                            for (category in EmojiCatalog.CATEGORIES) {
+                                grid.add(
+                                    JBLabel(category.title).apply {
+                                        foreground = CockpitTheme.muted()
+                                        border = JBUI.Borders.empty(6, 4, 2, 4)
+                                        alignmentX = Component.LEFT_ALIGNMENT
+                                    },
+                                )
+                                grid.add(section(category.entries))
+                            }
+                        } else {
+                            grid.add(section(EmojiCatalog.search(query)))
+                        }
+                        grid.revalidate()
+                        grid.repaint()
+                    }
+
+                    searchField.addDocumentListener(object : javax.swing.event.DocumentListener {
+                        override fun insertUpdate(e: javax.swing.event.DocumentEvent) = repopulate()
+                        override fun removeUpdate(e: javax.swing.event.DocumentEvent) = repopulate()
+                        override fun changedUpdate(e: javax.swing.event.DocumentEvent) = repopulate()
+                    })
+                    repopulate()
+
+                    val content = JPanel(BorderLayout(0, JBUI.scale(4))).apply {
+                        add(searchField, BorderLayout.NORTH)
+                        add(
+                            JBScrollPane(grid).apply {
+                                preferredSize = CockpitTheme.EMOJI_POPUP_SIZE
+                                horizontalScrollBarPolicy =
+                                    javax.swing.ScrollPaneConstants.HORIZONTAL_SCROLLBAR_NEVER
                             },
+                            BorderLayout.CENTER,
                         )
+                        border = JBUI.Borders.empty(4)
                     }
                     popup = JBPopupFactory.getInstance()
-                        .createComponentPopupBuilder(row, null)
+                        .createComponentPopupBuilder(content, searchField)
                         .setRequestFocus(true)
                         .createPopup()
                     val anchor = e.inputEvent?.component as? JComponent ?: field
@@ -2711,6 +2770,7 @@ class MrDetailPanel(
         init {
             isOpaque = false
             border = JBUI.Borders.empty(1, 6)
+            font = CockpitTheme.emojiFont(font)
         }
 
         override fun paintComponent(g: Graphics) {
@@ -2754,6 +2814,9 @@ class MrDetailPanel(
 
         /** Vertical gap (unscaled px) between two native timeline cards (iter3 B). */
         private const val TIMELINE_CARD_GAP = 8
+
+        /** Columns of the emoji catalog grid (GLC-56). */
+        private const val EMOJI_COLUMNS = 10
 
         /** Vertical gap (unscaled px) between the Info header's rows — the reference's airy spacing (GLC-48). */
         private const val HEADER_ROW_GAP = 8
