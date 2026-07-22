@@ -4,6 +4,24 @@
 
 ## [Unreleased]
 
+### Added
+
+- Complete native-style redesign (modeled on the JetBrains GitLab plugin): two-line MR list with avatars, branch chips, comment/pipeline badges and per-avatar tooltips
+- Per-MR editor-style tabs with a single review view — changes tree beside Info | Events & Discussions — and Pipelines as a drill-in from the pipeline status
+- Vertical MR action toolbar: approve/revoke, request changes, refresh, checkout of the source branch, close, copy link, open in browser and watch
+- Unified Edit Merge Request dialog: title, description, assignees, reviewers, labels and mark-as-draft
+- Events & Discussions timeline as rounded cards: system events, emoji reactions, hover actions (edit/delete/copy comment link), search, filters and a floating markdown composer with review drafts (threaded reply drafts included)
+- Job logs open as editor tabs with live streaming; the pipeline view refreshes in real time while visible
+- Changes-by-version selector, reviewed-files tracking with auto-mark from the diff, real file-type icons and change-type colors
+
+### Changed
+
+- Every status surface uses the platform's circled New-UI icons; people, comment and branch glyphs match the JetBrains collaboration icon set
+
+### Fixed
+
+- The "Events & Discussions" tab losing its ampersand (bundle mnemonic processing), duplicated avatars in list rows, the frozen tree/info splitter after opening Pipelines, MR tabs that could not be closed, and the changes tree now follows diff navigation
+
 ## [0.12.1] - 2026-07-21
 
 ### Added
