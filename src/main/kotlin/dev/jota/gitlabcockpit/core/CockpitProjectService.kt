@@ -14,6 +14,7 @@ import dev.jota.gitlabcockpit.api.GitLabDiscussion
 import dev.jota.gitlabcockpit.api.GitLabDiscussionNote
 import dev.jota.gitlabcockpit.api.GitLabDraftNote
 import dev.jota.gitlabcockpit.api.GitLabJob
+import dev.jota.gitlabcockpit.api.GitLabLabel
 import dev.jota.gitlabcockpit.api.GitLabMergeRequest
 import dev.jota.gitlabcockpit.api.GitLabMrVersion
 import dev.jota.gitlabcockpit.api.GitLabNote
@@ -27,6 +28,8 @@ import dev.jota.gitlabcockpit.api.PositionPayload
 import dev.jota.gitlabcockpit.api.TraceChunk
 import dev.jota.gitlabcockpit.settings.GitLabCockpitSettings
 import dev.jota.gitlabcockpit.settings.TokenStore
+import git4idea.repo.GitRemote
+import git4idea.repo.GitRepository
 import git4idea.repo.GitRepositoryManager
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.async
@@ -46,6 +49,13 @@ fun userNotes(notes: List<GitLabNote>): List<GitLabNote> = notes.filterNot { it.
  * first error message (already localized to a short `HTTP nnn` / network cause string).
  */
 data class RetryStageResult(val retried: Int, val firstError: String?)
+
+/**
+ * The git [repository] and its [remote] to check an MR's source branch into (GLC-42). Resolved by
+ * [CockpitProjectService.resolveCheckoutTarget] from the same remote/project resolution the tool
+ * window already uses, so the checkout targets the exact repository the cockpit is talking to.
+ */
+data class CheckoutTarget(val repository: GitRepository, val remote: GitRemote)
 
 /** Snapshot the tool window renders. Every terminal outcome of a load maps to one of these. */
 sealed interface CockpitState {
@@ -208,6 +218,14 @@ class CockpitProjectService(
                 if (it is GitLabResult.Success) cachedMembers[glProject.id] = it.data
             }
         }
+
+    /**
+     * The labels defined in [projectId] (its own plus ancestor-group labels), for the Edit dialog's
+     * label picker (GLC-42). The MR's own project id is passed so, in the "All projects" mode, the
+     * picker lists the labels of the MR's project rather than the git-resolved one.
+     */
+    suspend fun getProjectLabels(projectId: Long): GitLabResult<List<GitLabLabel>> =
+        withClientAndProject { client, _ -> client.getProjectLabels(projectId) }
 
     /** Applies a partial update to an MR and returns the updated MR. */
     suspend fun updateMr(ref: MrRef, update: MergeRequestUpdate): GitLabResult<GitLabMergeRequest> =
@@ -751,6 +769,35 @@ class CockpitProjectService(
             if (coords != null) candidates.add(CandidateRemote(coords, repo.root.path))
         }
         return orderCandidates(candidates, project.basePath)
+    }
+
+    /**
+     * Resolves the git [CheckoutTarget] — the [GitRepository] and the [GitRemote] — the local checkout
+     * action should fetch from and check out into (GLC-42), reusing the exact same host/remote/project
+     * resolution the tool window uses (see [findMatchingRemotes] / [chooseRemote]). Returns `null` when
+     * no configured instance, no matching git remote, or no repository/remote can be resolved — the
+     * checkout action then stays disabled. Synchronous and side-effect-free (only reads in-memory git
+     * state), so the toolbar's action `update` can call it on the EDT.
+     */
+    fun resolveCheckoutTarget(): CheckoutTarget? {
+        val baseUrl = GitLabCockpitSettings.getInstance().instances.firstOrNull()?.baseUrl?.trim().orEmpty()
+        if (baseUrl.isEmpty()) return null
+        val instanceHost = GitLabProjectResolver.hostOf(baseUrl) ?: return null
+
+        val candidates = findMatchingRemotes(instanceHost)
+        val chosen = chooseRemote(candidates, persistedRemotePath(), project.basePath) ?: return null
+
+        val repo = GitRepositoryManager.getInstance(project).repositories
+            .firstOrNull { it.root.path == chosen.rootPath } ?: return null
+        val remote = repo.remotes.firstOrNull { remote ->
+            remote.urls.any { url ->
+                GitLabProjectResolver.parseRemoteUrl(url)?.let {
+                    it.host.equals(instanceHost, ignoreCase = true) &&
+                        it.pathWithNamespace == chosen.coords.pathWithNamespace
+                } == true
+            }
+        } ?: return null
+        return CheckoutTarget(repo, remote)
     }
 
     private fun httpError(error: GitLabResult.HttpError): CockpitState.Error =

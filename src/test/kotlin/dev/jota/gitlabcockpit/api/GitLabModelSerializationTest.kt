@@ -29,6 +29,7 @@ class GitLabModelSerializationTest {
               "draft": true,
               "has_conflicts": true,
               "merge_status": "can_be_merged",
+              "source_project_id": 100,
               "labels": ["frontend", "ci"],
               "author": {"id": 1, "username": "jota", "name": "Jo Ta", "state": "active"},
               "references": {"short": "!42", "relative": "!42", "full": "group/project!42"},
@@ -57,6 +58,9 @@ class GitLabModelSerializationTest {
         assertEquals("jota", mr.author.username)
         assertEquals(listOf("rev1", "rev2"), mr.reviewers.map { it.username })
         assertEquals(listOf("asg1"), mr.assignees.map { it.username })
+        // GLC-42: labels parse as a plain list of names; a same-project MR's source_project_id == project_id.
+        assertEquals(listOf("frontend", "ci"), mr.labels)
+        assertEquals(100L, mr.sourceProjectId)
     }
 
     @Test
@@ -94,6 +98,9 @@ class GitLabModelSerializationTest {
         // Notification fields (GLC-27) default to null when absent.
         assertNull(mr.sha)
         assertNull(mr.userNotesCount)
+        // GLC-42 fields default when absent.
+        assertNull(mr.sourceProjectId)
+        assertTrue(mr.labels.isEmpty())
     }
 
     @Test

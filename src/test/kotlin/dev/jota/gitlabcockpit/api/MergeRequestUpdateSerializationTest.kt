@@ -61,4 +61,24 @@ class MergeRequestUpdateSerializationTest {
     fun `a null state_event is omitted`() {
         assertEquals("""{"title":"New title"}""", encode(MergeRequestUpdate(title = "New title", stateEvent = null)))
     }
+
+    @Test
+    fun `labels serialize as a csv string when set`() {
+        assertEquals("""{"labels":"frontend,ci"}""", encode(MergeRequestUpdate(labels = "frontend,ci")))
+    }
+
+    @Test
+    fun `an empty labels string is kept (it clears every label)`() {
+        assertEquals("""{"labels":""}""", encode(MergeRequestUpdate(labels = "")))
+    }
+
+    @Test
+    fun `a null labels field is omitted`() {
+        assertEquals("""{"title":"x"}""", encode(MergeRequestUpdate(title = "x", labels = null)))
+    }
+
+    @Test
+    fun `title carrying a draft prefix serializes verbatim (draft toggled via the title)`() {
+        assertEquals("""{"title":"Draft: Feature"}""", encode(MergeRequestUpdate(title = "Draft: Feature")))
+    }
 }

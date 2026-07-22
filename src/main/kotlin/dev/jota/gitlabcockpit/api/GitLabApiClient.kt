@@ -59,6 +59,13 @@ data class GitLabMergeRequest(
      * share the same [iid] space (see [dev.jota.gitlabcockpit.core.MrRef]).
      */
     @SerialName("project_id") val projectId: Long,
+    /**
+     * The id of the project the MR's *source* branch lives in (`source_project_id`), returned by the
+     * detail endpoint. For a same-project MR it equals [projectId]; for a fork MR it differs. The local
+     * checkout action (GLC-42) is only offered for same-project MRs, so it compares the two; nullable
+     * because the list endpoint / a trimmed payload may omit it (then checkout is disabled).
+     */
+    @SerialName("source_project_id") val sourceProjectId: Long? = null,
     val title: String,
     val state: String,
     @SerialName("source_branch") val sourceBranch: String,
@@ -125,6 +132,13 @@ data class GitLabMergeRequest(
      * trimmed payload may omit it.
      */
     @SerialName("user_notes_count") val userNotesCount: Int? = null,
+    /**
+     * The MR's label names (GLC-42). Both the list and the detail endpoints return `labels` as a
+     * plain array of names (the default representation, without `with_labels_details`), so this is a
+     * simple `List<String>`; it drives the read-only label chips on the Info header and pre-checks the
+     * label picker in the Edit dialog. Defaults to empty when the payload omits it.
+     */
+    val labels: List<String> = emptyList(),
 )
 
 /**
@@ -134,6 +148,18 @@ data class GitLabMergeRequest(
 @Serializable
 data class GitLabReferences(
     @SerialName("full") val full: String,
+)
+
+/**
+ * A project (or ancestor-group) label from `GET /projects/:id/labels` (GLC-42). Only [name] (the
+ * label text, also what the MR update API expects in its CSV) and [color] (a `#rrggbb` hex string,
+ * used for the chip's color dot) are modeled; the rest of GitLab's label payload (`id`, `text_color`,
+ * `description`, the counts…) is ignored by the configured [Json].
+ */
+@Serializable
+data class GitLabLabel(
+    val name: String,
+    val color: String,
 )
 
 /**
@@ -212,6 +238,14 @@ data class MergeRequestUpdate(
      * never set it) keep serializing without a `state_event` key; only the Close action populates it.
      */
     @SerialName("state_event") val stateEvent: String? = null,
+    /**
+     * The MR's full label set as a comma-separated list of names (GLC-42). GitLab's update endpoint
+     * treats `labels` as a *replacement* of the whole set, so the caller sends the complete CSV of the
+     * chosen labels (an empty string clears them). Nullable so an update that does not touch labels
+     * keeps serializing without a `labels` key; only the Edit dialog populates it, and only when the
+     * selection actually changed.
+     */
+    val labels: String? = null,
 )
 
 /** Approval state of a merge request from `/merge_requests/:iid/approvals`. */
@@ -574,6 +608,19 @@ class GitLabApiClient(
         }
         return GitLabResult.Success(all)
     }
+
+    /**
+     * Calls `GET /projects/:id/labels?per_page=100&include_ancestor_groups=true` — the project's own
+     * labels plus its ancestor groups' (so a group label the MR carries is included in the picker
+     * roster). Only the first 100 are fetched (a single page); a project with more labels than that is
+     * not expected in practice, and the picker's incremental search still narrows what is shown.
+     */
+    suspend fun getProjectLabels(projectId: Long): GitLabResult<List<GitLabLabel>> =
+        get(
+            "/projects/$projectId/labels",
+            listOf("per_page" to "100", "include_ancestor_groups" to "true"),
+            ListSerializer(GitLabLabel.serializer()),
+        )
 
     /**
      * Calls `PUT /projects/:id/merge_requests/:iid` with only the non-null attributes of [update].

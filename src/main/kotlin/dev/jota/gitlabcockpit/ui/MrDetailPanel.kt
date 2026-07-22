@@ -12,8 +12,12 @@ import com.intellij.openapi.actionSystem.AnAction
 import com.intellij.openapi.actionSystem.AnActionEvent
 import com.intellij.openapi.actionSystem.DefaultActionGroup
 import com.intellij.openapi.actionSystem.Toggleable
+import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.application.EDT
+import com.intellij.openapi.application.ModalityState
 import com.intellij.openapi.ide.CopyPasteManager
+import com.intellij.openapi.progress.ProgressIndicator
+import com.intellij.openapi.progress.Task
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.ui.ComboBox
 import com.intellij.openapi.ui.DialogWrapper
@@ -47,6 +51,7 @@ import dev.jota.gitlabcockpit.CockpitBundle
 import dev.jota.gitlabcockpit.api.GitLabApprovals
 import dev.jota.gitlabcockpit.api.GitLabAward
 import dev.jota.gitlabcockpit.api.GitLabDiscussionNote
+import dev.jota.gitlabcockpit.api.GitLabLabel
 import dev.jota.gitlabcockpit.api.GitLabMergeRequest
 import dev.jota.gitlabcockpit.api.GitLabNote
 import dev.jota.gitlabcockpit.api.GitLabResult
@@ -55,9 +60,11 @@ import dev.jota.gitlabcockpit.api.MergeRequestUpdate
 import dev.jota.gitlabcockpit.core.ApprovalsHealth
 import dev.jota.gitlabcockpit.core.AwardEmoji
 import dev.jota.gitlabcockpit.core.COCKPIT_NOTIFICATION_GROUP
+import dev.jota.gitlabcockpit.core.CheckoutTarget
 import dev.jota.gitlabcockpit.core.Closing
 import dev.jota.gitlabcockpit.core.CockpitProjectService
 import dev.jota.gitlabcockpit.core.CommentThread
+import dev.jota.gitlabcockpit.core.LabelSelectionModel
 import dev.jota.gitlabcockpit.core.MarkdownMarker
 import dev.jota.gitlabcockpit.core.MergeAction
 import dev.jota.gitlabcockpit.core.MergeLinePresentation
@@ -68,6 +75,7 @@ import dev.jota.gitlabcockpit.core.MrRef
 import dev.jota.gitlabcockpit.core.MrRole
 import dev.jota.gitlabcockpit.core.TimelineFilter
 import dev.jota.gitlabcockpit.core.TimelineItem
+import dev.jota.gitlabcockpit.core.applyDraftState
 import dev.jota.gitlabcockpit.core.approvalsHealth
 import dev.jota.gitlabcockpit.core.buildTimeline
 import dev.jota.gitlabcockpit.core.commentThreads
@@ -78,9 +86,12 @@ import dev.jota.gitlabcockpit.core.mergeButtonState
 import dev.jota.gitlabcockpit.core.mrHeaderPresentation
 import dev.jota.gitlabcockpit.core.mrParticipants
 import dev.jota.gitlabcockpit.core.projectWebUrlOf
+import dev.jota.gitlabcockpit.core.stripDraftPrefix
 import dev.jota.gitlabcockpit.core.threadAnchorLabel
 import dev.jota.gitlabcockpit.core.wrapMarkdown
 import dev.jota.gitlabcockpit.settings.GitLabCockpitSettings
+import git4idea.branch.GitBrancher
+import git4idea.fetch.GitFetchSupport
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.async
@@ -175,6 +186,16 @@ class MrDetailPanel(
     /** Recreated by [buildHeader]; the async approvals load fills them (two-tone: label + muted detail). */
     private var approvalsPrefixLabel: JBLabel? = null
     private var approvalsDetailLabel: JBLabel? = null
+
+    /** The header's read-only label-chips line (GLC-42); recreated by [buildHeader], re-colored async. */
+    private var labelsLine: JPanel? = null
+
+    /**
+     * Label name → `#rrggbb` color, cached per project (GLC-42). The MR payload carries only label
+     * *names*, so their colors are fetched once per project (label colors rarely change) and reused to
+     * paint the read-only chips' color dots on both the Info header and later MRs of the same project.
+     */
+    private val labelColorsByProject = ConcurrentHashMap<Long, Map<String, String>>()
 
     /** The contextual Merge / Set auto-merge link on the merge-readiness line; disabled while merging. */
     private var mergeLink: ActionLink? = null
@@ -390,6 +411,7 @@ class MrDetailPanel(
             add(requestChangesAction())
             add(watchAction())
             add(refreshAction())
+            add(checkoutAction())
             addSeparator()
             add(closeAction())
             add(copyLinkAction())
@@ -492,6 +514,85 @@ class MrDetailPanel(
 
         override fun actionPerformed(e: AnActionEvent) {
             currentRef?.let { loadDetail(it) }
+        }
+    }
+
+    /**
+     * Checkout the MR's source branch locally (GLC-42, icon [AllIcons.Actions.CheckOut] — the platform's
+     * diagonal checkout arrow; the field is spelled `CheckOut` with a capital O in 2025.2, and
+     * `AllIcons.Actions.Checkout` / `AllIcons.Vcs.CherryPick` do not exist). Enabled only for a
+     * **same-project** MR (`source_project_id == project_id`) whose
+     * git repository + remote the plugin can resolve ([CockpitProjectService.resolveCheckoutTarget]);
+     * for a fork MR, an MR with no `source_project_id`, or an unresolvable remote it is disabled with a
+     * "same-project only" tooltip. Clicking fetches the resolved remote and checks the branch out (see
+     * [onCheckout]).
+     */
+    private fun checkoutAction(): AnAction = object : AnAction() {
+        override fun getActionUpdateThread(): ActionUpdateThread = ActionUpdateThread.EDT
+
+        override fun update(e: AnActionEvent) {
+            e.presentation.icon = AllIcons.Actions.CheckOut
+            // Non-null exactly when the action is enabled: a same-project MR with a resolvable checkout
+            // target. Its value is the source branch, used in the "Checkout '<branch>'" tooltip.
+            val branch = currentMr
+                ?.takeIf { it.sourceProjectId != null && it.sourceProjectId == it.projectId }
+                ?.takeIf { service.resolveCheckoutTarget() != null }
+                ?.sourceBranch
+            e.presentation.isEnabled = branch != null
+            e.presentation.text = branch
+                ?.let { CockpitBundle.message("detail.toolbar.checkout", it) }
+                ?: CockpitBundle.message("detail.toolbar.checkout.disabled")
+        }
+
+        override fun actionPerformed(e: AnActionEvent) = onCheckout()
+    }
+
+    /**
+     * Fetches the resolved remote and checks the MR's source branch out, both via Git4Idea's own
+     * machinery (GLC-42). The fetch runs in a platform [Task.Backgroundable] (its progress bar is
+     * Git4Idea's); on a failed fetch [GitFetchResult.showNotificationIfFailed] already fires the error
+     * notification and the checkout is skipped. On a successful fetch the checkout is scheduled on the
+     * EDT — [GitBrancher] then runs its own background task with progress and error notifications (see
+     * [doCheckout]). A no-longer-resolvable target (the action was enabled, then the repo changed) is a
+     * silent no-op.
+     */
+    private fun onCheckout() {
+        val mr = currentMr ?: return
+        val target = service.resolveCheckoutTarget() ?: return
+        val branch = mr.sourceBranch
+        object : Task.Backgroundable(
+            project,
+            CockpitBundle.message("detail.checkout.progress", branch),
+            true,
+        ) {
+            override fun run(indicator: ProgressIndicator) {
+                val fetched = GitFetchSupport.fetchSupport(project)
+                    .fetch(target.repository, target.remote)
+                    .showNotificationIfFailed()
+                if (!fetched) return
+                ApplicationManager.getApplication().invokeLater(
+                    { doCheckout(target, branch) },
+                    ModalityState.nonModal(),
+                )
+            }
+        }.queue()
+    }
+
+    /**
+     * EDT. Checks [branch] out into [target]'s repository via [GitBrancher] (which schedules its own
+     * progress-bearing background task and notifies on failure). If a local branch of that name already
+     * exists it is simply checked out; otherwise a new local branch is created tracking the remote
+     * branch `<remote>/<branch>` (the standard `git checkout -b <branch> <remote>/<branch>` flow, which
+     * sets up tracking automatically).
+     */
+    private fun doCheckout(target: CheckoutTarget, branch: String) {
+        val brancher = GitBrancher.getInstance(project)
+        val repos = listOf(target.repository)
+        val local = target.repository.branches.findLocalBranch(branch)
+        if (local != null) {
+            brancher.checkout(branch, false, repos, null)
+        } else {
+            brancher.checkoutNewBranchStartingFrom(branch, "${target.remote.name}/$branch", repos, null)
         }
     }
 
@@ -647,6 +748,9 @@ class MrDetailPanel(
         repaint()
 
         loadApprovals(ref)
+        // The chips are already painted from the per-project color cache when present; only fetch (once
+        // per project) when the colors are not cached yet.
+        if (mr.labels.isNotEmpty() && !labelColorsByProject.containsKey(mr.projectId)) loadLabelColors(ref, mr)
         changesPanel.onTabSelected()
         mrToolbar?.updateActionsAsync()
         if (mainTabbedPane.selectedIndex == TIMELINE_TAB_INDEX) loadNotes(ref)
@@ -705,6 +809,17 @@ class MrDetailPanel(
 
         // 3. Meta line: !iid · created … · by … (· merged/closed …) — single muted label.
         header.add(buildMetaLine(pres))
+
+        // 3b. Labels line (read-only chips; GLC-42) — omitted when the MR has no labels. The chips show
+        // immediately with any cached colors; the async load then fills in / corrects them.
+        if (mr.labels.isNotEmpty()) {
+            val line = flowLine()
+            labelsLine = line
+            renderLabelChips(line, mr.labels, labelColorsByProject[mr.projectId].orEmpty())
+            header.add(line)
+        } else {
+            labelsLine = null
+        }
 
         // 4. Pipeline line (omitted when the MR has no head pipeline).
         buildPipelineLine(pres.pipelineStatus)?.let { header.add(it) }
@@ -880,6 +995,48 @@ class MrDetailPanel(
         line.add(detail)
         return line
     }
+
+    /**
+     * Fetches [mr]'s project labels in the background (GLC-42) to learn each label's color, caches them
+     * per project ([labelColorsByProject]) and re-paints the header's [labelsLine] chips with the right
+     * color dots. Guarded by [currentRef] so a slow load from a superseded MR never re-colors the wrong
+     * header; a failed fetch leaves the neutral dots in place.
+     */
+    private fun loadLabelColors(ref: MrRef, mr: GitLabMergeRequest) {
+        service.coroutineScope.launch {
+            val result = service.getProjectLabels(mr.projectId)
+            if (result is GitLabResult.Success) {
+                val colors = result.data.associate { it.name to it.color }
+                withContext(Dispatchers.EDT) {
+                    labelColorsByProject[mr.projectId] = colors
+                    if (currentRef != ref) return@withContext
+                    val line = labelsLine ?: return@withContext
+                    renderLabelChips(line, mr.labels, colors)
+                    line.revalidate()
+                    line.repaint()
+                }
+            }
+        }
+    }
+
+    /** EDT. Rebuilds [line]'s read-only label chips (GLC-42), one per name with its [colors] color dot. */
+    private fun renderLabelChips(line: JPanel, names: List<String>, colors: Map<String, String>) {
+        line.removeAll()
+        for (name in names) line.add(labelChip(name, colors[name]))
+    }
+
+    /** A read-only label chip (GLC-42): the label name on a [CockpitTheme.chipBackground] pill with a
+     * leading color dot ([colorHex] parsed, or a neutral dot when the color is unknown). */
+    private fun labelChip(name: String, colorHex: String?): JComponent =
+        LabelChip(name).apply {
+            icon = ColorDotIcon(parseLabelColor(colorHex), JBUI.scale(LABEL_DOT_DIAMETER))
+            iconTextGap = JBUI.scale(4)
+            toolTipText = name
+        }
+
+    /** Parses a GitLab `#rrggbb` label color, falling back to the muted foreground for an unknown one. */
+    private fun parseLabelColor(colorHex: String?): Color =
+        colorHex?.let { runCatching { Color.decode(it.trim()) }.getOrNull() } ?: CockpitTheme.muted()
 
     /** `success` → `Success`: the head pipeline status with its first letter capitalized. */
     private fun pipelineStatusText(status: String): String =
@@ -1662,6 +1819,16 @@ class MrDetailPanel(
                     }
                 }
             },
+            pickLabels = { current, onPicked ->
+                withLabels(mr.projectId) { projectLabels ->
+                    // Keep any current label absent from the project roster so it is not silently dropped.
+                    val known = projectLabels.mapTo(HashSet()) { it.name }
+                    val roster = projectLabels + current.filterNot { it in known }
+                        .map { GitLabLabel(it, FALLBACK_LABEL_COLOR) }
+                    val picker = EditLabelsDialog(project, roster, current.toSet())
+                    if (picker.showAndGet()) onPicked(picker.selectedNames())
+                }
+            },
         )
         if (dialog.showAndGet()) {
             applyUpdate(
@@ -1671,6 +1838,7 @@ class MrDetailPanel(
                     description = dialog.editedDescription,
                     reviewerIds = dialog.reviewerIds,
                     assigneeIds = dialog.assigneeIds,
+                    labels = dialog.labelsCsvOrNull,
                 ),
             )
         }
@@ -1690,6 +1858,25 @@ class MrDetailPanel(
                 when (result) {
                     is GitLabResult.Success -> onLoaded(result.data)
                     else -> showError("detail.error.members", result)
+                }
+            }
+        }
+    }
+
+    /**
+     * Loads [projectId]'s labels off the EDT (with a wait cursor), then runs [onLoaded] on the EDT — the
+     * label-picker analogue of [withMembers] (GLC-42). The MR's own project id is used so, in the "All
+     * projects" mode, the picker lists the labels of the MR's project rather than the git-resolved one.
+     */
+    private fun withLabels(projectId: Long, onLoaded: (List<GitLabLabel>) -> Unit) {
+        cursor = Cursor.getPredefinedCursor(Cursor.WAIT_CURSOR)
+        service.coroutineScope.launch {
+            val result = service.getProjectLabels(projectId)
+            withContext(Dispatchers.EDT) {
+                cursor = Cursor.getDefaultCursor()
+                when (result) {
+                    is GitLabResult.Success -> onLoaded(result.data)
+                    else -> showError("detail.error.labels", result)
                 }
             }
         }
@@ -1743,19 +1930,24 @@ class MrDetailPanel(
 
     /**
      * The unified Edit Merge Request dialog (iter3 G20, Kotlin UI DSL v2). Title and description are
-     * edited inline; the Assignees and Reviewers rows show the current people and an "Edit…" button that
-     * opens the existing pickers as a sub-step (via the injected [pickReviewers] / [pickAssignee]),
-     * staging the picked people into [reviewerIds] / [assigneeIds]. Branch/label/draft editing is out of
-     * scope (the plugin's update API does not cover it). OK returns the staged fields to the caller.
+     * edited inline; the Assignees, Reviewers and Labels rows show the current values and an "Edit…"
+     * button that opens the matching picker as a sub-step (via the injected [pickReviewers] /
+     * [pickAssignee] / [pickLabels]), staging the picks into [reviewerIds] / [assigneeIds] /
+     * [labelsCsvOrNull]. A "Mark as draft" checkbox (GLC-42) toggles the MR's draft state through its
+     * title's `Draft: ` prefix — GitLab's REST update endpoint has no direct draft/WIP input, so
+     * [editedTitle] normalizes the title to the checkbox via [applyDraftState]. The title field shows
+     * the *stripped* title (without any draft marker) so the checkbox is its single source of truth. OK
+     * returns the staged fields to the caller.
      */
     private class EditMrDialog(
         project: Project,
         mr: GitLabMergeRequest,
         private val pickReviewers: (List<GitLabUser>, (List<GitLabUser>) -> Unit) -> Unit,
         private val pickAssignee: (GitLabUser?, (GitLabUser?) -> Unit) -> Unit,
+        private val pickLabels: (List<String>, (List<String>) -> Unit) -> Unit,
     ) : DialogWrapper(project) {
 
-        private val titleField = JBTextField(mr.title, 40)
+        private val titleField = JBTextField(stripDraftPrefix(mr.title), 40)
         private val descriptionArea = JBTextArea(mr.description.orEmpty(), 12, 60).apply {
             lineWrap = true
             wrapStyleWord = true
@@ -1763,9 +1955,15 @@ class MrDetailPanel(
 
         private var stagedReviewers: List<GitLabUser> = mr.reviewers
         private var stagedAssignee: GitLabUser? = mr.assignees.firstOrNull()
+        private var stagedLabels: List<String> = mr.labels
 
         private val reviewersLabel = JBLabel(peopleText(stagedReviewers))
         private val assigneeLabel = JBLabel(personText(stagedAssignee))
+        private val labelsValueLabel = JBLabel(labelsText(stagedLabels))
+        private val draftCheck = JBCheckBox(CockpitBundle.message("dialog.editMr.draftLabel"), mr.draft)
+
+        /** The MR's original labels, for change detection: labels are only sent when this set changes. */
+        private val originalLabels: Set<String> = mr.labels.toSet()
 
         init {
             title = CockpitBundle.message("dialog.editMr.title")
@@ -1798,14 +1996,32 @@ class MrDetailPanel(
                     }
                 }
             }
+            row(CockpitBundle.message("dialog.editMr.labelsLabel")) {
+                cell(labelsValueLabel).align(AlignX.FILL)
+                button(CockpitBundle.message("dialog.editMr.editButton")) {
+                    pickLabels(stagedLabels) { picked ->
+                        stagedLabels = picked
+                        labelsValueLabel.text = labelsText(picked)
+                    }
+                }
+            }
+            row { cell(draftCheck) }
         }
 
         override fun getPreferredFocusedComponent(): JComponent = titleField
 
-        val editedTitle: String get() = titleField.text
+        /** The title normalized to the draft checkbox (adds/removes the `Draft: ` prefix, GLC-42). */
+        val editedTitle: String get() = applyDraftState(titleField.text.trim(), draftCheck.isSelected)
         val editedDescription: String get() = descriptionArea.text
         val reviewerIds: List<Long> get() = stagedReviewers.map { it.id }
         val assigneeIds: List<Long> get() = stagedAssignee?.let { listOf(it.id) } ?: emptyList()
+
+        /**
+         * The chosen labels as a CSV of names (GLC-42), or null when the selection is unchanged so the
+         * update omits the `labels` key. An empty string is meaningful — it clears every label.
+         */
+        val labelsCsvOrNull: String?
+            get() = if (stagedLabels.toSet() == originalLabels) null else stagedLabels.joinToString(",")
 
         private fun peopleText(users: List<GitLabUser>): String =
             users.takeIf { it.isNotEmpty() }?.joinToString(", ") { displayName(it) }
@@ -1813,6 +2029,9 @@ class MrDetailPanel(
 
         private fun personText(user: GitLabUser?): String =
             user?.let { displayName(it) } ?: CockpitBundle.message("detail.none")
+
+        private fun labelsText(names: List<String>): String =
+            names.takeIf { it.isNotEmpty() }?.joinToString(", ") ?: CockpitBundle.message("detail.none")
     }
 
     /**
@@ -1865,6 +2084,59 @@ class MrDetailPanel(
         override fun getPreferredFocusedComponent(): JComponent = searchField.textEditor
 
         fun selectedIds(): List<Long> = model.selectedIds()
+    }
+
+    /**
+     * Label picker (GLC-42): the reviewer-picker pattern over labels — an incremental [SearchTextField]
+     * above a [CheckBoxList] of the project's labels, with the MR's current labels pre-checked. The
+     * selection lives in a pure [LabelSelectionModel] keyed by label name, so a label checked while
+     * unfiltered stays checked even after a search hides it; the dialog is glue that repopulates the
+     * visible rows on each keystroke and forwards toggles to the model. [selectedNames] just reads the
+     * model.
+     */
+    private class EditLabelsDialog(
+        project: Project,
+        labels: List<GitLabLabel>,
+        currentLabelNames: Set<String>,
+    ) : DialogWrapper(project) {
+
+        private val model = LabelSelectionModel(labels, currentLabelNames)
+        private val searchField = SearchTextField()
+        private val checkList = CheckBoxList<GitLabLabel>()
+
+        init {
+            title = CockpitBundle.message("dialog.editLabels.title")
+            checkList.setCheckBoxListListener { index, value ->
+                checkList.getItemAt(index)?.let { model.setChecked(it.name, value) }
+            }
+            searchField.addDocumentListener(object : DocumentAdapter() {
+                override fun textChanged(e: DocumentEvent) = repopulate()
+            })
+            repopulate()
+            init()
+        }
+
+        /** EDT. Rebuilds the visible rows for the current query, checking each from the model. */
+        private fun repopulate() {
+            checkList.clear()
+            model.visibleItems(searchField.text).forEach { label ->
+                checkList.addItem(label, label.name, model.isChecked(label.name))
+            }
+        }
+
+        override fun createCenterPanel(): JComponent = panel {
+            row {
+                cell(searchField).align(AlignX.FILL)
+            }
+            row {
+                cell(JBScrollPane(checkList).apply { preferredSize = CockpitTheme.REVIEWERS_DIALOG_SIZE })
+                    .align(Align.FILL)
+            }.resizableRow()
+        }
+
+        override fun getPreferredFocusedComponent(): JComponent = searchField.textEditor
+
+        fun selectedNames(): List<String> = model.selectedNames()
     }
 
     /**
@@ -2127,6 +2399,51 @@ class MrDetailPanel(
         }
     }
 
+    /**
+     * A read-only label pill (GLC-42): a rounded [CockpitTheme.chipBackground] chip with a
+     * [JBColor.border] outline — the [ReactionChip] visual pattern without the highlight state — that
+     * carries a leading color-dot icon and the label name.
+     */
+    private class LabelChip(text: String) : JBLabel(text) {
+        init {
+            isOpaque = false
+            border = JBUI.Borders.empty(1, 6)
+        }
+
+        override fun paintComponent(g: Graphics) {
+            val g2 = g.create() as Graphics2D
+            try {
+                g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON)
+                val arc = JBUI.scale(REACTION_CHIP_ARC).toFloat()
+                val rect = RoundRectangle2D.Float(0.5f, 0.5f, width - 1f, height - 1f, arc, arc)
+                g2.color = CockpitTheme.chipBackground()
+                g2.fill(rect)
+                g2.color = JBColor.border()
+                g2.draw(rect)
+            } finally {
+                g2.dispose()
+            }
+            super.paintComponent(g)
+        }
+    }
+
+    /** A small filled circle in the label's own color, painted as the [LabelChip]'s leading icon (GLC-42). */
+    private class ColorDotIcon(private val color: Color, private val diameter: Int) : Icon {
+        override fun paintIcon(c: Component?, g: Graphics, x: Int, y: Int) {
+            val g2 = g.create() as Graphics2D
+            try {
+                g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON)
+                g2.color = color
+                g2.fillOval(x, y, diameter, diameter)
+            } finally {
+                g2.dispose()
+            }
+        }
+
+        override fun getIconWidth(): Int = diameter
+        override fun getIconHeight(): Int = diameter
+    }
+
     /** Cached emoji reactions of a note (GLC-40), keyed alongside the note's `updated_at` for freshness. */
     private data class CachedAwards(val updatedAt: String?, val awards: List<GitLabAward>)
 
@@ -2189,6 +2506,16 @@ class MrDetailPanel(
 
         /** Corner radius (unscaled px) of an emoji reaction chip (GLC-40). */
         private const val REACTION_CHIP_ARC = 10
+
+        /** Diameter (unscaled px) of a read-only label chip's leading color dot (GLC-42). */
+        private const val LABEL_DOT_DIAMETER = 8
+
+        /**
+         * Fallback color for a picker-roster label that is not among the project's returned labels
+         * (GLC-42) — e.g. a current MR label the labels endpoint did not include. The picker shows names
+         * only, so this color is never actually painted; it just satisfies the [GitLabLabel] shape.
+         */
+        private const val FALLBACK_LABEL_COLOR = "#808080"
 
         /** Rows of the composer popup's textarea (iter3 F14). */
         private const val COMPOSER_ROWS = 8
