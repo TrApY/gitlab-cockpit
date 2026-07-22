@@ -4,9 +4,9 @@ import com.intellij.codeInsight.template.TemplateManager
 import com.intellij.codeInsight.template.impl.TextExpression
 import com.intellij.openapi.command.WriteCommandAction
 import com.intellij.openapi.editor.ex.EditorEx
-import com.intellij.openapi.fileTypes.FileTypes
+import com.intellij.openapi.fileTypes.PlainTextLanguage
 import com.intellij.openapi.project.Project
-import com.intellij.ui.EditorTextField
+import com.intellij.ui.LanguageTextField
 import dev.jota.gitlabcockpit.core.MarkdownMarker
 import dev.jota.gitlabcockpit.core.wrapMarkdown
 
@@ -22,10 +22,12 @@ import dev.jota.gitlabcockpit.core.wrapMarkdown
 class MarkdownEditorField(
     private val project: Project,
     initialText: String,
-) : EditorTextField(initialText, project, FileTypes.PLAIN_TEXT) {
+) : LanguageTextField(PlainTextLanguage.INSTANCE, project, initialText, false) {
+    // LanguageTextField (vs the plain EditorTextField constructor) backs the document with a real
+    // PsiFile — without it TemplateManager.startTemplate silently does nothing (GLC-55: the dead
+    // Table button).
 
     init {
-        setOneLineMode(false)
         addSettingsProvider { editor: EditorEx ->
             editor.settings.isUseSoftWraps = true
             editor.settings.isLineNumbersShown = false
@@ -45,8 +47,8 @@ class MarkdownEditorField(
         val editor = this.editor ?: return
         val hasSelection = editor.selectionModel.hasSelection()
         if (!hasSelection && marker != MarkdownMarker.QUOTE) {
-            startTemplate(markerTemplate(marker))
-            return
+            if (startTemplate(markerTemplate(marker))) return
+            // Template engine unavailable → same result without the Tab boxes (GLC-55).
         }
         val start = editor.selectionModel.selectionStart
         val end = editor.selectionModel.selectionEnd
@@ -59,7 +61,11 @@ class MarkdownEditorField(
         requestFocusInWindow()
     }
 
-    /** Expands the 2×2 markdown table template — one Tab stop per header and cell (GLC-54). */
+    /**
+     * Expands the 2×2 markdown table template — one Tab stop per header and cell (GLC-54). If the
+     * template engine does not engage (belt-and-braces, GLC-55), a plain table skeleton is inserted
+     * with the first `header` selected instead.
+     */
     fun insertTable() {
         val manager = TemplateManager.getInstance(project)
         val template = manager.createTemplate("", TEMPLATE_GROUP)
@@ -73,7 +79,17 @@ class MarkdownEditorField(
         template.addVariable("C2", TextExpression("cell"), TextExpression("cell"), true)
         template.addTextSegment(" |\n")
         template.isToReformat = false
-        startTemplate(template)
+        if (!startTemplate(template)) {
+            val editor = this.editor ?: return
+            val offset = editor.caretModel.offset
+            WriteCommandAction.runWriteCommandAction(project) {
+                editor.document.insertString(offset, PLAIN_TABLE)
+            }
+            val headerAt = offset + PLAIN_TABLE.indexOf("header")
+            editor.selectionModel.setSelection(headerAt, headerAt + "header".length)
+            editor.caretModel.moveToOffset(headerAt + "header".length)
+            requestFocusInWindow()
+        }
     }
 
     /** Inserts [snippet] (an emoji from the picker) at the caret. */
@@ -119,14 +135,21 @@ class MarkdownEditorField(
         addTextSegment(symbol)
     }
 
-    private fun startTemplate(template: com.intellij.codeInsight.template.Template) {
-        val editor = this.editor ?: return
+    /** Starts [template] on the field's editor; false when the engine did not engage (GLC-55). */
+    private fun startTemplate(template: com.intellij.codeInsight.template.Template): Boolean {
+        val editor = this.editor ?: return false
+        val before = editor.document.text
         requestFocusInWindow()
         TemplateManager.getInstance(project).startTemplate(editor, template)
+        return TemplateManager.getInstance(project).getActiveTemplate(editor) != null ||
+            editor.document.text != before
     }
 
     companion object {
         /** Group id of the ad-hoc templates the format bar expands. */
         private const val TEMPLATE_GROUP = "GitLabCockpit"
+
+        /** The plain 2×2 table skeleton the fallback inserts when the template engine is unavailable. */
+        private const val PLAIN_TABLE = "| header | header |\n| --- | --- |\n| cell | cell |\n"
     }
 }
