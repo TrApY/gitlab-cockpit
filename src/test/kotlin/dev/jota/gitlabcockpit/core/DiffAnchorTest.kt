@@ -10,9 +10,9 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
- * Pure tests for the F4c anchor logic: the [anchorFor] position table (new/old/both/none) and
- * [threadsByAnchor] grouping (side+line key, first non-system positioned note, insertion order,
- * unanchorable discussions dropped).
+ * Pure tests for the F4c anchor logic: the [anchorFor] position table (new/old/both/none), the
+ * [discussionAnchor] per-discussion rule (first non-system positioned note, else null) and
+ * [threadsByAnchor] grouping (side+line key, insertion order, unanchorable discussions dropped).
  */
 class DiffAnchorTest {
 
@@ -55,6 +55,43 @@ class DiffAnchorTest {
     @Test
     fun `anchorFor with no lines returns null`() {
         assertNull(anchorFor(NotePosition(newPath = "a.kt", oldPath = "a.kt")))
+    }
+
+    // --- discussionAnchor -----------------------------------------------------------------------
+
+    @Test
+    fun `discussionAnchor uses the new side for a note with new_line`() {
+        val d = discussion("d1", note(id = 1, position = NotePosition(newLine = 8)))
+        assertEquals(DiffAnchor(AnchorSide.NEW, 8), discussionAnchor(d))
+    }
+
+    @Test
+    fun `discussionAnchor uses the old side for a note with only old_line`() {
+        val d = discussion("d1", note(id = 1, position = NotePosition(oldLine = 6)))
+        assertEquals(DiffAnchor(AnchorSide.OLD, 6), discussionAnchor(d))
+    }
+
+    @Test
+    fun `discussionAnchor is null for a general comment`() {
+        assertNull(discussionAnchor(discussion("d1", note(id = 1))))
+    }
+
+    @Test
+    fun `discussionAnchor is null for a system-only positioned thread`() {
+        val d = discussion("d1", note(id = 1, system = true, position = NotePosition(newLine = 3)))
+        assertNull(discussionAnchor(d))
+    }
+
+    @Test
+    fun `discussionAnchor anchors on the first non-system positioned note`() {
+        // A leading system note and a later reply both carry positions; neither may decide the anchor.
+        val d = discussion(
+            "d1",
+            note(id = 1, system = true, position = NotePosition(newLine = 9)),
+            note(id = 2, position = NotePosition(oldLine = 2)),
+            note(id = 3, position = NotePosition(newLine = 4)),
+        )
+        assertEquals(DiffAnchor(AnchorSide.OLD, 2), discussionAnchor(d))
     }
 
     // --- threadsByAnchor ------------------------------------------------------------------------

@@ -30,18 +30,27 @@ fun anchorFor(position: NotePosition): DiffAnchor? = when {
 }
 
 /**
- * Groups diff [discussions] by the (side, line) anchor of each discussion's *first non-system
- * positioned note* (the same note [discussionsByFile] keys on). Discussions without such a note —
- * general comments and system-only threads — are dropped. Insertion order is preserved both across
- * anchors and within each anchor's thread list, so threads render in the order GitLab returned them.
+ * The [DiffAnchor] of a whole [discussion]: the anchor of its **first non-system positioned note** —
+ * the note GitLab treats as the thread's location, and the same one [threadsByAnchor] keys on. A
+ * leading system note (e.g. "changed this line…") or a later reply may sit on a different line, so
+ * neither is allowed to decide the anchor. Null when the discussion has no such note: a general
+ * comment, a system-only thread, or a note whose position points at no line ([anchorFor] returns
+ * null). This is the single source of truth for "where does this thread live", shared by the inline
+ * renderer's grouping and by the timeline "jump to thread" reveal.
+ */
+fun discussionAnchor(discussion: GitLabDiscussion): DiffAnchor? =
+    discussion.notes.firstOrNull { !it.system && it.position != null }?.position?.let(::anchorFor)
+
+/**
+ * Groups diff [discussions] by their [discussionAnchor] (the side+line of each discussion's first
+ * non-system positioned note). Discussions without such a note — general comments and system-only
+ * threads — are dropped. Insertion order is preserved both across anchors and within each anchor's
+ * thread list, so threads render in the order GitLab returned them.
  */
 fun threadsByAnchor(discussions: List<GitLabDiscussion>): Map<DiffAnchor, List<GitLabDiscussion>> {
     val byAnchor = LinkedHashMap<DiffAnchor, MutableList<GitLabDiscussion>>()
     for (discussion in discussions) {
-        val position = discussion.notes
-            .firstOrNull { !it.system && it.position != null }
-            ?.position ?: continue
-        val anchor = anchorFor(position) ?: continue
+        val anchor = discussionAnchor(discussion) ?: continue
         byAnchor.getOrPut(anchor) { mutableListOf() }.add(discussion)
     }
     return byAnchor

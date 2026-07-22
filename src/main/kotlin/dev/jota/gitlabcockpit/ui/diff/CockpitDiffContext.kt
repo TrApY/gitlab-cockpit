@@ -16,10 +16,11 @@ import dev.jota.gitlabcockpit.core.ThreadSide
  * via [KEY] — plain request user-data, no global state, so every opened diff carries exactly the
  * threads that were loaded when it was opened.
  *
- * [revealDiscussionId] is a one-shot scroll target: when a diff is opened by the "jump to thread"
- * action of the Comments tab, it names the discussion the diff should scroll to once its inline
- * threads are mounted. [DiffThreadsRenderer] consumes it (clears it to null) after scrolling, so a
- * later re-init of the same viewer does not scroll again. Null for a diff opened any other way.
+ * The timeline's "jump to thread" reveal does *not* travel through this context: it rides on the
+ * request's own [com.intellij.diff.util.DiffUserDataKeys.SCROLL_TO_LINE] user-data, which the
+ * platform's initial-scroll helper applies at the right moment (after the async rediff, with the
+ * editor visible) — a manual scroll from the renderer's `onInit` ran before layout and was
+ * overwritten by the default scroll-to-first-change policy.
  *
  * [openNewThread] lets the "New comment at caret" action ([CockpitCommentHandle]) start a review
  * thread on the caret's `(side, 1-based line)` reusing ChangesPanel's new-thread flow;
@@ -42,7 +43,6 @@ data class CockpitDiffContext(
     val refs: DiffRefs,
     val discussions: List<GitLabDiscussion>,
     val projectWebUrl: String?,
-    var revealDiscussionId: String? = null,
     val openNewThread: ((side: ThreadSide, line1Based: Int) -> Unit)? = null,
     val onFileReviewed: (() -> Unit)? = null,
     val onFileShown: (() -> Unit)? = null,

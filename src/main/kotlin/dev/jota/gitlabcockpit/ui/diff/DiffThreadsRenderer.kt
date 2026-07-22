@@ -73,8 +73,6 @@ internal class DiffThreadsRenderer(
     /** EDT. Creates one embedded inlay + line marker per anchor and ties their lifetime to the viewer. */
     private fun mount() {
         val service = CockpitProjectService.getInstance(project)
-        // The line (and its editor) hosting the discussion the diff was asked to scroll to, if any.
-        var revealTarget: Pair<Editor, Int>? = null
         val mounted = mutableListOf<MountedAnchor>()
 
         for ((anchor, discussions) in threadsByAnchor(diffContext.discussions)) {
@@ -113,12 +111,6 @@ internal class DiffThreadsRenderer(
             val highlighter = addLineMarker(editor, lineIndex, discussions)
             mounted += MountedAnchor(editor, lineIndex, anchor)
 
-            if (diffContext.revealDiscussionId != null &&
-                discussions.any { it.id == diffContext.revealDiscussionId }
-            ) {
-                revealTarget = editor to lineIndex
-            }
-
             panels.forEach { panel ->
                 panel.onContentChanged = {
                     group.revalidate()
@@ -142,12 +134,6 @@ internal class DiffThreadsRenderer(
         // Order the mounted anchors for keyboard navigation; each unique anchor maps to one mount.
         val byAnchor = mounted.associateBy { it.anchor }
         mountedAnchors = sortAnchors(mounted.map { it.anchor }).mapNotNull { byAnchor[it] }
-
-        revealTarget?.let { (editor, line) ->
-            editor.scrollingModel.scrollTo(LogicalPosition(line, 0), ScrollType.CENTER)
-        }
-        // One-shot: never scroll again if this viewer re-inits.
-        diffContext.revealDiscussionId = null
     }
 
     /**

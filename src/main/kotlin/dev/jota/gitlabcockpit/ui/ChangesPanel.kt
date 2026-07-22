@@ -30,6 +30,7 @@ import com.intellij.openapi.ui.ComboBox
 import com.intellij.openapi.ui.DialogWrapper
 import com.intellij.openapi.ui.Messages
 import com.intellij.openapi.ui.ValidationInfo
+import com.intellij.openapi.util.Pair
 import com.intellij.openapi.vcs.FileStatus
 import com.intellij.ui.ColoredTreeCellRenderer
 import com.intellij.ui.DoubleClickListener
@@ -55,6 +56,7 @@ import dev.jota.gitlabcockpit.api.GitLabDiscussion
 import dev.jota.gitlabcockpit.api.GitLabDraftNote
 import dev.jota.gitlabcockpit.api.GitLabMrVersion
 import dev.jota.gitlabcockpit.api.GitLabResult
+import dev.jota.gitlabcockpit.core.AnchorSide
 import dev.jota.gitlabcockpit.core.COCKPIT_NOTIFICATION_GROUP
 import dev.jota.gitlabcockpit.core.ChangeType
 import dev.jota.gitlabcockpit.core.ChangesView
@@ -70,6 +72,7 @@ import dev.jota.gitlabcockpit.core.chainIndex
 import dev.jota.gitlabcockpit.core.changeTypeOf
 import dev.jota.gitlabcockpit.core.changesViews
 import dev.jota.gitlabcockpit.core.buildFileTree
+import dev.jota.gitlabcockpit.core.discussionAnchor
 import dev.jota.gitlabcockpit.core.discussionsByFile
 import dev.jota.gitlabcockpit.core.versionRefs
 import dev.jota.gitlabcockpit.ui.diff.CockpitDiffContext
@@ -746,9 +749,12 @@ class ChangesPanel(
      * [CockpitDiffContext] (F4c) with [file]'s loaded discussions ([discussionsByPath]) so
      * [dev.jota.gitlabcockpit.ui.diff.CockpitDiffExtension] renders the review threads inline, stamps
      * the "New comment at caret" handle ([openNewThreadDialog]) and — when there are threads — the
-     * thread-navigation handle. [revealDiscussionId], when set, tells the renderer to scroll to that
-     * thread. The two editors show the whole base/head file, so an editor line equals that side's
-     * GitLab line number.
+     * thread-navigation handle. [revealDiscussionId], when set, resolves that discussion's
+     * [discussionAnchor] and stamps it onto the request as [DiffUserDataKeys.SCROLL_TO_LINE] (side +
+     * 0-based line); the platform's initial-scroll helper applies it after the async rediff with the
+     * editor visible, instead of a manual scroll in the renderer's `onInit` that landed before layout
+     * and got overwritten by the default scroll-to-first-change policy. The two editors show the whole
+     * base/head file, so an editor line equals that side's GitLab line number.
      */
     @Throws(DiffRequestProducerException::class)
     private fun buildDiffRequest(
@@ -798,6 +804,18 @@ class ChangesPanel(
             val fileDiscussions =
                 (discussionsByPath[file.newPath].orEmpty() + discussionsByPath[file.oldPath].orEmpty())
                     .distinctBy { it.id }
+            // Timeline "jump to thread": hand the reveal to the platform's initial-scroll helper via
+            // SCROLL_TO_LINE (side + 0-based line). The helper consults it *before* its default
+            // scroll-to-first-change policy and applies it after the async rediff, with the editor
+            // visible — a manual scroll in the renderer's onInit ran before layout and got overwritten.
+            if (revealDiscussionId != null) {
+                fileDiscussions.firstOrNull { it.id == revealDiscussionId }
+                    ?.let(::discussionAnchor)
+                    ?.let { anchor ->
+                        val side = if (anchor.side == AnchorSide.OLD) Side.LEFT else Side.RIGHT
+                        request.putUserData(DiffUserDataKeys.SCROLL_TO_LINE, Pair.create(side, anchor.line - 1))
+                    }
+            }
             request.putUserData(
                 CockpitDiffContext.KEY,
                 CockpitDiffContext(
@@ -806,7 +824,6 @@ class ChangesPanel(
                     refs = refs,
                     discussions = fileDiscussions,
                     projectWebUrl = webUrl,
-                    revealDiscussionId = revealDiscussionId,
                     openNewThread = { side, line -> openNewThreadDialog(file, refs, side, line) },
                     onFileReviewed = { refreshReviewedAfterAutoMark() },
                     onFileShown = { syncTreeToShownFile(file) },
