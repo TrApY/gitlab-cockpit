@@ -4,6 +4,8 @@
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-07-22
+
 ### Added
 
 - Pipeline and merge-request notifications now carry two actions — "Open in Cockpit" (activates the tool window and opens the merge request's tab, even when the window was closed) and "Open in GitLab" (the merge request's web page) — and each balloon shows a per-event icon (GLC-54)
