@@ -4,6 +4,12 @@
 
 ## [Unreleased]
 
+## [0.13.2] - 2026-07-22
+
+### Fixed
+
+- Clicking a discussion's `[file:line]` jump link in Events & Discussions now scrolls the diff to the commented line — the jump used to land on the first change because the platform's initial scroll overwrote the manual one
+
 ## [0.13.1] - 2026-07-22
 
 ### Fixed
