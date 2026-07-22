@@ -54,14 +54,16 @@
             icon="/icons/toolwindow.svg"/>
         <notificationGroup
             id="Cockpit for GitLab"
-            displayType="BALLOON"/>
+            displayType="BALLOON"
+            icon="/icons/toolwindow.svg"/>
         <!-- A second group with the same look but STICKY_BALLOON display, used when the opt-in
              "sticky notifications" setting is on (GLC-30). A group's display type is fixed at
              registration time and not mutable at runtime, so the sticky variant must be its own
              group; post() picks between the two per event via notificationGroupFor(). -->
         <notificationGroup
             id="Cockpit for GitLab (Sticky)"
-            displayType="STICKY_BALLOON"/>
+            displayType="STICKY_BALLOON"
+            icon="/icons/toolwindow.svg"/>
         <diff.DiffExtension
             implementation="dev.jota.gitlabcockpit.ui.diff.CockpitDiffExtension"/>
         <postStartupActivity

@@ -5,6 +5,7 @@ import com.intellij.openapi.project.Project
 import com.intellij.openapi.startup.ProjectActivity
 import com.intellij.openapi.wm.ToolWindowManager
 import dev.jota.gitlabcockpit.settings.GitLabCockpitSettings
+import dev.jota.gitlabcockpit.ui.CockpitNavigation
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
@@ -57,11 +58,7 @@ class BackgroundNotificationsPoller : ProjectActivity {
     /** Reads the plugin tool window's visibility on the EDT (tool window state must be queried there). */
     private suspend fun isToolWindowVisible(project: Project): Boolean =
         withContext(Dispatchers.EDT) {
-            ToolWindowManager.getInstance(project).getToolWindow(TOOL_WINDOW_ID)?.isVisible == true
+            ToolWindowManager.getInstance(project)
+                .getToolWindow(CockpitNavigation.TOOL_WINDOW_ID)?.isVisible == true
         }
-
-    companion object {
-        /** Id of the plugin tool window, as declared in `plugin.xml`. */
-        private const val TOOL_WINDOW_ID = "GitLab Cockpit"
-    }
 }

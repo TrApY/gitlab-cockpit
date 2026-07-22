@@ -347,13 +347,19 @@ class CockpitToolWindowPanel(
         })
     }
 
-    /**
-     * Double-click / Enter on a row: open (or re-select) the MR's own closeable tab. Tabs are keyed by
-     * [MrRef] so a second open of the same MR just re-selects its existing tab instead of duplicating
-     * it; a fresh tab loads that MR into its own [MrDetailPanel] and takes focus.
-     */
+    /** Double-click / Enter on a row: open (or re-select) the selected MR's own closeable tab. */
     private fun openSelected() {
         val mr = mrList.selectedValue ?: return
+        openMrTab(mr)
+    }
+
+    /**
+     * Opens (or re-selects) [mr]'s own closeable tab. Tabs are keyed by [MrRef] so a second open of the
+     * same MR just re-selects its existing tab instead of duplicating it; a fresh tab loads that MR into
+     * its own [MrDetailPanel] and takes focus. Public so a notification's "Open in Cockpit" action can
+     * reach it through [CockpitNavigation] once the tool window has been activated (GLC-54).
+     */
+    fun openMrTab(mr: GitLabMergeRequest) {
         val ref = MrRef(mr.projectId, mr.iid)
         val contentManager = toolWindow.contentManager
 

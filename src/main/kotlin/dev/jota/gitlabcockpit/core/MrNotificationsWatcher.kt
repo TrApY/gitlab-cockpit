@@ -1,11 +1,17 @@
 package dev.jota.gitlabcockpit.core
 
+import com.intellij.ide.BrowserUtil
+import com.intellij.notification.NotificationAction
 import com.intellij.notification.NotificationGroupManager
 import com.intellij.notification.NotificationType
 import com.intellij.openapi.project.Project
+import com.intellij.openapi.util.text.StringUtil
 import dev.jota.gitlabcockpit.CockpitBundle
 import dev.jota.gitlabcockpit.api.GitLabMergeRequest
 import dev.jota.gitlabcockpit.settings.GitLabCockpitSettings
+import dev.jota.gitlabcockpit.ui.CockpitIcons
+import dev.jota.gitlabcockpit.ui.CockpitNavigation
+import javax.swing.Icon
 
 /** Id of the notification group declared in `plugin.xml` (`Cockpit for GitLab`, balloon display). */
 const val COCKPIT_NOTIFICATION_GROUP = "Cockpit for GitLab"
@@ -44,6 +50,68 @@ data class PipelineStatusChange(val mr: GitLabMergeRequest, val status: String)
  */
 fun shouldNotify(prev: String?, new: String): Boolean =
     new in NOTIFY_STATUSES && prev != null && prev != new
+
+/**
+ * An event balloon's rendered text: [title] is the bold header, [content] the body line. Both are the
+ * final display strings, with every dynamic merge-request datum (the MR title) already HTML-escaped —
+ * the platform renders both as HTML, so an unescaped `<`, `>` or `&` in a title would corrupt the
+ * balloon or silently drop text (GLC-54).
+ */
+data class NotificationText(val title: String, val content: String)
+
+/**
+ * Resolves a bundle key and its MessageFormat arguments to a display string. Injected into the pure
+ * text builders below so they stay platform-free and unit-testable without an IDE `Application`:
+ * production binds it to [CockpitBundle], a test binds it to a raw `.properties`-backed resolver.
+ */
+fun interface NotificationMessages {
+    fun format(key: String, params: List<Any>): String
+}
+
+/**
+ * Escapes the one piece of dynamic, user-controlled data an MR notification interpolates — the MR
+ * title — so it is safe inside the HTML the balloon renders (GLC-54). `Fix <T> handling` becomes
+ * `Fix &lt;T&gt; handling` instead of losing the `<T>`.
+ */
+private fun escapeMrTitle(title: String): String = StringUtil.escapeXmlEntities(title)
+
+/**
+ * Builds a pipeline event's balloon text (GLC-54). Unified hierarchy: the title is the outcome
+ * ("Pipeline succeeded" / "Pipeline failed") and the body is the MR line — the same line the other MR
+ * events use as their body — so a pipeline balloon reads like every other event. Pure; escapes the MR
+ * title before interpolating it.
+ */
+fun pipelineNotificationText(change: PipelineStatusChange, messages: NotificationMessages): NotificationText {
+    val titleKey =
+        if (change.status == "success") "notification.pipeline.success" else "notification.pipeline.failed"
+    return NotificationText(
+        title = messages.format(titleKey, emptyList()),
+        content = messages.format("notification.mr.line", listOf(change.mr.iid, escapeMrTitle(change.mr.title))),
+    )
+}
+
+/**
+ * Builds an [MrEvent]'s balloon text (GLC-54): a per-variant title over the MR line (or, for new
+ * comments, the count line). Pure; escapes the MR title before interpolating it.
+ */
+fun mrEventNotificationText(event: MrEvent, messages: NotificationMessages): NotificationText {
+    val mr = event.mr
+    val safeTitle = escapeMrTitle(mr.title)
+    val line = messages.format("notification.mr.line", listOf(mr.iid, safeTitle))
+    return when (event) {
+        is MrEvent.NewMr ->
+            NotificationText(messages.format("notification.newMr.title", emptyList()), line)
+        is MrEvent.StateChanged ->
+            NotificationText(messages.format("notification.mrState.title", listOf(event.new)), line)
+        is MrEvent.NewPush ->
+            NotificationText(messages.format("notification.push.title", emptyList()), line)
+        is MrEvent.NewComments ->
+            NotificationText(
+                messages.format("notification.comments.title", emptyList()),
+                messages.format("notification.comments.content", listOf(mr.iid, safeTitle, event.count)),
+            )
+    }
+}
 
 /**
  * Configurable IDE notifier for merge-request events (GLC-27). After each merge-request list load
@@ -85,40 +153,52 @@ class MrNotificationsWatcher(
         }
     }
 
+    /** Binds the pure text builders to the plugin resource bundle (needs an IDE `Application`). */
+    private val messages = NotificationMessages { key, params ->
+        CockpitBundle.message(key, *params.toTypedArray())
+    }
+
     private fun notifyPipeline(change: PipelineStatusChange) {
         val success = change.status == "success"
-        val title = CockpitBundle.message("notification.pipeline.title", change.mr.iid, change.mr.title)
-        val content = CockpitBundle.message(
-            if (success) "notification.pipeline.success" else "notification.pipeline.failed",
-        )
+        val text = pipelineNotificationText(change, messages)
         val type = if (success) NotificationType.INFORMATION else NotificationType.ERROR
-        post(title, content, type)
+        post(text, type, CockpitIcons.status(if (success) "success" else "failed"), change.mr)
     }
 
     private fun notifyMrEvent(event: MrEvent) {
-        val mr = event.mr
-        val line = CockpitBundle.message("notification.mr.line", mr.iid, mr.title)
-        val (title, content) = when (event) {
-            is MrEvent.NewMr ->
-                CockpitBundle.message("notification.newMr.title") to line
-            is MrEvent.StateChanged ->
-                CockpitBundle.message("notification.mrState.title", event.new) to line
-            is MrEvent.NewPush ->
-                CockpitBundle.message("notification.push.title") to line
-            is MrEvent.NewComments ->
-                CockpitBundle.message("notification.comments.title") to
-                    CockpitBundle.message("notification.comments.content", mr.iid, mr.title, event.count)
+        val text = mrEventNotificationText(event, messages)
+        val icon = when (event) {
+            is MrEvent.NewComments -> CockpitIcons.commentBadge
+            is MrEvent.NewPush -> CockpitIcons.branchChip
+            is MrEvent.NewMr, is MrEvent.StateChanged -> CockpitIcons.toolWindow
         }
-        post(title, content, NotificationType.INFORMATION)
+        post(text, NotificationType.INFORMATION, icon, event.mr)
     }
 
-    private fun post(title: String, content: String, type: NotificationType) {
+    /**
+     * Posts one balloon for [mr]'s [text], tagged with [icon] and carrying the two shared actions:
+     * "Open in Cockpit" (activates the tool window and opens the MR's tab, even from the closed-window
+     * poller — see [CockpitNavigation.openMr]) and "Open in GitLab" (the MR's web page). Both expire the
+     * balloon when triggered.
+     */
+    private fun post(text: NotificationText, type: NotificationType, icon: Icon, mr: GitLabMergeRequest) {
         // Resolve the group per post (never cache): reading the setting on each event makes a
         // sticky-toggle change take effect on the next notification without restarting anything.
         val group = notificationGroupFor(GitLabCockpitSettings.getInstance().stickyNotifications)
         NotificationGroupManager.getInstance()
             .getNotificationGroup(group)
-            .createNotification(title, content, type)
+            .createNotification(text.title, text.content, type)
+            .setIcon(icon)
+            .addAction(
+                NotificationAction.createSimpleExpiring(
+                    CockpitBundle.message("notification.action.openCockpit"),
+                ) { CockpitNavigation.openMr(project, mr) },
+            )
+            .addAction(
+                NotificationAction.createSimpleExpiring(
+                    CockpitBundle.message("notification.action.openBrowser"),
+                ) { BrowserUtil.browse(mr.webUrl) },
+            )
             .notify(project)
     }
 }

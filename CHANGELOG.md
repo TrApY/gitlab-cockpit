@@ -4,6 +4,18 @@
 
 ## [Unreleased]
 
+### Added
+
+- Pipeline and merge-request notifications now carry two actions — "Open in Cockpit" (activates the tool window and opens the merge request's tab, even when the window was closed) and "Open in GitLab" (the merge request's web page) — and each balloon shows a per-event icon (GLC-54)
+
+### Changed
+
+- Pipeline notifications now read like the other events: the outcome ("Pipeline succeeded" / "Pipeline failed") is the title and the `!iid — title` line is the body (GLC-54)
+
+### Fixed
+
+- Merge request titles containing `<`, `>` or `&` no longer break or drop text in notification balloons: every title is HTML-escaped before it is shown (GLC-54)
+
 ## [0.13.2] - 2026-07-22
 
 ### Fixed
