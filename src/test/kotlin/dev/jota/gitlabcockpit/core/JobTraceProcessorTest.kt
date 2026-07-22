@@ -16,8 +16,12 @@ class JobTraceProcessorTest {
     /** Timestamped prefix of a brand-new logical line (`...Z 01O ` — stream 01, stdout, no `+`). */
     private val tsNew = "2026-07-13T16:25:02.840617Z 01O "
 
-    /** Timestamped prefix of a continuation line (`...Z 00O+ ` — the `+` marks a continuation). */
-    private val tsCont = "2026-07-13T16:25:02.840618Z 00O+ "
+    /**
+     * Timestamped prefix of a continuation line: the `+` flag is the marker's 4th character and the
+     * content follows **immediately** — real traces read `…Z 00O+section_start:…` (GLC-47; the old
+     * fixture's trailing space encoded a format GitLab never emits).
+     */
+    private val tsCont = "2026-07-13T16:25:02.840618Z 00O+"
 
     /** Runs the chunks through one processor and returns feed output concatenated with the flush. */
     private fun process(vararg chunks: String): String {
@@ -129,5 +133,27 @@ class JobTraceProcessorTest {
         val afterFlush = processor.feed(tsNew + "third\n")
         assertEquals("", afterFlush)
         assertEquals("third\n", processor.flush())
+    }
+
+    /**
+     * Regression for GLC-47 (reported with a real Europcar trace): continuation lines carry their
+     * content immediately after the `+` flag (`…Z 00O+section_start:…`), which the old
+     * `optional-plus-then-space` pattern never matched — every such line leaked through with its raw
+     * timestamp prefix, `000+` marker and un-dropped `section_start:` text.
+     */
+    @Test
+    fun `real trace continuations join, drop their section marker and keep the colored header`() {
+        val out = process(
+            "2026-07-21T13:43:20.910469Z 00O \n" +
+                "2026-07-21T13:43:20.910515Z 00O+section_start:1784641400:prepare_executor\r\n" +
+                "2026-07-21T13:43:20.910520Z 00O+" + esc + "[0K" + esc +
+                "[36mPreparing the \"docker\" executor" + esc + "[0;m\n" +
+                "2026-07-21T13:43:20.911000Z 00O Using Docker executor with image ci-tools:latest\n",
+        )
+        assertEquals(
+            esc + "[36mPreparing the \"docker\" executor" + esc + "[0;m\n" +
+                "Using Docker executor with image ci-tools:latest\n",
+            out,
+        )
     }
 }

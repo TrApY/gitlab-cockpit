@@ -135,12 +135,16 @@ class JobTraceProcessor {
         private val BEL: String = Char(0x07).toString()
 
         /**
-         * GitLab 17+ timestamped line: `<RFC3339 with optional fraction>Z <2 stream digits><O|E><+?>
-         * <content>`. [RegexOption.DOT_MATCHES_ALL] lets the content group capture the embedded `\r`
-         * that section headers and progress redraws use (a physical line never contains `\n` here).
+         * GitLab 17+ timestamped line: `<RFC3339 with optional fraction>Z <2 stream digits><O|E><flag>`
+         * where the flag is the FOURTH character of the marker — a space for a line start or `+` for a
+         * continuation — and the content follows **immediately** (no separator: real traces read
+         * `…Z 00O+section_start:…`, GLC-47). The earlier pattern demanded a space after an *optional*
+         * `+`, so every continuation line failed to match and leaked through with its raw prefix.
+         * [RegexOption.DOT_MATCHES_ALL] lets the content group capture the embedded `\r` that section
+         * headers and progress redraws use (a physical line never contains `\n` here).
          */
         private val TIMESTAMPED = Regex(
-            "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d+)?Z (\\d{2})([OE])(\\+?) (.*)$",
+            "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d+)?Z (\\d{2})([OE])([+ ])(.*)$",
             RegexOption.DOT_MATCHES_ALL,
         )
 
