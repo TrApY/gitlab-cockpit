@@ -4,6 +4,8 @@
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-07-22
+
 ### Added
 
 - Complete native-style redesign (modeled on the JetBrains GitLab plugin): two-line MR list with avatars, branch chips, comment/pipeline badges and per-avatar tooltips
