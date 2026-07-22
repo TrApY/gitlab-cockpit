@@ -32,6 +32,14 @@ class MemberCompletionProvider :
         LookupElementBuilder.create(item, item.username)
             .withPresentableText(item.name.ifBlank { item.username })
             .withTailText(" (@${item.username})", true)
+            // The always-matching prefix matcher below keeps the platform from re-filtering, but it
+            // also means accepting a lookup replaces an EMPTY prefix — the typed letters were left in
+            // front of the inserted username (GLC-51). The field holds exactly one username, so the
+            // insert handler rewrites the whole document with the accepted value instead.
+            .withInsertHandler { context, _ ->
+                context.document.setText(item.username)
+                context.editor.caretModel.moveToOffset(item.username.length)
+            }
 
     override fun getItems(
         prefix: String,
