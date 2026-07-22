@@ -106,6 +106,8 @@ import java.awt.Color
 import java.awt.Component
 import java.awt.Container
 import java.awt.Cursor
+import java.awt.Dimension
+import java.awt.Rectangle
 import java.awt.FlowLayout
 import java.awt.Font
 import java.awt.Graphics
@@ -125,6 +127,7 @@ import javax.swing.JComponent
 import javax.swing.JPanel
 import javax.swing.JSeparator
 import javax.swing.ListSelectionModel
+import javax.swing.Scrollable
 import javax.swing.SwingConstants
 import javax.swing.SwingUtilities
 import javax.swing.event.DocumentEvent
@@ -207,9 +210,33 @@ class MrDetailPanel(
     /** The contextual Merge / Set auto-merge link on the merge-readiness line; disabled while merging. */
     private var mergeLink: ActionLink? = null
 
-    private val descriptionPane = CockpitHtml.createHtmlPane()
-    private val descriptionScroll = JBScrollPane(descriptionPane)
+    private val descriptionPane = CockpitHtml.createHtmlPane().apply {
+        border = JBUI.Borders.empty(0, INFO_H_PADDING, INFO_V_PADDING, INFO_H_PADDING)
+    }
     private val headerContainer = JPanel(BorderLayout()).apply { isOpaque = false }
+
+    /**
+     * The Info tab's single scrolling page (GLC-48): header on top, the markdown description flowing
+     * right below it — no inner scroll pane, no border "textbox", nothing at all when the MR has no
+     * description (like the reference plugin). [Scrollable] with width-tracking so the description
+     * keeps word-wrapping to the viewport (a plain panel between the editor pane and the viewport
+     * would otherwise disable [javax.swing.JEditorPane]'s own tracking and grow sideways).
+     */
+    private val infoContent = object : JPanel(BorderLayout()), Scrollable {
+        override fun getPreferredScrollableViewportSize(): Dimension = preferredSize
+        override fun getScrollableUnitIncrement(visibleRect: Rectangle, orientation: Int, direction: Int): Int =
+            JBUI.scale(16)
+        override fun getScrollableBlockIncrement(visibleRect: Rectangle, orientation: Int, direction: Int): Int =
+            if (orientation == SwingConstants.VERTICAL) visibleRect.height else visibleRect.width
+        override fun getScrollableTracksViewportWidth(): Boolean = true
+        override fun getScrollableTracksViewportHeight(): Boolean = false
+    }.apply {
+        isOpaque = false
+        add(headerContainer, BorderLayout.NORTH)
+        add(descriptionPane, BorderLayout.CENTER)
+    }
+
+    private val infoScroll = JBScrollPane(infoContent).apply { border = JBUI.Borders.empty() }
     private val overviewPanel = JPanel(BorderLayout())
 
     /** Shared circular-avatar cache; feeds the header people row (author, assignees, reviewers). */
@@ -346,9 +373,9 @@ class MrDetailPanel(
     )
 
     init {
-        // Info card content: the header (+ top-right edit pencil) + the markdown description.
-        overviewPanel.add(headerContainer, BorderLayout.NORTH)
-        overviewPanel.add(descriptionScroll, BorderLayout.CENTER)
+        // Info card content: one scrolling page — header (+ top-right edit pencil) with the markdown
+        // description flowing right below it (GLC-48).
+        overviewPanel.add(infoScroll, BorderLayout.CENTER)
 
         // Events & Discussions card: filter/sort/+ toolbar + draft banner, then the native card stack.
         val commentsNorth = JPanel(BorderLayout()).apply { isOpaque = false }
@@ -780,11 +807,14 @@ class MrDetailPanel(
     }
 
     private fun setDescription(mr: GitLabMergeRequest) {
-        val fragment = if (mr.description.isNullOrBlank()) {
-            "<p><i>" + CockpitHtml.escapeHtml(CockpitBundle.message("detail.noDescription")) + "</i></p>"
-        } else {
-            CockpitHtml.stripBody(MarkdownRenderer.toHtml(mr.description))
+        // No description → nothing at all (no placeholder, no box), like the reference (GLC-48).
+        if (mr.description.isNullOrBlank()) {
+            descriptionPane.text = ""
+            descriptionPane.isVisible = false
+            return
         }
+        descriptionPane.isVisible = true
+        val fragment = CockpitHtml.stripBody(MarkdownRenderer.toHtml(mr.description))
         val ref = MrRef(mr.projectId, mr.iid)
         applyMarkdownUploads(
             pane = descriptionPane,
@@ -805,9 +835,9 @@ class MrDetailPanel(
             closedRelative = mr.closedAt?.let(::formatRelative),
         )
 
-        val header = JPanel(VerticalLayout(JBUI.scale(4)))
+        val header = JPanel(VerticalLayout(JBUI.scale(HEADER_ROW_GAP)))
         header.isOpaque = false
-        header.border = CockpitTheme.panelBorder()
+        header.border = JBUI.Borders.empty(INFO_V_PADDING, INFO_H_PADDING, HEADER_ROW_GAP, INFO_H_PADDING)
 
         // 0. People row: circular avatars (author, assignees, reviewers) with a name tooltip, no text.
         header.add(buildAvatarsRow(mr))
@@ -2537,6 +2567,15 @@ class MrDetailPanel(
 
         /** Vertical gap (unscaled px) between two native timeline cards (iter3 B). */
         private const val TIMELINE_CARD_GAP = 8
+
+        /** Vertical gap (unscaled px) between the Info header's rows — the reference's airy spacing (GLC-48). */
+        private const val HEADER_ROW_GAP = 8
+
+        /** Top/bottom padding (unscaled px) of the Info page. */
+        private const val INFO_V_PADDING = 10
+
+        /** Left/right padding (unscaled px) of the Info page (header rows and description alike). */
+        private const val INFO_H_PADDING = 12
 
         /** Corner radius (unscaled px) of a timeline card's rounded border/background (iter3 B5). */
         private const val CARD_ARC = 8
