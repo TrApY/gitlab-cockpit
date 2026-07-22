@@ -71,15 +71,17 @@ class GitLabCockpitConfigurable : Configurable {
 
     override fun createComponent(): JComponent {
         val dialogPanel = panel {
+            // Every setting carries a muted explanation line (GLC-58, user request): the comment()
+            // strings live in the bundle next to their labels.
             row(CockpitBundle.message("settings.name.label")) {
                 cell(nameField).align(AlignX.FILL)
-            }
+            }.rowComment(CockpitBundle.message("settings.name.help"))
             row(CockpitBundle.message("settings.url.label")) {
                 cell(urlField).align(AlignX.FILL)
-            }
+            }.rowComment(CockpitBundle.message("settings.url.help"))
             row(CockpitBundle.message("settings.token.label")) {
                 cell(tokenField).align(AlignX.FILL)
-            }
+            }.rowComment(CockpitBundle.message("settings.token.help"))
             row("") {
                 button(CockpitBundle.message("settings.test.button")) { testConnection() }
                 cell(resultLabel)
@@ -87,23 +89,31 @@ class GitLabCockpitConfigurable : Configurable {
             group(CockpitBundle.message("settings.merge.title")) {
                 row(CockpitBundle.message("settings.merge.squash.label")) {
                     cell(squashCombo)
-                }
+                }.rowComment(CockpitBundle.message("settings.merge.squash.help"))
                 row(CockpitBundle.message("settings.merge.deleteSource.label")) {
                     cell(deleteSourceCombo)
-                }
+                }.rowComment(CockpitBundle.message("settings.merge.deleteSource.help"))
             }
             group(CockpitBundle.message("settings.notifications.title")) {
                 row { cell(notificationsEnabledCheck) }
+                    .rowComment(CockpitBundle.message("settings.notifications.enabled.help"))
                 row { cell(stickyCheck) }
+                    .rowComment(CockpitBundle.message("settings.notifications.sticky.help"))
                 row { cell(notifyPipelineCheck) }
+                    .rowComment(CockpitBundle.message("settings.notifications.pipeline.help"))
                 row { cell(notifyNewMrCheck) }
+                    .rowComment(CockpitBundle.message("settings.notifications.newMr.help"))
                 row { cell(notifyMrStateCheck) }
+                    .rowComment(CockpitBundle.message("settings.notifications.mrState.help"))
                 row { cell(notifyPushCheck) }
+                    .rowComment(CockpitBundle.message("settings.notifications.push.help"))
                 row { cell(notifyCommentsCheck) }
+                    .rowComment(CockpitBundle.message("settings.notifications.comments.help"))
                 row { cell(notifyScopeAllFilteredCheck) }
+                    .rowComment(CockpitBundle.message("settings.notifications.scopeAllFiltered.help"))
                 row(CockpitBundle.message("settings.notifications.backgroundInterval")) {
                     cell(backgroundIntervalCombo)
-                }
+                }.rowComment(CockpitBundle.message("settings.notifications.backgroundInterval.help"))
             }
         }
         reset()

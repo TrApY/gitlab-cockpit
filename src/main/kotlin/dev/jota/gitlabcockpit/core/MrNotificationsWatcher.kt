@@ -74,7 +74,9 @@ class MrNotificationsWatcher(
         // later never replays historical changes; then post only the enabled ones.
         for (event in service.detectScopeMrEvents(ready)) {
             val enabled = when (event) {
-                is MrEvent.NewMr -> settings.notifyNewMr
+                // Only an OPEN merge request is news when it appears — a merged/closed one entering
+                // the scope is filter/scope motion (e.g. the state filter switched to ALL), GLC-57.
+                is MrEvent.NewMr -> settings.notifyNewMr && event.mr.state == "opened"
                 is MrEvent.StateChanged -> settings.notifyMrState
                 is MrEvent.NewPush -> settings.notifyPush
                 is MrEvent.NewComments -> settings.notifyComments

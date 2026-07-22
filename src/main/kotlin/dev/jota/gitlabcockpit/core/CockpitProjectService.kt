@@ -140,6 +140,7 @@ class CockpitProjectService(
 
     /** Loads merge requests for [selection], resolving project/user/remote as needed. */
     suspend fun loadMergeRequests(selection: MrFilterSelection): CockpitState {
+        lastLoadedSelection = selection
         val ok = when (val resolution = resolveClientAndProject()) {
             is ProjectResolution.Ok -> resolution
             ProjectResolution.NotConfigured -> return CockpitState.NotConfigured
@@ -535,6 +536,14 @@ class CockpitProjectService(
     @Volatile
     private var lastMrSnapshot: Map<MrRef, MrSnapshot>? = null
 
+    /** The selection of the last [loadMergeRequests]; feeds the filter-change rebaseline (GLC-57). */
+    @Volatile
+    private var lastLoadedSelection: MrFilterSelection? = null
+
+    /** The selection the events snapshot was built under; a difference rebaselines silently (GLC-57). */
+    @Volatile
+    private var lastEventsSelection: MrFilterSelection? = null
+
     /**
      * One watcher pass: for the (at most [MAX_WATCHED_MRS] most recent) MRs the current user authored
      * or is assigned to, fetches each MR's latest pipeline status in parallel and compares it to the
@@ -595,7 +604,13 @@ class CockpitProjectService(
             }
         }
 
-        return advanceMrSnapshot(scoped + fetched)
+        // A filter change means the scope's population changed wholesale: rebaseline silently so the
+        // MRs the new filter exposes (e.g. every historical MR after switching the state to ALL) are
+        // memorized without one "new MR" balloon each (GLC-57, user-reported after 0.13.0).
+        val selection = lastLoadedSelection
+        val baseline = selection != lastEventsSelection
+        lastEventsSelection = selection
+        return advanceMrSnapshot(scoped + fetched, baseline)
     }
 
     /**
@@ -604,8 +619,11 @@ class CockpitProjectService(
      * snapshot indivisible while the network fetches in [detectScopeMrEvents] stay outside the lock.
      */
     @Synchronized
-    private fun advanceMrSnapshot(mrs: List<GitLabMergeRequest>): List<MrEvent> {
-        val (events, snapshot) = detectMrEvents(lastMrSnapshot, mrs)
+    private fun advanceMrSnapshot(mrs: List<GitLabMergeRequest>, baseline: Boolean): List<MrEvent> {
+        // A baseline pass (the filter just changed, GLC-57) memorizes silently: filter-induced
+        // appearance is scope motion, not news — detectMrEvents' null-previous rule does exactly that.
+        val previous = if (baseline) null else lastMrSnapshot
+        val (events, snapshot) = detectMrEvents(previous, mrs)
         lastMrSnapshot = snapshot
         return events
     }

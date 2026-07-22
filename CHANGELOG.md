@@ -4,6 +4,16 @@
 
 ## [Unreleased]
 
+## [0.13.1] - 2026-07-22
+
+### Fixed
+
+- Switching the list filter (e.g. the state to ALL) no longer floods "new merge request" notifications for every merge request the new filter exposes: a filter change now rebaselines the watcher silently, and "new merge request" only ever fires for open ones
+
+### Added
+
+- Every setting in Settings → Tools → Cockpit for GitLab now carries an explanation line
+
 ## [0.13.0] - 2026-07-22
 
 ### Added
