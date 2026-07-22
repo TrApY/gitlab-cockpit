@@ -2,6 +2,8 @@ package dev.jota.gitlabcockpit.ui
 
 import com.intellij.icons.AllIcons
 import com.intellij.ide.BrowserUtil
+import com.intellij.notification.NotificationGroupManager
+import com.intellij.notification.NotificationType
 import com.intellij.openapi.Disposable
 import com.intellij.openapi.application.EDT
 import com.intellij.openapi.editor.event.DocumentEvent
@@ -26,6 +28,7 @@ import com.intellij.util.ui.JBUI
 import dev.jota.gitlabcockpit.CockpitBundle
 import dev.jota.gitlabcockpit.api.GitLabMergeRequest
 import dev.jota.gitlabcockpit.api.GitLabResult
+import dev.jota.gitlabcockpit.core.COCKPIT_NOTIFICATION_GROUP
 import dev.jota.gitlabcockpit.core.CockpitProjectService
 import dev.jota.gitlabcockpit.core.CockpitState
 import dev.jota.gitlabcockpit.core.MergeRequestState
@@ -232,6 +235,7 @@ class CockpitToolWindowPanel(
             // combo re-enters this listener with the new role, which performs the actual reload.
             if (allProjectsCheckBox.isSelected && roleCombo.selectedItem == RoleFilter.ALL) {
                 roleCombo.selectedItem = RoleFilter.I_AM_AUTHOR
+                notifyAllRoleUnavailable()
                 return@addActionListener
             }
             val byUser = roleCombo.selectedItem == RoleFilter.BY_USER
@@ -243,8 +247,10 @@ class CockpitToolWindowPanel(
         allProjectsCheckBox.addActionListener {
             // Enabling global mode while ALL is selected switches the role (its own listener reloads);
             // any other toggle reloads directly.
+            updateRoleComboTooltip()
             if (allProjectsCheckBox.isSelected && roleCombo.selectedItem == RoleFilter.ALL) {
                 roleCombo.selectedItem = RoleFilter.I_AM_AUTHOR
+                notifyAllRoleUnavailable()
             } else {
                 reload(invalidateCache = false)
             }
@@ -354,6 +360,31 @@ class CockpitToolWindowPanel(
     /** Opens the selected MR's GitLab page in the external browser. */
     private fun browseSelected() {
         mrList.selectedValue?.let { BrowserUtil.browse(it.webUrl) }
+    }
+
+    /**
+     * Explains the silent ALL→I_AM_AUTHOR bounce: in "All projects" mode the list comes from the
+     * instance-wide `/merge_requests?scope=all`, where an unrestricted "All" would page through every
+     * merge request the user can see on the whole GitLab instance. Without this balloon the bounce
+     * looks like a broken combo (reported by a user who kept re-selecting "All").
+     */
+    private fun notifyAllRoleUnavailable() {
+        NotificationGroupManager.getInstance()
+            .getNotificationGroup(COCKPIT_NOTIFICATION_GROUP)
+            .createNotification(
+                CockpitBundle.message("toolwindow.filter.role.allUnavailable"),
+                NotificationType.INFORMATION,
+            )
+            .notify(project)
+    }
+
+    /** Keeps the role combo's tooltip in sync with the "All projects" constraint on the ALL role. */
+    private fun updateRoleComboTooltip() {
+        roleCombo.toolTipText = if (allProjectsCheckBox.isSelected) {
+            CockpitBundle.message("toolwindow.filter.role.allProjectsTooltip")
+        } else {
+            CockpitBundle.message("toolwindow.filter.role.label")
+        }
     }
 
     private fun currentSelection(): MrFilterSelection = MrFilterSelection(
