@@ -18,6 +18,36 @@ fun filterMembers(members: List<GitLabUser>, query: String): List<GitLabUser> {
 }
 
 /**
+ * Stages [user] into the [current] picks of an Assignees/Reviewers column of the Edit-MR dialog
+ * (GLC-50, the "+" popup selection). When [single] — the **Assignee** column, which is 0..1 because the
+ * update contract takes a single assignee — the result is exactly `[user]`, so a pick *replaces* whatever
+ * was there. Otherwise (Reviewers) [user] is appended unless a member with the same [GitLabUser.id] is
+ * already staged (no duplicates), preserving order. Returns a new list; [current] is never mutated. Pure
+ * so the popup's add/replace path is unit tested without a UI.
+ */
+fun stageMember(current: List<GitLabUser>, user: GitLabUser, single: Boolean): List<GitLabUser> =
+    when {
+        single -> listOf(user)
+        current.any { it.id == user.id } -> current
+        else -> current + user
+    }
+
+/**
+ * Removes the member with [id] from [current] (the "−" button, GLC-50), preserving order; a no-op when
+ * no staged member carries that id. Returns a new list; [current] is never mutated.
+ */
+fun unstageMember(current: List<GitLabUser>, id: Long): List<GitLabUser> =
+    current.filterNot { it.id == id }
+
+/**
+ * The id a "−" click removes (GLC-50): the [selectedId] when the user has a chip selected, otherwise the
+ * last staged member (the reference removes the bottom-most one), or `null` when the column is empty so
+ * the click is a no-op.
+ */
+fun memberToRemove(current: List<GitLabUser>, selectedId: Long?): Long? =
+    selectedId ?: current.lastOrNull()?.id
+
+/**
  * The platform-free selection state behind [dev.jota.gitlabcockpit.ui] reviewer editing: the full
  * [members] roster plus the set of currently checked ids. It survives filtering — a member checked
  * while unfiltered stays checked even while a [query] hides it from [visibleItems], so the user can

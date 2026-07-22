@@ -82,6 +82,9 @@ import dev.jota.gitlabcockpit.core.buildTimeline
 import dev.jota.gitlabcockpit.core.commentThreads
 import dev.jota.gitlabcockpit.core.eventIconKey
 import dev.jota.gitlabcockpit.core.filterMembers
+import dev.jota.gitlabcockpit.core.memberToRemove
+import dev.jota.gitlabcockpit.core.stageMember
+import dev.jota.gitlabcockpit.core.unstageMember
 import dev.jota.gitlabcockpit.core.filterTimeline
 import dev.jota.gitlabcockpit.core.mergeButtonState
 import dev.jota.gitlabcockpit.core.mrHeaderPresentation
@@ -116,17 +119,23 @@ import java.awt.Graphics2D
 import java.awt.GridBagLayout
 import java.awt.RenderingHints
 import java.awt.datatransfer.StringSelection
+import java.awt.event.KeyAdapter
+import java.awt.event.KeyEvent
 import java.awt.event.MouseAdapter
 import java.awt.event.MouseEvent
 import java.awt.event.MouseListener
+import java.awt.event.WindowAdapter
+import java.awt.event.WindowEvent
 import java.awt.geom.RoundRectangle2D
 import java.util.concurrent.ConcurrentHashMap
 import javax.swing.Action
 import javax.swing.Icon
 import javax.swing.JButton
 import javax.swing.JComponent
+import javax.swing.JList
 import javax.swing.JPanel
 import javax.swing.JSeparator
+import javax.swing.ListCellRenderer
 import javax.swing.ListSelectionModel
 import javax.swing.Scrollable
 import javax.swing.SwingConstants
@@ -1861,32 +1870,16 @@ class MrDetailPanel(
     // --- Edit actions -------------------------------------------------------------------------
 
     /**
-     * Opens the unified Edit dialog (iter3 G20): title + description + reviewers/assignee rows. The
-     * reviewer/assignee rows reuse the existing pickers ([EditReviewersDialog] / [EditAssigneeDialog])
-     * as a sub-step; OK applies the staged title, description, reviewers and assignee in one update.
+     * Opens the unified Edit dialog (iter3 G20, GLC-50): title + description + side-by-side Assignees /
+     * Reviewers chip columns + a Labels row. The member roster is preloaded once when the dialog opens
+     * (via [withMembers], see [EditMrDialog]) so each column's "+" popup opens instantly and in-modal;
+     * OK applies the staged title, description, reviewers and assignee in one update.
      */
     private fun onEditMr(mr: GitLabMergeRequest) {
         val dialog = EditMrDialog(
             project,
             mr,
-            pickReviewers = { current, onPicked ->
-                withMembers(mr.projectId) { members ->
-                    val picker = EditReviewersDialog(project, members, current.map { it.id }.toSet())
-                    if (picker.showAndGet()) {
-                        val ids = picker.selectedIds().toSet()
-                        onPicked(members.filter { it.id in ids })
-                    }
-                }
-            },
-            pickAssignee = { current, onPicked ->
-                withMembers(mr.projectId) { members ->
-                    val picker = EditAssigneeDialog(project, members, current?.id)
-                    if (picker.showAndGet()) {
-                        val id = picker.selectedIds().firstOrNull()
-                        onPicked(members.firstOrNull { it.id == id })
-                    }
-                }
-            },
+            loadRoster = { onLoaded -> withMembers(mr.projectId, onLoaded) },
             pickLabels = { current, onPicked ->
                 withLabels(mr.projectId) { projectLabels ->
                     // Keep any current label absent from the project roster so it is not silently dropped.
@@ -2003,21 +1996,30 @@ class MrDetailPanel(
     // --- Edit dialogs -------------------------------------------------------------------------
 
     /**
-     * The unified Edit Merge Request dialog (iter3 G20, Kotlin UI DSL v2). Title and description are
-     * edited inline; the Assignees, Reviewers and Labels rows show the current values and an "Edit…"
-     * button that opens the matching picker as a sub-step (via the injected [pickReviewers] /
-     * [pickAssignee] / [pickLabels]), staging the picks into [reviewerIds] / [assigneeIds] /
-     * [labelsCsvOrNull]. A "Mark as draft" checkbox (GLC-42) toggles the MR's draft state through its
-     * title's `Draft: ` prefix — GitLab's REST update endpoint has no direct draft/WIP input, so
-     * [editedTitle] normalizes the title to the checkbox via [applyDraftState]. The title field shows
-     * the *stripped* title (without any draft marker) so the checkbox is its single source of truth. OK
-     * returns the staged fields to the caller.
+     * The unified Edit Merge Request dialog (iter3 G20 / GLC-50, Kotlin UI DSL v2). Title and description
+     * are edited inline; the **Assignees** and **Reviewers** picks are shown side by side as
+     * [MemberColumn]s — a vertical list of member chips with "+"/"−" buttons, the "+" opening an in-modal
+     * search popup over the preloaded roster (see below). Labels keep the value-label + "Edit…" button
+     * that opens [EditLabelsDialog] (the reference edits labels the same way, via [pickLabels]). A "Mark
+     * as draft" checkbox (GLC-42) toggles the MR's draft state through its title's `Draft: ` prefix —
+     * GitLab's REST update endpoint has no direct draft/WIP input, so [editedTitle] normalizes the title
+     * to the checkbox via [applyDraftState]. The title field shows the *stripped* title (without any
+     * draft marker) so the checkbox is its single source of truth. OK returns the staged fields.
+     *
+     * **Assignee is unique**: the update contract takes a single assignee, so the Assignees column is a
+     * single-select [MemberColumn] (0..1 chips) and picking in its popup *replaces* the current one (see
+     * [stageMember]). [assigneeIds] is therefore always 0 or 1 id.
+     *
+     * **Roster preload & modality (GLC-49/50)**: [loadRoster] is fired once from [WindowAdapter.windowOpened]
+     * — from the EDT *after* this modal is on screen — so the [MrDetailPanel.withMembers] continuation it
+     * wraps captures this dialog's modality and lands *inside* the modal. A preload kicked off before
+     * `show()` would resume under NON_MODAL and be deferred until the dialog closes. With the roster in
+     * memory, each "+" popup then opens synchronously from the click with no round-trip to the background.
      */
     private class EditMrDialog(
         project: Project,
         mr: GitLabMergeRequest,
-        private val pickReviewers: (List<GitLabUser>, (List<GitLabUser>) -> Unit) -> Unit,
-        private val pickAssignee: (GitLabUser?, (GitLabUser?) -> Unit) -> Unit,
+        private val loadRoster: ((List<GitLabUser>) -> Unit) -> Unit,
         private val pickLabels: (List<String>, (List<String>) -> Unit) -> Unit,
     ) : DialogWrapper(project) {
 
@@ -2027,12 +2029,26 @@ class MrDetailPanel(
             wrapStyleWord = true
         }
 
-        private var stagedReviewers: List<GitLabUser> = mr.reviewers
-        private var stagedAssignee: GitLabUser? = mr.assignees.firstOrNull()
-        private var stagedLabels: List<String> = mr.labels
+        /** The preloaded member roster, empty until [loadRoster] lands in-modal (see the class KDoc). */
+        private var roster: List<GitLabUser> = emptyList()
+        private var rosterLoaded: Boolean = false
 
-        private val reviewersLabel = JBLabel(peopleText(stagedReviewers))
-        private val assigneeLabel = JBLabel(personText(stagedAssignee))
+        private val assigneeColumn = MemberColumn(
+            CockpitBundle.message("dialog.editMr.assigneeLabel"),
+            single = true,
+            initial = mr.assignees.take(1),
+            rosterSupplier = { roster },
+            rosterReady = { rosterLoaded },
+        )
+        private val reviewersColumn = MemberColumn(
+            CockpitBundle.message("dialog.editMr.reviewersLabel"),
+            single = false,
+            initial = mr.reviewers,
+            rosterSupplier = { roster },
+            rosterReady = { rosterLoaded },
+        )
+
+        private var stagedLabels: List<String> = mr.labels
         private val labelsValueLabel = JBLabel(labelsText(stagedLabels))
         private val draftCheck = JBCheckBox(CockpitBundle.message("dialog.editMr.draftLabel"), mr.draft)
 
@@ -2042,6 +2058,16 @@ class MrDetailPanel(
         init {
             title = CockpitBundle.message("dialog.editMr.title")
             init()
+            // Preload the roster once the modal is on screen so the continuation lands in-modal (GLC-49).
+            window?.addWindowListener(object : WindowAdapter() {
+                override fun windowOpened(e: WindowEvent) = loadRoster(::onRosterLoaded)
+            })
+        }
+
+        /** EDT, in-modal: the roster arrived — the "+" popups now filter it and drop their loading hint. */
+        private fun onRosterLoaded(members: List<GitLabUser>) {
+            roster = members
+            rosterLoaded = true
         }
 
         override fun createCenterPanel(): JComponent = panel {
@@ -2052,23 +2078,9 @@ class MrDetailPanel(
                 cell(JBScrollPane(descriptionArea).apply { preferredSize = CockpitTheme.EDIT_MR_DIALOG_SIZE })
                     .align(Align.FILL)
             }.resizableRow()
-            row(CockpitBundle.message("dialog.editMr.assigneeLabel")) {
-                cell(assigneeLabel).align(AlignX.FILL)
-                button(CockpitBundle.message("dialog.editMr.editButton")) {
-                    pickAssignee(stagedAssignee) { picked ->
-                        stagedAssignee = picked
-                        assigneeLabel.text = personText(picked)
-                    }
-                }
-            }
-            row(CockpitBundle.message("dialog.editMr.reviewersLabel")) {
-                cell(reviewersLabel).align(AlignX.FILL)
-                button(CockpitBundle.message("dialog.editMr.editButton")) {
-                    pickReviewers(stagedReviewers) { picked ->
-                        stagedReviewers = picked
-                        reviewersLabel.text = peopleText(picked)
-                    }
-                }
+            row {
+                cell(assigneeColumn.component())
+                cell(reviewersColumn.component())
             }
             row(CockpitBundle.message("dialog.editMr.labelsLabel")) {
                 cell(labelsValueLabel).align(AlignX.FILL)
@@ -2087,8 +2099,10 @@ class MrDetailPanel(
         /** The title normalized to the draft checkbox (adds/removes the `Draft: ` prefix, GLC-42). */
         val editedTitle: String get() = applyDraftState(titleField.text.trim(), draftCheck.isSelected)
         val editedDescription: String get() = descriptionArea.text
-        val reviewerIds: List<Long> get() = stagedReviewers.map { it.id }
-        val assigneeIds: List<Long> get() = stagedAssignee?.let { listOf(it.id) } ?: emptyList()
+        val reviewerIds: List<Long> get() = reviewersColumn.selectedIds()
+
+        /** 0 or 1 id — the Assignees column is single-select (see the class KDoc). */
+        val assigneeIds: List<Long> get() = assigneeColumn.selectedIds()
 
         /**
          * The chosen labels as a CSV of names (GLC-42), or null when the selection is unchanged so the
@@ -2097,67 +2111,197 @@ class MrDetailPanel(
         val labelsCsvOrNull: String?
             get() = if (stagedLabels.toSet() == originalLabels) null else stagedLabels.joinToString(",")
 
-        private fun peopleText(users: List<GitLabUser>): String =
-            users.takeIf { it.isNotEmpty() }?.joinToString(", ") { displayName(it) }
-                ?: CockpitBundle.message("detail.none")
-
-        private fun personText(user: GitLabUser?): String =
-            user?.let { displayName(it) } ?: CockpitBundle.message("detail.none")
-
         private fun labelsText(names: List<String>): String =
             names.takeIf { it.isNotEmpty() }?.joinToString(", ") ?: CockpitBundle.message("detail.none")
     }
 
     /**
-     * Reviewer picker with an incremental search field over a [CheckBoxList]. The selection state
-     * lives in a pure [dev.jota.gitlabcockpit.core.ReviewerSelectionModel], so a member checked while
-     * unfiltered stays checked even after a search hides it — the dialog is glue that repopulates the
-     * visible rows on each keystroke and forwards toggles to the model. [selectedIds] just reads the
-     * model.
+     * One Edit-MR member column (GLC-50): a header, a vertical single-select [JBList] of member chips (so
+     * "−" knows which chip to drop) and a "+"/"−" button pair to its right. "+" opens an in-modal search
+     * popup ([showPickerPopup]) over the [rosterSupplier] roster and stages the pick via [stageMember]
+     * ([single] replaces for the unique Assignee, else appends without duplicates); "−" drops the selected
+     * chip, or the last one when none is selected (via [memberToRemove]). [selectedIds] reads the staged
+     * ids in list order. The column reads the roster live through [rosterSupplier]/[rosterReady] so it
+     * needs no notification when the [EditMrDialog] preload lands.
      */
-    private class EditReviewersDialog(
-        project: Project,
-        members: List<GitLabUser>,
-        currentReviewerIds: Set<Long>,
-    ) : DialogWrapper(project) {
+    private class MemberColumn(
+        private val headerText: String,
+        private val single: Boolean,
+        initial: List<GitLabUser>,
+        private val rosterSupplier: () -> List<GitLabUser>,
+        private val rosterReady: () -> Boolean,
+    ) {
 
-        private val model = dev.jota.gitlabcockpit.core.ReviewerSelectionModel(members, currentReviewerIds)
-        private val searchField = SearchTextField()
-        private val checkList = CheckBoxList<GitLabUser>()
+        private val listModel = CollectionListModel(initial)
+        private val chipList = JBList(listModel).apply {
+            selectionMode = ListSelectionModel.SINGLE_SELECTION
+            cellRenderer = MemberChipRenderer()
+            background = UIUtil.getPanelBackground()
+        }
+        private val addButton = iconButton(AllIcons.General.Add, "dialog.editMr.addTooltip") { showPickerPopup() }
+        private val removeButton =
+            iconButton(AllIcons.General.Remove, "dialog.editMr.removeTooltip") { removeSelected() }
 
-        init {
-            title = CockpitBundle.message("dialog.editReviewers.title")
-            checkList.setCheckBoxListListener { index, value ->
-                checkList.getItemAt(index)?.let { model.setChecked(it.id, value) }
+        /** The column's UI: header on top, chip list with the "+"/"−" bar to its right below it. */
+        fun component(): JComponent {
+            val header = JBLabel(headerText).apply { font = JBFont.label().asBold() }
+            val buttons = JPanel(VerticalLayout(JBUI.scale(2))).apply {
+                isOpaque = false
+                add(addButton)
+                add(removeButton)
+            }
+            val body = JPanel(BorderLayout(JBUI.scale(4), 0)).apply {
+                isOpaque = false
+                add(
+                    JBScrollPane(chipList).apply { preferredSize = CockpitTheme.EDIT_MR_CHIPS_SIZE },
+                    BorderLayout.CENTER,
+                )
+                add(buttons, BorderLayout.EAST)
+            }
+            return JPanel(BorderLayout(0, JBUI.scale(2))).apply {
+                isOpaque = false
+                add(header, BorderLayout.NORTH)
+                add(body, BorderLayout.CENTER)
+            }
+        }
+
+        /** The staged member ids in list order (0..1 when [single]). */
+        fun selectedIds(): List<Long> = listModel.items.map { it.id }
+
+        private fun removeSelected() {
+            val target = memberToRemove(listModel.items, chipList.selectedValue?.id) ?: return
+            listModel.replaceAll(unstageMember(listModel.items, target))
+        }
+
+        private fun stage(user: GitLabUser) {
+            listModel.replaceAll(stageMember(listModel.items, user, single))
+        }
+
+        /**
+         * Opens the "+" popup anchored under [addButton]: a [SearchTextField] over a candidate [JBList]
+         * filtered in memory by [filterMembers] from the first character, plus a muted hint (GLC-50). The
+         * roster is already loaded (or a loading hint shows), so this opens synchronously and in-modal.
+         * Enter/double-click stages the highlighted candidate and closes; Esc closes (JBPopup default).
+         */
+        private fun showPickerPopup() {
+            val searchField = SearchTextField()
+            val candModel = CollectionListModel<GitLabUser>()
+            val candList = JBList(candModel).apply {
+                selectionMode = ListSelectionModel.SINGLE_SELECTION
+                cellRenderer = textCellRenderer<GitLabUser> { memberLabel(it) }
+            }
+            val hint = JBLabel().apply {
+                foreground = CockpitTheme.muted()
+                border = JBUI.Borders.empty(2, 6)
+            }
+            fun repopulate() {
+                candModel.replaceAll(filterMembers(rosterSupplier(), searchField.text))
+                hint.text = CockpitBundle.message(
+                    if (rosterReady()) "dialog.editMr.membersSearchHint" else "dialog.editMr.membersLoading",
+                )
+                if (candModel.items.isNotEmpty()) candList.selectedIndex = 0
+            }
+            val content = JPanel(BorderLayout(0, JBUI.scale(4))).apply {
+                add(searchField, BorderLayout.NORTH)
+                add(
+                    JBScrollPane(candList).apply { preferredSize = CockpitTheme.MEMBER_POPUP_SIZE },
+                    BorderLayout.CENTER,
+                )
+                add(hint, BorderLayout.SOUTH)
+            }
+            lateinit var popup: JBPopup
+            fun confirm() {
+                val picked = candList.selectedValue ?: return
+                stage(picked)
+                popup.closeOk(null)
+            }
+            fun moveSelection(delta: Int) {
+                val size = candModel.items.size
+                if (size == 0) return
+                val next = (candList.selectedIndex + delta).coerceIn(0, size - 1)
+                candList.selectedIndex = next
+                candList.ensureIndexIsVisible(next)
             }
             searchField.addDocumentListener(object : DocumentAdapter() {
                 override fun textChanged(e: DocumentEvent) = repopulate()
             })
+            searchField.textEditor.addKeyListener(object : KeyAdapter() {
+                override fun keyPressed(e: KeyEvent) {
+                    when (e.keyCode) {
+                        KeyEvent.VK_ENTER -> { confirm(); e.consume() }
+                        KeyEvent.VK_DOWN -> { moveSelection(1); e.consume() }
+                        KeyEvent.VK_UP -> { moveSelection(-1); e.consume() }
+                    }
+                }
+            })
+            object : DoubleClickListener() {
+                override fun onDoubleClick(event: MouseEvent): Boolean {
+                    if (candList.selectedIndex < 0) return false
+                    confirm()
+                    return true
+                }
+            }.installOn(candList)
             repopulate()
-            init()
+            popup = JBPopupFactory.getInstance()
+                .createComponentPopupBuilder(content, searchField.textEditor)
+                .setRequestFocus(true)
+                .setResizable(true)
+                .createPopup()
+            popup.showUnderneathOf(addButton)
         }
 
-        /** EDT. Rebuilds the visible rows for the current query, checking each from the model. */
-        private fun repopulate() {
-            checkList.clear()
-            model.visibleItems(searchField.text).forEach { member ->
-                checkList.addItem(member, memberLabel(member), model.isChecked(member.id))
+        private fun iconButton(icon: Icon, tooltipKey: String, onClick: () -> Unit): JButton =
+            JButton(icon).apply {
+                toolTipText = CockpitBundle.message(tooltipKey)
+                margin = JBUI.insets(2)
+                isFocusable = false
+                addActionListener { onClick() }
             }
+    }
+
+    /**
+     * Renders a staged member as a rounded [CockpitTheme.chipBackground] chip — `Name (@username)` — in an
+     * Edit-MR [MemberColumn] list (GLC-50), tinting the selected chip with [CockpitTheme.info] like
+     * [ReactionChip] so the "−" target reads at a glance. The [ReactionChip] pill-paint pattern.
+     */
+    private class MemberChipRenderer : JBLabel(), ListCellRenderer<GitLabUser> {
+
+        private var selected = false
+
+        init {
+            isOpaque = false
+            border = JBUI.Borders.empty(2, 8)
         }
 
-        override fun createCenterPanel(): JComponent = panel {
-            row {
-                cell(searchField).align(AlignX.FILL)
+        override fun getListCellRendererComponent(
+            list: JList<out GitLabUser>,
+            value: GitLabUser,
+            index: Int,
+            isSelected: Boolean,
+            cellHasFocus: Boolean,
+        ): Component {
+            text = memberLabel(value)
+            selected = isSelected
+            foreground = list.foreground
+            return this
+        }
+
+        override fun paintComponent(g: Graphics) {
+            val g2 = g.create() as Graphics2D
+            try {
+                g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON)
+                val arc = JBUI.scale(REACTION_CHIP_ARC).toFloat()
+                val rect = RoundRectangle2D.Float(0.5f, 0.5f, width - 1f, height - 1f, arc, arc)
+                g2.color =
+                    if (selected) ColorUtil.toAlpha(CockpitTheme.info, 40) else CockpitTheme.chipBackground()
+                g2.fill(rect)
+                g2.color = if (selected) CockpitTheme.info else JBColor.border()
+                g2.draw(rect)
+            } finally {
+                g2.dispose()
             }
-            row {
-                cell(JBScrollPane(checkList).apply { preferredSize = CockpitTheme.REVIEWERS_DIALOG_SIZE })
-                    .align(Align.FILL)
-            }.resizableRow()
+            super.paintComponent(g)
         }
-
-        override fun getPreferredFocusedComponent(): JComponent = searchField.textEditor
-
-        fun selectedIds(): List<Long> = model.selectedIds()
     }
 
     /**
@@ -2211,80 +2355,6 @@ class MrDetailPanel(
         override fun getPreferredFocusedComponent(): JComponent = searchField.textEditor
 
         fun selectedNames(): List<String> = model.selectedNames()
-    }
-
-    /**
-     * Assignee picker: an incremental search field over a single-selection [JBList] whose first row
-     * is always the fixed "None" option (null), kept visible regardless of the filter. Typing filters
-     * the members below it via [filterMembers]; the current assignee is preselected, a double click
-     * confirms, and [selectedIds] returns the picked user's id (empty for "None").
-     */
-    private class EditAssigneeDialog(
-        project: Project,
-        private val members: List<GitLabUser>,
-        currentAssigneeId: Long?,
-    ) : DialogWrapper(project) {
-
-        private val noneLabel = CockpitBundle.message("detail.none")
-        private val searchField = SearchTextField()
-        private val listModel = CollectionListModel<GitLabUser?>()
-        private val userList = JBList(listModel).apply {
-            selectionMode = ListSelectionModel.SINGLE_SELECTION
-            cellRenderer = textCellRenderer<GitLabUser>(noneLabel) { user -> memberLabel(user) }
-        }
-
-        init {
-            title = CockpitBundle.message("dialog.editAssignee.title")
-            searchField.addDocumentListener(object : DocumentAdapter() {
-                override fun textChanged(e: DocumentEvent) = repopulate()
-            })
-            object : DoubleClickListener() {
-                override fun onDoubleClick(event: MouseEvent): Boolean {
-                    if (userList.selectedIndex < 0) return false
-                    doOKAction()
-                    return true
-                }
-            }.installOn(userList)
-            repopulate()
-            // Preselect the current assignee, or the "None" row (index 0) when there is none.
-            val preselect = members.firstOrNull { it.id == currentAssigneeId }
-            if (preselect != null) userList.setSelectedValue(preselect, true) else userList.selectedIndex = 0
-            init()
-        }
-
-        /**
-         * EDT. Rebuilds the list — "None" first, then the members matching the current query. The
-         * prior selection is kept when it survives the filter; otherwise the fixed "None" row is
-         * selected (Swing's `setSelectedValue(null, …)` clears the selection, so it is set explicitly).
-         */
-        private fun repopulate() {
-            val previous = userList.selectedValue
-            val items = buildList<GitLabUser?> {
-                add(null)
-                addAll(filterMembers(members, searchField.text))
-            }
-            listModel.replaceAll(items)
-            if (previous != null && items.contains(previous)) {
-                userList.setSelectedValue(previous, true)
-            } else {
-                userList.selectedIndex = 0
-            }
-        }
-
-        override fun createCenterPanel(): JComponent = panel {
-            row {
-                cell(searchField).align(AlignX.FILL)
-            }
-            row {
-                cell(JBScrollPane(userList).apply { preferredSize = CockpitTheme.REVIEWERS_DIALOG_SIZE })
-                    .align(Align.FILL)
-            }.resizableRow()
-        }
-
-        override fun getPreferredFocusedComponent(): JComponent = searchField.textEditor
-
-        fun selectedIds(): List<Long> =
-            userList.selectedValue?.let { listOf(it.id) } ?: emptyList()
     }
 
     /**

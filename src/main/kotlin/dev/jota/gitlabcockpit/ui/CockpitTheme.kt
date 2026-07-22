@@ -59,6 +59,12 @@ object CockpitTheme {
     /** Preferred size of the member-picker dialogs (reviewers, assignee). */
     val REVIEWERS_DIALOG_SIZE = JBUI.size(360, 320)
 
+    /** Preferred size of an Edit-MR Assignees/Reviewers chip list column (GLC-50). */
+    val EDIT_MR_CHIPS_SIZE = JBUI.size(220, 96)
+
+    /** Preferred size of the Edit-MR "+" member-search popup (search field + candidate list, GLC-50). */
+    val MEMBER_POPUP_SIZE = JBUI.size(260, 240)
+
     /** Preferred size of the edit-title/description dialog's description area. */
     val EDIT_MR_DIALOG_SIZE = JBUI.size(560, 300)
 
