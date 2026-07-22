@@ -24,8 +24,10 @@ import java.net.URI
 import java.net.http.HttpClient
 import java.net.http.HttpRequest
 import java.net.http.HttpResponse
+import java.nio.file.AtomicMoveNotSupportedException
 import java.nio.file.Files
 import java.nio.file.Path
+import java.nio.file.StandardCopyOption
 import java.security.MessageDigest
 import java.time.Duration
 import java.util.concurrent.ConcurrentHashMap
@@ -70,9 +72,11 @@ class HttpAvatarDownloader : AvatarDownloader {
  * on the EDT so the caller can repaint). Downloads run on [Dispatchers.IO] capped at
  * [MAX_CONCURRENT_DOWNLOADS] via a [Semaphore]; bytes are cached on disk at `<diskDir>/<sha1(url)>.png`
  * (immutable — GitLab changes the URL when the image changes, so there is no TTL) and the rendered
- * circular [Icon] is cached in memory per `url + size`. A failed download is remembered for
- * [FAILURE_TTL_MS] so a broken avatar is not re-fetched on every repaint; a user with no `avatar_url`
- * gets the placeholder with no network at all.
+ * circular [Icon] is cached in memory per `url + size`. Disk writes are atomic (temp file + atomic move),
+ * so a concurrent repaint never reads a half-written file; and a file that reads back but no longer
+ * decodes is treated as corrupt — it is deleted and re-downloaded after the failure window. A failed
+ * download is remembered for [FAILURE_TTL_MS] so a broken avatar is not re-fetched on every repaint; a
+ * user with no `avatar_url` gets the placeholder with no network at all.
  */
 class AvatarLoader(
     private val scope: CoroutineScope,
@@ -134,7 +138,8 @@ class AvatarLoader(
         memory[key]?.let { return it }
         if (isRecentFailure(url)) return null
 
-        val bytes = readDisk(url) ?: run {
+        val fromDisk = readDisk(url)
+        val bytes = fromDisk ?: run {
             val downloaded = semaphore.withPermit { withContext(Dispatchers.IO) { downloader.download(url) } }
             if (downloaded == null) {
                 failures[url] = clock()
@@ -146,6 +151,10 @@ class AvatarLoader(
 
         val icon = withContext(Dispatchers.IO) { renderCircular(bytes, size) }
         if (icon == null) {
+            // Bytes read back from disk that no longer decode are corrupt (a truncated/half-written file
+            // from before atomic writes, or on-disk rot): purge the poisoned file so the next request —
+            // after the failure TTL — re-downloads it fresh instead of serving the same bad bytes forever.
+            if (fromDisk != null) deleteDisk(url)
             failures[url] = clock()
             return null
         }
@@ -161,11 +170,29 @@ class AvatarLoader(
         return if (Files.isRegularFile(file)) runCatching { Files.readAllBytes(file) }.getOrNull() else null
     }
 
+    /**
+     * Writes [bytes] to disk atomically: it fills a `<sha1>.png.tmp` sibling first, then swaps it onto
+     * the final `<sha1>.png` with an [StandardCopyOption.ATOMIC_MOVE] (falling back to a plain replace on
+     * the rare filesystem that rejects atomic moves within the same directory). A reader therefore never
+     * observes a half-written avatar — a repaint mid-write sees either the old file or the whole new one.
+     */
     private fun writeDisk(url: String, bytes: ByteArray) {
         runCatching {
             Files.createDirectories(diskDir)
-            Files.write(diskFile(url), bytes)
+            val target = diskFile(url)
+            val tmp = diskDir.resolve("${sha1(url)}.png.tmp")
+            Files.write(tmp, bytes)
+            try {
+                Files.move(tmp, target, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)
+            } catch (e: AtomicMoveNotSupportedException) {
+                Files.move(tmp, target, StandardCopyOption.REPLACE_EXISTING)
+            }
         }
+    }
+
+    /** Deletes the on-disk avatar for [url] (a corrupt/undecodable file); best-effort, never throws. */
+    private fun deleteDisk(url: String) {
+        runCatching { Files.deleteIfExists(diskFile(url)) }
     }
 
     private fun diskFile(url: String): Path = diskDir.resolve("${sha1(url)}.png")

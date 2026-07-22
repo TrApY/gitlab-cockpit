@@ -167,6 +167,35 @@ data class GitLabDiffFile(
 )
 
 /**
+ * One entry of a merge request's diff-version history (`/merge_requests/:iid/versions`, GLC-41): a
+ * snapshot of the MR's diff at a past push. [id] identifies the version (used to fetch that version's
+ * diffs); [headCommitSha] / [baseCommitSha] / [startCommitSha] are the three SHAs that snapshot's diff
+ * is anchored to (the same roles as [DiffRefs]); [createdAt] is when the version was collected. GitLab
+ * returns versions newest-first. Unknown fields (`merge_request_id`, `state`, `real_size`…) are ignored
+ * by the configured [Json].
+ */
+@Serializable
+data class GitLabMrVersion(
+    val id: Long,
+    @SerialName("head_commit_sha") val headCommitSha: String,
+    @SerialName("base_commit_sha") val baseCommitSha: String,
+    @SerialName("start_commit_sha") val startCommitSha: String,
+    @SerialName("created_at") val createdAt: String,
+)
+
+/**
+ * The single-version payload (`/merge_requests/:iid/versions/:version_id`): the version's identity plus
+ * the [diffs] of that snapshot (the same [GitLabDiffFile] shape the `/diffs` endpoint returns). Only the
+ * [diffs] are consumed by [GitLabApiClient.getMrVersionDiffs]; the SHAs already travel with the
+ * [GitLabMrVersion] from the list endpoint. Unknown fields (`commits`, `state`…) are ignored.
+ */
+@Serializable
+data class GitLabMrVersionDetail(
+    val id: Long,
+    val diffs: List<GitLabDiffFile> = emptyList(),
+)
+
+/**
  * Body for `PUT /projects/:id/merge_requests/:iid`. Every field is optional: only the non-null
  * ones are sent (see [GitLabApiClient.updateJson], configured with `explicitNulls = false`), so a
  * partial update touches only the provided attributes. An empty list is meaningful — it clears the
@@ -794,6 +823,43 @@ class GitLabApiClient(
             GitLabDiscussion.serializer(),
         )
     }
+
+    // --- MR diff versions (GLC-41) ------------------------------------------------------------
+
+    /**
+     * Calls `GET /projects/:id/merge_requests/:iid/versions?per_page=100` — the MR's diff-version
+     * history, newest-first, for the "changes per version" selector. Each entry carries its three
+     * anchoring SHAs and its `created_at`.
+     */
+    suspend fun getMrVersions(projectId: Long, mrIid: Long): GitLabResult<List<GitLabMrVersion>> =
+        get(
+            "/projects/$projectId/merge_requests/$mrIid/versions",
+            listOf("per_page" to "100"),
+            ListSerializer(GitLabMrVersion.serializer()),
+        )
+
+    /**
+     * Calls `GET /projects/:id/merge_requests/:iid/versions/:version_id` and returns just that
+     * version's changed files ([GitLabMrVersionDetail.diffs]). The version's base/head/start SHAs are
+     * already known from the [getMrVersions] list entry, so only the diffs are surfaced here; the diff
+     * viewer then fetches each side raw at those SHAs exactly like the "All changes" path does.
+     */
+    suspend fun getMrVersionDiffs(
+        projectId: Long,
+        mrIid: Long,
+        versionId: Long,
+    ): GitLabResult<List<GitLabDiffFile>> =
+        when (
+            val r = get(
+                "/projects/$projectId/merge_requests/$mrIid/versions/$versionId",
+                emptyList(),
+                GitLabMrVersionDetail.serializer(),
+            )
+        ) {
+            is GitLabResult.Success -> GitLabResult.Success(r.data.diffs)
+            is GitLabResult.HttpError -> r
+            is GitLabResult.NetworkError -> r
+        }
 
     // --- Draft notes & review submission (F4b) ------------------------------------------------
 

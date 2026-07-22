@@ -53,9 +53,11 @@ import dev.jota.gitlabcockpit.api.DiffRefs
 import dev.jota.gitlabcockpit.api.GitLabDiffFile
 import dev.jota.gitlabcockpit.api.GitLabDiscussion
 import dev.jota.gitlabcockpit.api.GitLabDraftNote
+import dev.jota.gitlabcockpit.api.GitLabMrVersion
 import dev.jota.gitlabcockpit.api.GitLabResult
 import dev.jota.gitlabcockpit.core.COCKPIT_NOTIFICATION_GROUP
 import dev.jota.gitlabcockpit.core.ChangeType
+import dev.jota.gitlabcockpit.core.ChangesView
 import dev.jota.gitlabcockpit.core.CockpitProjectService
 import dev.jota.gitlabcockpit.core.DiffLineMap
 import dev.jota.gitlabcockpit.core.FileNode
@@ -66,8 +68,10 @@ import dev.jota.gitlabcockpit.core.ThreadSide
 import dev.jota.gitlabcockpit.core.buildLineMap
 import dev.jota.gitlabcockpit.core.chainIndex
 import dev.jota.gitlabcockpit.core.changeTypeOf
+import dev.jota.gitlabcockpit.core.changesViews
 import dev.jota.gitlabcockpit.core.buildFileTree
 import dev.jota.gitlabcockpit.core.discussionsByFile
+import dev.jota.gitlabcockpit.core.versionRefs
 import dev.jota.gitlabcockpit.ui.diff.CockpitDiffContext
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -113,6 +117,12 @@ import javax.swing.tree.TreeSelectionModel
  * scope (never the EDT); results are marshaled with [Dispatchers.EDT] and dropped when stale
  * (re-checking [currentRef]).
  *
+ * An "All changes ▾" selector above the tree (GLC-41) switches the tree/diff between the MR's full diff
+ * (the default, its current head) and any past diff version — opening that version's files at its own
+ * base/head SHAs through the same raw-file flow. The reviewed state and its counter apply only to
+ * "All changes"; they are keyed to the current head, so a concrete version is a read-only view. The
+ * selector resets to "All changes" on every (re)load.
+ *
  * @param onFileCountChanged reports the loaded file count (or null while unknown).
  * @param onReviewSubmitted called after a successful "Submit review" (bulk publish) so the parent can
  * refresh its Events & Discussions timeline (published drafts become regular notes; the draft banner
@@ -156,12 +166,25 @@ class ChangesPanel(
     /** The MR's pending draft notes, loaded alongside the discussions; drives the "Pending review" section. */
     private var currentDrafts: List<GitLabDraftNote> = emptyList()
 
+    /** The MR's full "All changes" diff set (its current head), kept so a version→All-changes switch is instant. */
+    private var allChangesFiles: List<GitLabDiffFile> = emptyList()
+
+    /** The MR's diff versions (newest-first), loaded with the changes; empty until loaded or on error. */
+    private var versions: List<GitLabMrVersion> = emptyList()
+
+    /** The version currently shown, or null for "All changes" (the default). Drives [viewRefs] and the counter gate. */
+    private var selectedVersion: GitLabMrVersion? = null
+
+    /** Guards [onVersionSelected] against the combo's programmatic (re)build so a rebuild is not read as a pick. */
+    private var updatingVersionCombo = false
+
     private var loadJob: Job? = null
     private var discussionsJob: Job? = null
     private var newThreadJob: Job? = null
     private var draftsJob: Job? = null
     private var publishJob: Job? = null
     private var deleteJob: Job? = null
+    private var versionDiffsJob: Job? = null
 
     /** Per-MR reviewed-file store (GLC-35): drives the tree's muted+tick rendering and the counter. */
     private val reviewedFiles = ReviewedFiles.getInstance(project)
@@ -182,6 +205,21 @@ class ChangesPanel(
         isVisible = false
     }
 
+    // --- Changes version selector (GLC-41) ----------------------------------------------------
+
+    /** "All changes ▾" selector above the tree; each [ChangesView] renders as its label ([versionOptionLabel]). */
+    private val versionCombo = ComboBox<ChangesView>().apply {
+        renderer = textCellRenderer<ChangesView>("") { versionOptionLabel(it) }
+        addActionListener { onVersionSelected() }
+    }
+
+    /** Wrapper for [versionCombo], the first row of the panel; hidden until the MR has ≥1 diff version. */
+    private val versionSelectorPanel = JPanel(BorderLayout()).apply {
+        border = JBUI.Borders.empty(4, 8, 2, 8)
+        add(versionCombo, BorderLayout.CENTER)
+        isVisible = false
+    }
+
     // --- Pending review (F4b) -----------------------------------------------------------------
 
     /** One row per draft, rebuilt on every drafts (re)load. */
@@ -196,6 +234,7 @@ class ChangesPanel(
         val bottom = JPanel(VerticalLayout(0)).apply { isOpaque = false }
         bottom.add(reviewedCountLabel)
         bottom.add(buildPendingReviewPanel())
+        add(versionSelectorPanel, BorderLayout.NORTH)
         add(JBScrollPane(tree), BorderLayout.CENTER)
         add(bottom, BorderLayout.SOUTH)
 
@@ -342,6 +381,7 @@ class ChangesPanel(
         draftsJob?.cancel()
         publishJob?.cancel()
         deleteJob?.cancel()
+        versionDiffsJob?.cancel()
     }
 
     private fun clearContent() {
@@ -349,6 +389,7 @@ class ChangesPanel(
         treeModel.reload()
         discussionsByFilePath = emptyMap()
         loadedFiles = emptyList()
+        allChangesFiles = emptyList()
         discussionsLoaded = false
         pendingRevealId = null
         selectedFile = null
@@ -357,11 +398,22 @@ class ChangesPanel(
         pendingReviewPanel.isVisible = false
         reviewedCountLabel.isVisible = false
         reviewedCountLabel.text = ""
+        versions = emptyList()
+        selectedVersion = null
+        rebuildVersionCombo()
     }
 
     // --- Loading ------------------------------------------------------------------------------
 
-    /** Loads the MR's diffs and discussions in parallel, then renders the tree. */
+    /** The parallel results of one changes load: diffs, discussions, drafts and diff versions. */
+    private class LoadedChanges(
+        val diffs: GitLabResult<List<GitLabDiffFile>>,
+        val discussions: GitLabResult<List<GitLabDiscussion>>,
+        val drafts: GitLabResult<List<GitLabDraftNote>>,
+        val versions: GitLabResult<List<GitLabMrVersion>>,
+    )
+
+    /** Loads the MR's diffs, discussions, drafts and diff versions in parallel, then renders the tree. */
     private fun load(ref: MrRef) {
         loadedForRef = ref
         clearContent()
@@ -369,21 +421,25 @@ class ChangesPanel(
         tree.emptyText.text = CockpitBundle.message("changes.loading")
         loadJob?.cancel()
         loadJob = service.coroutineScope.launch {
-            val (diffsResult, discussionsResult, draftsResult) = coroutineScope {
+            val loaded = coroutineScope {
                 val diffs = async { service.getMrDiffs(ref) }
                 val discussions = async { service.getMrDiscussions(ref) }
                 val drafts = async { service.getDraftNotes(ref) }
-                Triple(diffs.await(), discussions.await(), drafts.await())
+                val versions = async { service.getMrVersions(ref) }
+                LoadedChanges(diffs.await(), discussions.await(), drafts.await(), versions.await())
             }
             withContext(Dispatchers.EDT) {
                 if (currentRef != ref) return@withContext
                 // Drafts are non-fatal too: an error just hides the "Pending review" section.
-                renderDrafts((draftsResult as? GitLabResult.Success)?.data ?: emptyList())
-                when (diffsResult) {
+                renderDrafts((loaded.drafts as? GitLabResult.Success)?.data ?: emptyList())
+                // Versions are non-fatal: an error just hides the selector (All changes stays available).
+                renderVersions((loaded.versions as? GitLabResult.Success)?.data ?: emptyList())
+                when (val diffsResult = loaded.diffs) {
                     is GitLabResult.Success -> {
                         // Discussions are non-fatal: an error just means "no comments shown".
-                        val discussions = (discussionsResult as? GitLabResult.Success)?.data ?: emptyList()
+                        val discussions = (loaded.discussions as? GitLabResult.Success)?.data ?: emptyList()
                         discussionsByFilePath = discussionsByFile(discussions)
+                        allChangesFiles = diffsResult.data
                         renderFiles(diffsResult.data)
                         discussionsLoaded = true
                         resolvePendingReveal()
@@ -418,24 +474,115 @@ class ChangesPanel(
         return treeNode
     }
 
+    // --- Changes version selector (GLC-41) ----------------------------------------------------
+
+    /** EDT. Stores the loaded [versions], resets the selection to "All changes" and rebuilds the combo. */
+    private fun renderVersions(versions: List<GitLabMrVersion>) {
+        this.versions = versions
+        selectedVersion = null
+        rebuildVersionCombo()
+    }
+
+    /**
+     * EDT. Rebuilds the combo from [versions] ("All changes" + one entry per version), selecting "All
+     * changes", and shows the selector only when the MR has at least one version (a lone "All changes"
+     * entry is not worth a combo). The [updatingVersionCombo] guard keeps the programmatic rebuild from
+     * being read as a user pick.
+     */
+    private fun rebuildVersionCombo() {
+        updatingVersionCombo = true
+        try {
+            versionCombo.removeAllItems()
+            for (view in changesViews(versions)) versionCombo.addItem(view)
+            if (versionCombo.itemCount > 0) versionCombo.selectedIndex = 0
+        } finally {
+            updatingVersionCombo = false
+        }
+        versionSelectorPanel.isVisible = versions.isNotEmpty()
+    }
+
+    /** The combo's label for one [view]: "All changes", or "Version N · <relative date>". */
+    private fun versionOptionLabel(view: ChangesView): String = when (view) {
+        ChangesView.AllChanges -> CockpitBundle.message("changes.version.all")
+        is ChangesView.Version ->
+            CockpitBundle.message("changes.version.label", view.ordinal, formatRelative(view.version.createdAt))
+    }
+
+    /** EDT. A user pick in the version combo: switch the tree/diff to that view (ignored during a rebuild). */
+    private fun onVersionSelected() {
+        if (updatingVersionCombo) return
+        when (val view = versionCombo.selectedItem as? ChangesView) {
+            null, ChangesView.AllChanges -> showAllChanges()
+            is ChangesView.Version -> showVersion(view.version)
+        }
+    }
+
+    /** EDT. Returns the tree/diff to the MR's full "All changes" set (already loaded — no network). */
+    private fun showAllChanges() {
+        versionDiffsJob?.cancel()
+        selectedVersion = null
+        renderFiles(allChangesFiles)
+    }
+
+    /**
+     * EDT. Loads [version]'s changed files off the EDT and renders them; the diff then opens each file at
+     * the version's base/head SHAs ([viewRefs]). A stale result (the MR changed, or another view was
+     * picked meanwhile) is dropped. Reviewed state and its counter are hidden while a version is shown.
+     */
+    private fun showVersion(version: GitLabMrVersion) {
+        val ref = currentRef ?: return
+        selectedVersion = version
+        updateReviewedCounter()
+        tree.emptyText.text = CockpitBundle.message("changes.loading")
+        versionDiffsJob?.cancel()
+        versionDiffsJob = service.coroutineScope.launch {
+            val result = service.getMrVersionDiffs(ref, version.id)
+            withContext(Dispatchers.EDT) {
+                if (currentRef != ref || selectedVersion != version) return@withContext
+                when (result) {
+                    is GitLabResult.Success -> renderFiles(result.data)
+                    else -> {
+                        tree.emptyText.text =
+                            CockpitBundle.message("changes.version.error", describe(result))
+                        onFileCountChanged(null)
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * The base/head/start SHAs the diff opens with: the selected version's SHAs while a version is
+     * shown, otherwise the MR's own `diff_refs`. Null only when no version is shown and the MR has no
+     * `diff_refs` (nothing to anchor a diff to).
+     */
+    private fun viewRefs(): DiffRefs? = selectedVersion?.let { versionRefs(it) } ?: diffRefs
+
     // --- Reviewed state (GLC-35) --------------------------------------------------------------
 
     /** A changed file's tree/review key: its `new_path`, or `old_path` for a deleted file. */
     private fun treePathOf(file: GitLabDiffFile): String =
         if (file.deletedFile) file.oldPath else file.newPath
 
-    /** Whether [path] is reviewed for the current MR at its head SHA (false when either is unknown). */
+    /**
+     * Whether [path] is reviewed for the current MR at its head SHA (false when either is unknown).
+     * Always false while a concrete version is shown — reviewed state is keyed to the current head only.
+     */
     private fun isPathReviewed(path: String): Boolean {
+        if (selectedVersion != null) return false
         val ref = currentRef ?: return false
         val sha = diffRefs?.headSha ?: return false
         return reviewedFiles.isReviewed(ref, sha, path)
     }
 
-    /** EDT. Refreshes the muted "N of M files reviewed" footer (hidden when there is no change). */
+    /**
+     * EDT. Refreshes the muted "N of M files reviewed" footer (hidden when there is no change, or while
+     * a concrete version is shown — reviewed counters only make sense on the current head's "All changes").
+     */
     private fun updateReviewedCounter() {
         val ref = currentRef
         val sha = diffRefs?.headSha
-        if (ref == null || sha == null || loadedFiles.isEmpty()) {
+        if (selectedVersion != null || ref == null || sha == null || loadedFiles.isEmpty()) {
             reviewedCountLabel.isVisible = false
             reviewedCountLabel.text = ""
             return
@@ -448,6 +595,7 @@ class ChangesPanel(
 
     /** Space on the selected file leaf: flip its reviewed state, then repaint the tree and counter. */
     private fun toggleReviewedForSelection() {
+        if (selectedVersion != null) return
         val node = tree.lastSelectedPathComponent as? DefaultMutableTreeNode ?: return
         val fileNode = node.userObject as? FileNode ?: return
         if (fileNode.file == null) return
@@ -460,6 +608,7 @@ class ChangesPanel(
 
     /** Right-click on a file leaf: a single "Mark as (not) reviewed" item reflecting its state. */
     private fun showReviewedContextMenu(comp: Component, x: Int, y: Int) {
+        if (selectedVersion != null) return
         val path = tree.getPathForLocation(x, y) ?: return
         val node = path.lastPathComponent as? DefaultMutableTreeNode ?: return
         val fileNode = node.userObject as? FileNode ?: return
@@ -514,7 +663,7 @@ class ChangesPanel(
      */
     private fun openDiff(file: GitLabDiffFile, revealDiscussionId: String? = null) {
         val ref = currentRef ?: return
-        val refs = diffRefs
+        val refs = viewRefs()
         if (refs == null) {
             Messages.showErrorDialog(
                 project,
@@ -525,6 +674,10 @@ class ChangesPanel(
         }
         val files = loadedFiles
         if (files.isEmpty()) return
+        // Review context (inline threads, "new comment at caret" and auto-mark-reviewed) is bound to
+        // the MR's current head, so it is attached only in "All changes" — a concrete version is a
+        // read-only historical view (see [buildDiffRequest]).
+        val reviewContext = selectedVersion == null
         // Snapshot the panel state the (background) producers read, so the whole chain is consistent
         // and no field is touched off the EDT.
         val discussionsByPath = discussionsByFilePath
@@ -537,6 +690,7 @@ class ChangesPanel(
                 discussionsByPath,
                 webUrl,
                 revealDiscussionId.takeIf { changed === file },
+                reviewContext,
             )
         }
         val chain = SimpleDiffRequestChain.fromProducers(producers, chainIndex(files, file))
@@ -571,10 +725,11 @@ class ChangesPanel(
         discussionsByPath: Map<String, List<GitLabDiscussion>>,
         webUrl: String?,
         revealDiscussionId: String?,
+        reviewContext: Boolean,
     ): DiffRequestProducer {
         val displayPath = if (file.deletedFile) file.oldPath else file.newPath
         return SimpleDiffRequestProducer.create(displayPath) {
-            buildDiffRequest(ref, file, refs, discussionsByPath, webUrl, revealDiscussionId)
+            buildDiffRequest(ref, file, refs, discussionsByPath, webUrl, revealDiscussionId, reviewContext)
         }
     }
 
@@ -602,6 +757,7 @@ class ChangesPanel(
         discussionsByPath: Map<String, List<GitLabDiscussion>>,
         webUrl: String?,
         revealDiscussionId: String?,
+        reviewContext: Boolean,
     ): DiffRequest {
         val sides = runBlockingCancellable {
             val old = if (file.newFile) SideText("") else loadSide(ref.projectId, file.oldPath, refs.baseSha)
@@ -623,33 +779,38 @@ class ChangesPanel(
             CockpitBundle.message("changes.diff.base"),
             CockpitBundle.message("changes.diff.head"),
         )
-        val commentAction = object : AnAction(
-            CockpitBundle.message("diff.commentAction"),
-            null,
-            AllIcons.General.Balloon,
-        ) {
-            override fun getActionUpdateThread(): ActionUpdateThread = ActionUpdateThread.EDT
-            override fun actionPerformed(e: AnActionEvent) = onCommentFromDiff(e, file, refs)
+        // Only the "All changes" head carries the review affordances: the "Comment on line…" action, the
+        // inline thread renderer and the auto-mark-reviewed. A concrete version opens as a plain, read-only
+        // diff (no [CockpitDiffContext]), so nothing is anchored to — or reviewed against — its old SHAs.
+        if (reviewContext) {
+            val commentAction = object : AnAction(
+                CockpitBundle.message("diff.commentAction"),
+                null,
+                AllIcons.General.Balloon,
+            ) {
+                override fun getActionUpdateThread(): ActionUpdateThread = ActionUpdateThread.EDT
+                override fun actionPerformed(e: AnActionEvent) = onCommentFromDiff(e, file, refs)
+            }
+            request.putUserData(DiffUserDataKeys.CONTEXT_ACTIONS, listOf<AnAction>(commentAction))
+            // The discussions map keys by the position's new_path (falling back to old_path), so both
+            // paths are probed — a rename/delete may have been keyed under either one.
+            val fileDiscussions =
+                (discussionsByPath[file.newPath].orEmpty() + discussionsByPath[file.oldPath].orEmpty())
+                    .distinctBy { it.id }
+            request.putUserData(
+                CockpitDiffContext.KEY,
+                CockpitDiffContext(
+                    mrRef = ref,
+                    file = file,
+                    refs = refs,
+                    discussions = fileDiscussions,
+                    projectWebUrl = webUrl,
+                    revealDiscussionId = revealDiscussionId,
+                    openNewThread = { side, line -> openNewThreadDialog(file, refs, side, line) },
+                    onFileReviewed = { refreshReviewedAfterAutoMark() },
+                ),
+            )
         }
-        request.putUserData(DiffUserDataKeys.CONTEXT_ACTIONS, listOf<AnAction>(commentAction))
-        // The discussions map keys by the position's new_path (falling back to old_path), so both
-        // paths are probed — a rename/delete may have been keyed under either one.
-        val fileDiscussions =
-            (discussionsByPath[file.newPath].orEmpty() + discussionsByPath[file.oldPath].orEmpty())
-                .distinctBy { it.id }
-        request.putUserData(
-            CockpitDiffContext.KEY,
-            CockpitDiffContext(
-                mrRef = ref,
-                file = file,
-                refs = refs,
-                discussions = fileDiscussions,
-                projectWebUrl = webUrl,
-                revealDiscussionId = revealDiscussionId,
-                openNewThread = { side, line -> openNewThreadDialog(file, refs, side, line) },
-                onFileReviewed = { refreshReviewedAfterAutoMark() },
-            ),
-        )
         return request
     }
 
