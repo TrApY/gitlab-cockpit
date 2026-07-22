@@ -119,7 +119,7 @@ class MrRowPresentationTest {
 
         val p = mrRowPresentation(value, showProject = false, relativeUpdatedAt = "2h ago")
 
-        assertEquals(listOf(author, assignee, other), p.avatarUsers)
+        assertEquals(listOf(author, assignee, other), p.participants.map { it.user })
         assertEquals(0, p.avatarOverflow)
     }
 
@@ -131,7 +131,7 @@ class MrRowPresentationTest {
 
         val p = mrRowPresentation(value, showProject = false, relativeUpdatedAt = "2h ago")
 
-        assertEquals(3, p.avatarUsers.size)
+        assertEquals(5, p.participants.size) // uncapped; the renderer shows the first 3
         assertEquals(2, p.avatarOverflow)
     }
 
@@ -144,33 +144,35 @@ class MrRowPresentationTest {
         assertFalse(p.avatarOverflow > 0)
     }
 
-    // --- mrRowTooltip (G17, roles in C10) -----------------------------------------------------
+    // --- mrParticipantTooltip (GLC-44: one tooltip per shown avatar) --------------------------
 
     @Test
-    fun `tooltip lists each deduplicated participant with roles then the comment count`() {
-        // Alex Marin (id 1) is author AND reviewer → one entry with both roles; Sandra is the assignee.
+    fun `participant tooltip combines the roles of a deduplicated user`() {
+        // Alex Marin (id 1) is author AND reviewer → one participant with both roles in its tooltip.
         val value = mr(
             authorName = "Alex Marin",
             authorUsername = "alex",
             assignees = listOf(GitLabUser(id = 2, username = "sandra", name = "Sandra Camero")),
             reviewers = listOf(GitLabUser(id = 1, username = "alex", name = "Alex Marin")),
-        ).copy(userNotesCount = 4)
-
-        assertEquals(
-            "Alex Marin (Author, Reviewer) · Sandra Camero (Assignee) · 4 comments",
-            mrRowTooltip(value),
         )
+        val p = mrRowPresentation(value, showProject = false, relativeUpdatedAt = "2h ago")
+
+        assertEquals("Alex Marin (Author, Reviewer)", mrParticipantTooltip(p.participants[0]))
+        assertEquals("Sandra Camero (Assignee)", mrParticipantTooltip(p.participants[1]))
     }
 
     @Test
-    fun `tooltip of a lone author is just the author with the author role`() {
-        assertEquals("José Tomás (Author)", mrRowTooltip(mr()))
+    fun `participant tooltip of a lone author carries the author role`() {
+        val p = mrRowPresentation(mr(), showProject = false, relativeUpdatedAt = "2h ago")
+
+        assertEquals("José Tomás (Author)", mrParticipantTooltip(p.participants.single()))
     }
 
     @Test
-    fun `tooltip falls back to the username when a name is blank`() {
+    fun `participant tooltip falls back to the username when the name is blank`() {
         val value = mr(authorName = "", authorUsername = "jota")
+        val p = mrRowPresentation(value, showProject = false, relativeUpdatedAt = "2h ago")
 
-        assertEquals("jota (Author)", mrRowTooltip(value))
+        assertEquals("jota (Author)", mrParticipantTooltip(p.participants.single()))
     }
 }

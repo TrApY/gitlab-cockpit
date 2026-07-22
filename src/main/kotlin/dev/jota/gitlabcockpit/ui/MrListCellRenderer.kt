@@ -6,7 +6,9 @@ import com.intellij.ui.SimpleTextAttributes
 import com.intellij.util.ui.JBUI
 import dev.jota.gitlabcockpit.CockpitBundle
 import dev.jota.gitlabcockpit.api.GitLabMergeRequest
+import dev.jota.gitlabcockpit.core.MrParticipant
 import dev.jota.gitlabcockpit.core.MrSegmentStyle
+import dev.jota.gitlabcockpit.core.mrParticipantTooltip
 import dev.jota.gitlabcockpit.core.mrRowPresentation
 import java.awt.BorderLayout
 import java.awt.Color
@@ -196,6 +198,7 @@ class MrListCellRenderer(
         val status = enrichment.statusOf(value)
         statusLabel.icon = status?.let { CockpitIcons.status(it) }
         statusLabel.isVisible = statusLabel.icon != null
+        statusLabel.toolTipText = status?.let { CockpitBundle.message("toolwindow.mr.tooltip.pipeline", it) }
 
         val notes = value.userNotesCount ?: 0
         if (notes > 0) {
@@ -204,26 +207,45 @@ class MrListCellRenderer(
             commentsLabel.text = notes.toString()
             commentsLabel.foreground = muted
             commentsLabel.isVisible = true
+            commentsLabel.toolTipText = "$notes " + CockpitBundle.message("toolwindow.mr.tooltip.comments")
         } else {
             commentsLabel.isVisible = false
         }
 
+        // Each shown participant gets its own avatar with its own person tooltip (GLC-44); the +N
+        // badge's tooltip lists the people it hides. Tooltips fire through the list's sub-component
+        // hit-testing (see CockpitToolWindowPanel's getToolTipText), not through Swing's own manager.
         avatarsPanel.removeAll()
-        for (user in presentation.avatarUsers) {
-            avatarsPanel.add(JLabel(avatarCache.icon(user, AVATAR_SIZE) { repaintList() }))
+        val shown = presentation.participants.take(MAX_AVATARS)
+        for (participant in shown) {
+            avatarsPanel.add(
+                JLabel(avatarCache.icon(participant.user, AVATAR_SIZE) { repaintList() }).apply {
+                    toolTipText = participantTooltip(participant)
+                },
+            )
         }
-        avatarsPanel.isVisible = presentation.avatarUsers.isNotEmpty()
+        avatarsPanel.isVisible = shown.isNotEmpty()
 
         if (presentation.avatarOverflow > 0) {
             overflowLabel.text = "+${presentation.avatarOverflow}"
             overflowLabel.foreground = muted
             overflowLabel.isVisible = true
+            overflowLabel.toolTipText = presentation.participants.drop(MAX_AVATARS)
+                .joinToString(" · ") { participantTooltip(it) }
         } else {
             overflowLabel.isVisible = false
         }
 
         return root
     }
+
+    /** One participant's `Name (Roles)` tooltip, localized with the same role words the Info uses. */
+    private fun participantTooltip(participant: MrParticipant): String = mrParticipantTooltip(
+        participant,
+        authorLabel = CockpitBundle.message("detail.role.author"),
+        assigneeLabel = CockpitBundle.message("detail.role.assignee"),
+        reviewerLabel = CockpitBundle.message("detail.role.reviewer"),
+    )
 
     private fun segmentColor(style: MrSegmentStyle, normal: Color): Color = when (style) {
         MrSegmentStyle.NORMAL -> normal

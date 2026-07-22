@@ -37,7 +37,6 @@ import dev.jota.gitlabcockpit.core.MrNotificationsWatcher
 import dev.jota.gitlabcockpit.core.MrRef
 import dev.jota.gitlabcockpit.core.RoleFilter
 import dev.jota.gitlabcockpit.core.filterByTitle
-import dev.jota.gitlabcockpit.core.mrRowTooltip
 import dev.jota.gitlabcockpit.core.mrTabLabel
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -59,6 +58,7 @@ import javax.swing.JPanel
 import javax.swing.JPopupMenu
 import javax.swing.KeyStroke
 import javax.swing.ListSelectionModel
+import javax.swing.SwingUtilities
 import javax.swing.ToolTipManager
 
 /**
@@ -181,9 +181,12 @@ class CockpitToolWindowPanel(
     private val mrCellRenderer = MrListCellRenderer(project, avatarCache, enrichment) { mrList.repaint() }
 
     /**
-     * The MR list. A [JBList] subclass so its rows can carry a per-row tooltip (GLC-38 / iter3 G17):
-     * a cell renderer's avatars/badges never fire tooltips on their own, so [getToolTipText] maps the
-     * hovered point to its row and composes the row's people/comment tooltip via [mrRowTooltip].
+     * The MR list. A [JBList] subclass so its rows can carry tooltips (GLC-38 / iter3 G17): a cell
+     * renderer is a stamp, so its avatars/badges never fire tooltips on their own. [getToolTipText]
+     * maps the hovered point to its row, re-stamps and lays out the renderer at the cell's size, and
+     * hit-tests the sub-component under the mouse — so each avatar answers with *its own* person
+     * («Alex Marin (Author, Reviewer)»), the `+N` badge with the people it hides, and the badges with
+     * their own text (GLC-44: per-element tooltips instead of one whole-row string).
      */
     private val mrList: JBList<GitLabMergeRequest> = object : JBList<GitLabMergeRequest>(listModel) {
         override fun getToolTipText(event: MouseEvent): String? {
@@ -192,13 +195,28 @@ class CockpitToolWindowPanel(
             val bounds = getCellBounds(index, index) ?: return null
             if (!bounds.contains(event.point)) return null
             val mr = model.getElementAt(index) ?: return null
-            return mrRowTooltip(
-                mr,
-                authorLabel = CockpitBundle.message("detail.role.author"),
-                assigneeLabel = CockpitBundle.message("detail.role.assignee"),
-                reviewerLabel = CockpitBundle.message("detail.role.reviewer"),
-                commentsWord = CockpitBundle.message("toolwindow.mr.tooltip.comments"),
+            val stamp = cellRenderer.getListCellRendererComponent(this, mr, index, false, false)
+            stamp.setBounds(0, 0, bounds.width, bounds.height)
+            layoutRecursively(stamp)
+            val deepest = SwingUtilities.getDeepestComponentAt(
+                stamp,
+                event.point.x - bounds.x,
+                event.point.y - bounds.y,
             )
+            var component: Component? = deepest
+            while (component != null && component !== stamp) {
+                (component as? JComponent)?.toolTipText?.let { return it }
+                component = component.parent
+            }
+            return null
+        }
+
+        /** Lays out the freshly-stamped renderer tree (a non-displayable stamp never gets validated). */
+        private fun layoutRecursively(component: Component) {
+            component.doLayout()
+            if (component is java.awt.Container) {
+                for (child in component.components) layoutRecursively(child)
+            }
         }
     }.apply {
         selectionMode = ListSelectionModel.SINGLE_SELECTION
