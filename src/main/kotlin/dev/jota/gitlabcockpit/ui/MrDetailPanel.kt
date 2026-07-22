@@ -89,6 +89,7 @@ import dev.jota.gitlabcockpit.core.filterTimeline
 import dev.jota.gitlabcockpit.core.mergeButtonState
 import dev.jota.gitlabcockpit.core.mrHeaderPresentation
 import dev.jota.gitlabcockpit.core.mrParticipants
+import dev.jota.gitlabcockpit.core.projectLabelOf
 import dev.jota.gitlabcockpit.core.projectWebUrlOf
 import dev.jota.gitlabcockpit.core.stripDraftPrefix
 import dev.jota.gitlabcockpit.core.threadAnchorLabel
@@ -1879,6 +1880,7 @@ class MrDetailPanel(
         val dialog = EditMrDialog(
             project,
             mr,
+            projectPath = projectLabelOf(mr),
             loadRoster = { onLoaded -> withMembers(mr.projectId, onLoaded) },
             pickLabels = { current, onPicked ->
                 withLabels(mr.projectId) { projectLabels ->
@@ -1900,6 +1902,9 @@ class MrDetailPanel(
                     reviewerIds = dialog.reviewerIds,
                     assigneeIds = dialog.assigneeIds,
                     labels = dialog.labelsCsvOrNull,
+                    targetBranch = dialog.targetBranchOrNull,
+                    removeSourceBranch = dialog.removeSourceBranchOrNull,
+                    squash = dialog.squashOrNull,
                 ),
             )
         }
@@ -2019,6 +2024,7 @@ class MrDetailPanel(
     private class EditMrDialog(
         project: Project,
         mr: GitLabMergeRequest,
+        private val projectPath: String?,
         private val loadRoster: ((List<GitLabUser>) -> Unit) -> Unit,
         private val pickLabels: (List<String>, (List<String>) -> Unit) -> Unit,
     ) : DialogWrapper(project) {
@@ -2028,6 +2034,23 @@ class MrDetailPanel(
             lineWrap = true
             wrapStyleWord = true
         }
+
+        /** The MR's original target branch, for change detection (GLC-52). */
+        private val originalTargetBranch: String = mr.targetBranch
+        private val targetBranchField = JBTextField(mr.targetBranch, 30)
+
+        private val originalRemoveSourceBranch: Boolean = mr.forceRemoveSourceBranch ?: false
+        private val removeSourceBranchCheck =
+            JBCheckBox(CockpitBundle.message("dialog.editMr.deleteBranchLabel"), originalRemoveSourceBranch)
+
+        private val originalSquash: Boolean = mr.squash
+        private val squashCheck = JBCheckBox(CockpitBundle.message("dialog.editMr.squashLabel"), originalSquash)
+
+        /** Read-only "field" showing the source branch — informative, like the reference. */
+        private val sourceBranchField = JBTextField(mr.sourceBranch).apply { isEditable = false }
+
+        /** Read-only "field" showing the MR's `group/project`; row omitted when unknown. */
+        private val sourceRepoField = projectPath?.let { JBTextField(it).apply { isEditable = false } }
 
         /** The preloaded member roster, empty until [loadRoster] lands in-modal (see the class KDoc). */
         private var roster: List<GitLabUser> = emptyList()
@@ -2049,7 +2072,9 @@ class MrDetailPanel(
         )
 
         private var stagedLabels: List<String> = mr.labels
-        private val labelsValueLabel = JBLabel(labelsText(stagedLabels))
+
+        /** Field-styled (read-only) view of the staged labels; edited through the Edit… button. */
+        private val labelsValueField = JBTextField(labelsText(stagedLabels)).apply { isEditable = false }
         private val draftCheck = JBCheckBox(CockpitBundle.message("dialog.editMr.draftLabel"), mr.draft)
 
         /** The MR's original labels, for change detection: labels are only sent when this set changes. */
@@ -2071,27 +2096,45 @@ class MrDetailPanel(
         }
 
         override fun createCenterPanel(): JComponent = panel {
+            // Reference order (GLC-52): repo/branches first, then title, rich description, labels,
+            // people, and the MR attribute checkboxes.
+            sourceRepoField?.let { field ->
+                row(CockpitBundle.message("dialog.editMr.sourceRepoLabel")) {
+                    cell(field).align(AlignX.FILL)
+                }
+            }
+            row(CockpitBundle.message("dialog.editMr.sourceBranchLabel")) {
+                cell(sourceBranchField).align(AlignX.FILL)
+            }
+            row(CockpitBundle.message("dialog.editMr.targetBranchLabel")) {
+                cell(targetBranchField).align(AlignX.FILL)
+            }
             row(CockpitBundle.message("dialog.editMr.titleLabel")) {
                 cell(titleField).align(AlignX.FILL)
             }
             row(CockpitBundle.message("dialog.editMr.descriptionLabel")) {
+                cell(MarkdownFormatBar(descriptionArea))
+            }
+            row {
                 cell(JBScrollPane(descriptionArea).apply { preferredSize = CockpitTheme.EDIT_MR_DIALOG_SIZE })
                     .align(Align.FILL)
             }.resizableRow()
+            row(CockpitBundle.message("dialog.editMr.labelsLabel")) {
+                cell(labelsValueField).align(AlignX.FILL)
+                button(CockpitBundle.message("dialog.editMr.editButton")) {
+                    pickLabels(stagedLabels) { picked ->
+                        stagedLabels = picked
+                        labelsValueField.text = labelsText(picked)
+                    }
+                }
+            }
             row {
                 cell(assigneeColumn.component())
                 cell(reviewersColumn.component())
             }
-            row(CockpitBundle.message("dialog.editMr.labelsLabel")) {
-                cell(labelsValueLabel).align(AlignX.FILL)
-                button(CockpitBundle.message("dialog.editMr.editButton")) {
-                    pickLabels(stagedLabels) { picked ->
-                        stagedLabels = picked
-                        labelsValueLabel.text = labelsText(picked)
-                    }
-                }
-            }
             row { cell(draftCheck) }
+            row { cell(removeSourceBranchCheck) }
+            row { cell(squashCheck) }
         }
 
         override fun getPreferredFocusedComponent(): JComponent = titleField
@@ -2110,6 +2153,19 @@ class MrDetailPanel(
          */
         val labelsCsvOrNull: String?
             get() = if (stagedLabels.toSet() == originalLabels) null else stagedLabels.joinToString(",")
+
+        /** The new target branch, or null when unchanged/blank so the update omits `target_branch`. */
+        val targetBranchOrNull: String?
+            get() = targetBranchField.text.trim()
+                .takeIf { it.isNotEmpty() && it != originalTargetBranch }
+
+        /** The delete-source-branch flag, or null when untouched so the update omits it (GLC-52). */
+        val removeSourceBranchOrNull: Boolean?
+            get() = removeSourceBranchCheck.isSelected.takeIf { it != originalRemoveSourceBranch }
+
+        /** The squash flag, or null when untouched so the update omits it (GLC-52). */
+        val squashOrNull: Boolean?
+            get() = squashCheck.isSelected.takeIf { it != originalSquash }
 
         private fun labelsText(names: List<String>): String =
             names.takeIf { it.isNotEmpty() }?.joinToString(", ") ?: CockpitBundle.message("detail.none")
@@ -2425,6 +2481,48 @@ class MrDetailPanel(
      * The dialog itself is pure UI: [onSubmit] / [onSaveDraft] carry the text (and the "Start review"
      * flag) to the panel, which performs the network call. The textarea takes focus on open.
      */
+    /**
+     * The markdown-format button bar shared by the comment composer and the Edit MR description
+     * (GLC-52): B / I / S / inline code / code block / quote / link, each wrapping the [area]'s
+     * current selection via [wrapMarkdown] and restoring the selection the wrap yields.
+     */
+    private class MarkdownFormatBar(
+        private val area: JBTextArea,
+    ) : JPanel(FlowLayout(FlowLayout.LEFT, JBUI.scale(2), 0)) {
+        init {
+            isOpaque = false
+            add(formatButton("B", "detail.composer.format.bold", MarkdownMarker.BOLD, Font.BOLD))
+            add(formatButton("I", "detail.composer.format.italic", MarkdownMarker.ITALIC, Font.ITALIC))
+            add(formatButton("S", "detail.composer.format.strike", MarkdownMarker.STRIKE, Font.PLAIN))
+            add(formatButton("</>", "detail.composer.format.code", MarkdownMarker.CODE, Font.PLAIN))
+            add(formatButton("{ }", "detail.composer.format.codeBlock", MarkdownMarker.CODE_BLOCK, Font.PLAIN))
+            add(formatButton(">", "detail.composer.format.quote", MarkdownMarker.QUOTE, Font.PLAIN))
+            add(
+                JButton(CockpitIcons.copyLink).apply {
+                    toolTipText = CockpitBundle.message("detail.composer.format.link")
+                    margin = JBUI.emptyInsets()
+                    addActionListener { applyFormat(MarkdownMarker.LINK) }
+                },
+            )
+        }
+
+        private fun formatButton(text: String, tooltipKey: String, marker: MarkdownMarker, style: Int): JButton =
+            JButton(text).apply {
+                toolTipText = CockpitBundle.message(tooltipKey)
+                if (style != Font.PLAIN) font = font.deriveFont(style)
+                margin = JBUI.emptyInsets()
+                addActionListener { applyFormat(marker) }
+            }
+
+        /** Applies [marker] to the current selection and restores the caret/selection the wrap yields. */
+        private fun applyFormat(marker: MarkdownMarker) {
+            val result = wrapMarkdown(area.text, area.selectionStart, area.selectionEnd, marker)
+            area.text = result.text
+            area.select(result.selectionStart, result.selectionEnd)
+            area.requestFocusInWindow()
+        }
+    }
+
     private class ComposerDialog(
         project: Project,
         dialogTitle: String,
@@ -2448,46 +2546,13 @@ class MrDetailPanel(
         }
 
         override fun createCenterPanel(): JComponent = panel {
-            row { cell(buildFormatToolbar()) }
+            row { cell(MarkdownFormatBar(area)) }
             row {
                 cell(JBScrollPane(area)).align(Align.FILL)
             }.resizableRow()
             // Edit mode publishes the change directly — there is no draft/"start review" flow.
             if (!editMode) row { cell(startReviewCheck) }
         }.apply { preferredSize = CockpitTheme.EDIT_MR_DIALOG_SIZE }
-
-        /** The markdown-format toolbar: B / I / S / inline code / code block / quote / link. */
-        private fun buildFormatToolbar(): JComponent {
-            val bar = JPanel(FlowLayout(FlowLayout.LEFT, JBUI.scale(2), 0)).apply { isOpaque = false }
-            bar.add(formatButton("B", "detail.composer.format.bold", MarkdownMarker.BOLD, Font.BOLD))
-            bar.add(formatButton("I", "detail.composer.format.italic", MarkdownMarker.ITALIC, Font.ITALIC))
-            bar.add(formatButton("S", "detail.composer.format.strike", MarkdownMarker.STRIKE, Font.PLAIN))
-            bar.add(formatButton("</>", "detail.composer.format.code", MarkdownMarker.CODE, Font.PLAIN))
-            bar.add(formatButton("{ }", "detail.composer.format.codeBlock", MarkdownMarker.CODE_BLOCK, Font.PLAIN))
-            bar.add(formatButton(">", "detail.composer.format.quote", MarkdownMarker.QUOTE, Font.PLAIN))
-            val linkButton = JButton(CockpitIcons.copyLink).apply {
-                toolTipText = CockpitBundle.message("detail.composer.format.link")
-                addActionListener { applyFormat(MarkdownMarker.LINK) }
-            }
-            bar.add(linkButton)
-            return bar
-        }
-
-        private fun formatButton(text: String, tooltipKey: String, marker: MarkdownMarker, style: Int): JButton =
-            JButton(text).apply {
-                toolTipText = CockpitBundle.message(tooltipKey)
-                if (style != Font.PLAIN) font = font.deriveFont(style)
-                margin = JBUI.emptyInsets()
-                addActionListener { applyFormat(marker) }
-            }
-
-        /** Applies [marker] to the current selection and restores the caret/selection the wrap yields. */
-        private fun applyFormat(marker: MarkdownMarker) {
-            val result = wrapMarkdown(area.text, area.selectionStart, area.selectionEnd, marker)
-            area.text = result.text
-            area.select(result.selectionStart, result.selectionEnd)
-            area.requestFocusInWindow()
-        }
 
         override fun getPreferredFocusedComponent(): JComponent = area
 

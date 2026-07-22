@@ -81,4 +81,27 @@ class MergeRequestUpdateSerializationTest {
     fun `title carrying a draft prefix serializes verbatim (draft toggled via the title)`() {
         assertEquals("""{"title":"Draft: Feature"}""", encode(MergeRequestUpdate(title = "Draft: Feature")))
     }
+
+    // --- GLC-52: target branch and merge-attribute flags ---------------------------------------
+
+    @Test
+    fun `target branch serializes with its snake_case key when set`() {
+        assertEquals("""{"target_branch":"develop"}""", encode(MergeRequestUpdate(targetBranch = "develop")))
+    }
+
+    @Test
+    fun `remove_source_branch and squash serialize when toggled — false included (it clears the flag)`() {
+        assertEquals(
+            """{"remove_source_branch":true,"squash":false}""",
+            encode(MergeRequestUpdate(removeSourceBranch = true, squash = false)),
+        )
+    }
+
+    @Test
+    fun `null target branch and flags are omitted`() {
+        assertEquals(
+            """{"title":"x"}""",
+            encode(MergeRequestUpdate(title = "x", targetBranch = null, removeSourceBranch = null, squash = null)),
+        )
+    }
 }

@@ -246,6 +246,15 @@ data class MergeRequestUpdate(
      * selection actually changed.
      */
     val labels: String? = null,
+
+    /** New target branch of the MR (GLC-52). Sent only when the Edit dialog actually changed it. */
+    @SerialName("target_branch") val targetBranch: String? = null,
+
+    /** The MR's "delete source branch when merged" flag (GLC-52); sent only when toggled in Edit. */
+    @SerialName("remove_source_branch") val removeSourceBranch: Boolean? = null,
+
+    /** The MR's squash-on-merge flag (GLC-52); sent only when toggled in Edit. */
+    val squash: Boolean? = null,
 )
 
 /** Approval state of a merge request from `/merge_requests/:iid/approvals`. */
