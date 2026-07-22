@@ -279,9 +279,29 @@ data class GitLabDiscussionNote(
     val system: Boolean = false,
     val author: GitLabUser,
     @SerialName("created_at") val createdAt: String,
+    /**
+     * ISO-8601 timestamp of the note's last edit (`updated_at`); equals [createdAt] for an unedited
+     * note. Nullable on trimmed payloads. It is the freshness half of the emoji-reactions cache key
+     * (noteId + updatedAt, GLC-40): a re-edited note invalidates its cached awards so a stale reaction
+     * row is never shown.
+     */
+    @SerialName("updated_at") val updatedAt: String? = null,
     val resolvable: Boolean = false,
     val resolved: Boolean = false,
     val position: NotePosition? = null,
+)
+
+/**
+ * An emoji reaction (award) on a note from `/notes/:note_id/award_emoji` (GLC-40). [name] is GitLab's
+ * canonical emoji name (`thumbsup`, `tada`, `heart`…); [user] is who reacted, so the UI can highlight
+ * the current user's own reactions and toggle them. Unknown fields (`awardable_id`, timestamps…) are
+ * ignored by the configured [Json].
+ */
+@Serializable
+data class GitLabAward(
+    val id: Long,
+    val name: String,
+    val user: GitLabUser,
 )
 
 /**
@@ -563,6 +583,79 @@ class GitLabApiClient(
             GitLabNote.serializer(),
         )
     }
+
+    /**
+     * Calls `PUT /projects/:id/merge_requests/:iid/notes/:note_id` with `{ "body": … }` to edit an
+     * existing note (GLC-40). Returns the updated note. Editing another user's note comes back as
+     * `403`/`404` and becomes [GitLabResult.HttpError].
+     */
+    suspend fun updateMrNote(
+        projectId: Long,
+        mrIid: Long,
+        noteId: Long,
+        body: String,
+    ): GitLabResult<GitLabNote> {
+        val payload = updateJson.encodeToString(NoteCreateBody.serializer(), NoteCreateBody(body))
+        return put(
+            "/projects/$projectId/merge_requests/$mrIid/notes/$noteId",
+            payload,
+            GitLabNote.serializer(),
+        )
+    }
+
+    /**
+     * Calls `DELETE /projects/:id/merge_requests/:iid/notes/:note_id` to delete a note (GLC-40).
+     * GitLab answers `204` with no body, so nothing is decoded.
+     */
+    suspend fun deleteMrNote(projectId: Long, mrIid: Long, noteId: Long): GitLabResult<Unit> =
+        delete("/projects/$projectId/merge_requests/$mrIid/notes/$noteId")
+
+    // --- Emoji reactions on notes (GLC-40) ----------------------------------------------------
+
+    /**
+     * Calls `GET /projects/:id/merge_requests/:iid/notes/:note_id/award_emoji` — every emoji reaction
+     * on a single note. Returns them as-is; the UI groups them by [GitLabAward.name] into reaction chips.
+     */
+    suspend fun getNoteAwards(
+        projectId: Long,
+        mrIid: Long,
+        noteId: Long,
+    ): GitLabResult<List<GitLabAward>> =
+        get(
+            "/projects/$projectId/merge_requests/$mrIid/notes/$noteId/award_emoji",
+            emptyList(),
+            ListSerializer(GitLabAward.serializer()),
+        )
+
+    /**
+     * Calls `POST /projects/:id/merge_requests/:iid/notes/:note_id/award_emoji?name=<name>` to add an
+     * emoji reaction (GLC-40). The emoji name is passed as a query parameter (no JSON body), as GitLab's
+     * award-emoji API expects. GitLab answers `201` with the created award, which is returned.
+     */
+    suspend fun addNoteAward(
+        projectId: Long,
+        mrIid: Long,
+        noteId: Long,
+        name: String,
+    ): GitLabResult<GitLabAward> =
+        post(
+            "/projects/$projectId/merge_requests/$mrIid/notes/$noteId/award_emoji" +
+                encodeQuery(listOf("name" to name)),
+            null,
+            GitLabAward.serializer(),
+        )
+
+    /**
+     * Calls `DELETE /projects/:id/merge_requests/:iid/notes/:note_id/award_emoji/:award_id` to remove
+     * the current user's emoji reaction (GLC-40). GitLab answers `204` with no body, so nothing is decoded.
+     */
+    suspend fun deleteNoteAward(
+        projectId: Long,
+        mrIid: Long,
+        noteId: Long,
+        awardId: Long,
+    ): GitLabResult<Unit> =
+        delete("/projects/$projectId/merge_requests/$mrIid/notes/$noteId/award_emoji/$awardId")
 
     /**
      * Calls `PUT /projects/:id/merge_requests/:iid/merge` with

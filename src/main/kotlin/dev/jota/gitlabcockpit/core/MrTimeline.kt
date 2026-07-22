@@ -53,6 +53,33 @@ fun buildTimeline(
 }
 
 /**
+ * Filters an already-built [items] timeline by a free-text [query] (GLC-40, the toolbar search),
+ * case-insensitively. An [TimelineItem.EventItem] matches when the query is in its note body or its
+ * author's name/username; a [TimelineItem.DiscussionItem] matches when the query is in the body or
+ * author of *any* of its notes (so a hit on a reply keeps the whole thread). A blank query returns
+ * every item unchanged, preserving order. Pure and platform-free.
+ */
+fun filterTimeline(items: List<TimelineItem>, query: String): List<TimelineItem> {
+    val needle = query.trim().lowercase()
+    if (needle.isEmpty()) return items
+    return items.filter { item ->
+        when (item) {
+            is TimelineItem.EventItem -> matchesNote(item.note.body, item.note.author.name, item.note.author.username, needle)
+            is TimelineItem.DiscussionItem ->
+                item.thread.notes.any { note ->
+                    matchesNote(note.body, note.author.name, note.author.username, needle)
+                }
+        }
+    }
+}
+
+/** True when [needle] (already lowercased) is a substring of the note body or either author field. */
+private fun matchesNote(body: String, authorName: String, authorUsername: String, needle: String): Boolean =
+    body.lowercase().contains(needle) ||
+        authorName.lowercase().contains(needle) ||
+        authorUsername.lowercase().contains(needle)
+
+/**
  * Classifies a system note [body] into an icon key by the phrase GitLab uses, so the UI can pick an
  * icon: `commit` ("added N commits"), `assign` ("assigned to …"), `review` ("requested review …"),
  * `approve` ("approved this merge request"), `merge` ("merged"), `state` ("closed" / "reopened" /

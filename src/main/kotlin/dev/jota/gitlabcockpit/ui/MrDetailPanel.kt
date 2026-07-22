@@ -18,6 +18,8 @@ import com.intellij.openapi.project.Project
 import com.intellij.openapi.ui.ComboBox
 import com.intellij.openapi.ui.DialogWrapper
 import com.intellij.openapi.ui.Messages
+import com.intellij.openapi.ui.popup.JBPopup
+import com.intellij.openapi.ui.popup.JBPopupFactory
 import com.intellij.ui.CheckBoxList
 import com.intellij.ui.CollectionListModel
 import com.intellij.ui.ColorUtil
@@ -43,12 +45,15 @@ import com.intellij.util.ui.JBUI
 import com.intellij.util.ui.UIUtil
 import dev.jota.gitlabcockpit.CockpitBundle
 import dev.jota.gitlabcockpit.api.GitLabApprovals
+import dev.jota.gitlabcockpit.api.GitLabAward
+import dev.jota.gitlabcockpit.api.GitLabDiscussionNote
 import dev.jota.gitlabcockpit.api.GitLabMergeRequest
 import dev.jota.gitlabcockpit.api.GitLabNote
 import dev.jota.gitlabcockpit.api.GitLabResult
 import dev.jota.gitlabcockpit.api.GitLabUser
 import dev.jota.gitlabcockpit.api.MergeRequestUpdate
 import dev.jota.gitlabcockpit.core.ApprovalsHealth
+import dev.jota.gitlabcockpit.core.AwardEmoji
 import dev.jota.gitlabcockpit.core.COCKPIT_NOTIFICATION_GROUP
 import dev.jota.gitlabcockpit.core.Closing
 import dev.jota.gitlabcockpit.core.CockpitProjectService
@@ -68,6 +73,7 @@ import dev.jota.gitlabcockpit.core.buildTimeline
 import dev.jota.gitlabcockpit.core.commentThreads
 import dev.jota.gitlabcockpit.core.eventIconKey
 import dev.jota.gitlabcockpit.core.filterMembers
+import dev.jota.gitlabcockpit.core.filterTimeline
 import dev.jota.gitlabcockpit.core.mergeButtonState
 import dev.jota.gitlabcockpit.core.mrHeaderPresentation
 import dev.jota.gitlabcockpit.core.mrParticipants
@@ -80,10 +86,14 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import java.awt.BorderLayout
 import java.awt.CardLayout
 import java.awt.Color
+import java.awt.Component
+import java.awt.Container
 import java.awt.Cursor
 import java.awt.FlowLayout
 import java.awt.Font
@@ -94,14 +104,18 @@ import java.awt.RenderingHints
 import java.awt.datatransfer.StringSelection
 import java.awt.event.MouseAdapter
 import java.awt.event.MouseEvent
+import java.awt.event.MouseListener
 import java.awt.geom.RoundRectangle2D
+import java.util.concurrent.ConcurrentHashMap
 import javax.swing.Action
+import javax.swing.Icon
 import javax.swing.JButton
 import javax.swing.JComponent
 import javax.swing.JPanel
 import javax.swing.JSeparator
 import javax.swing.ListSelectionModel
 import javax.swing.SwingConstants
+import javax.swing.SwingUtilities
 import javax.swing.event.DocumentEvent
 
 /**
@@ -185,6 +199,17 @@ class MrDetailPanel(
     /** All notes of the MR incl. GitLab system ones — the timeline's event source; reloaded with threads. */
     private var loadedTimelineNotes: List<GitLabNote> = emptyList()
 
+    /**
+     * Lazily-loaded emoji reactions per note (GLC-40), keyed by note id. Discussion notes don't carry
+     * their awards, so each card's reaction row is filled in the background (bounded by
+     * [awardsSemaphore]) and cached here, keyed also by the note's `updated_at` so a re-edited note
+     * re-fetches. Cleared on every MR switch ([showMr]).
+     */
+    private val awardsCache = ConcurrentHashMap<Long, CachedAwards>()
+
+    /** Bounds the background award-emoji fetches to 4 concurrent requests (GLC-40, avoids an N+1 storm). */
+    private val awardsSemaphore = Semaphore(4)
+
     /** Session-only timeline filter (All / Events / Discussions); not persisted across restarts. */
     private var timelineFilter: TimelineFilter = TimelineFilter.ALL
 
@@ -212,6 +237,26 @@ class MrDetailPanel(
             refreshOrderButton()
             renderTimeline(loadedThreads)
         }
+    }
+
+    /** Session-only free-text timeline filter (GLC-40); empty = no filtering. */
+    private var timelineQuery: String = ""
+
+    /**
+     * Toolbar search field (GLC-40): an in-memory, case-insensitive filter over the loaded timeline —
+     * event/note bodies and authors (see [filterTimeline]). Re-renders the loaded timeline on each
+     * keystroke; never hits the network.
+     */
+    private val timelineSearchField = SearchTextField().apply {
+        toolTipText = CockpitBundle.message("detail.timeline.search.tooltip")
+        textEditor.columns = 14
+        addDocumentListener(object : DocumentAdapter() {
+            override fun textChanged(e: DocumentEvent) {
+                if (text == timelineQuery) return
+                timelineQuery = text
+                renderTimeline(loadedThreads)
+            }
+        })
     }
 
     /** Toolbar "+" that opens the composer popup for a new general comment (GLC-38 / iter3 F13). */
@@ -578,6 +623,9 @@ class MrDetailPanel(
         notesLoadedForRef = null
         loadedThreads = emptyList()
         loadedTimelineNotes = emptyList()
+        awardsCache.clear()
+        timelineQuery = ""
+        timelineSearchField.text = ""
         showTimelineMessage(null)
         draftBanner.isVisible = false
         setTimelineTabTitle(null)
@@ -947,6 +995,7 @@ class MrDetailPanel(
         val toolbar = JPanel(FlowLayout(FlowLayout.LEFT, JBUI.scale(6), JBUI.scale(2))).apply { isOpaque = false }
         toolbar.add(timelineFilterCombo)
         toolbar.add(timelineOrderButton)
+        toolbar.add(timelineSearchField)
         toolbar.add(
             JSeparator(SwingConstants.VERTICAL).apply { preferredSize = JBUI.size(6, 20) },
         )
@@ -1044,7 +1093,10 @@ class MrDetailPanel(
     private fun renderTimeline(threads: List<CommentThread>) {
         loadedThreads = threads
         val noteCount = threads.sumOf { it.notes.size }
-        val items = buildTimeline(loadedTimelineNotes, threads, timelineFilter, timelineAscending)
+        val items = filterTimeline(
+            buildTimeline(loadedTimelineNotes, threads, timelineFilter, timelineAscending),
+            timelineQuery,
+        )
         timelineContainer.removeAll()
         if (items.isEmpty()) {
             timelineContainer.add(
@@ -1101,7 +1153,22 @@ class MrDetailPanel(
         val card = RoundedCardPanel(VerticalLayout(JBUI.scale(4)))
         val first = thread.notes.first()
 
-        // Header: author + tags on the left, date on the right.
+        // Reactions row (GLC-40): chips filled lazily; hidden until the note has awards.
+        val reactionsRow = JPanel(FlowLayout(FlowLayout.LEFT, JBUI.scale(4), 0)).apply {
+            isOpaque = false
+            isVisible = false
+        }
+
+        // Hover actions (GLC-40): 😊 react (always), ✏ edit / 🗑 delete (own note only), 🔗 copy link;
+        // hidden until the mouse enters the card.
+        val hoverActions = JPanel(FlowLayout(FlowLayout.RIGHT, JBUI.scale(2), 0)).apply {
+            isOpaque = false
+            isVisible = false
+        }
+        val hoverListener = cardHoverListener(card, hoverActions)
+        fillCardHoverActions(hoverActions, first) { renderReactionsRow(reactionsRow, first, notesEpoch, hoverListener) }
+
+        // Header: author + tags on the left; hover actions then the date on the right.
         val header = JPanel(BorderLayout()).apply { isOpaque = false }
         val headerLeft = JPanel(FlowLayout(FlowLayout.LEFT, JBUI.scale(6), 0)).apply { isOpaque = false }
         headerLeft.add(JBLabel(displayName(first.author)).apply { font = font.deriveFont(Font.BOLD) })
@@ -1117,8 +1184,11 @@ class MrDetailPanel(
                 ActionLink("[$anchor]") { gotoDiscussionInChanges(thread.discussionId) },
             )
         }
+        val headerRight = JPanel(FlowLayout(FlowLayout.RIGHT, JBUI.scale(6), 0)).apply { isOpaque = false }
+        headerRight.add(hoverActions)
+        headerRight.add(dateLabel(first.createdAt))
         header.add(headerLeft, BorderLayout.WEST)
-        header.add(dateLabel(first.createdAt), BorderLayout.EAST)
+        header.add(headerRight, BorderLayout.EAST)
         card.add(header)
 
         // Body: root markdown + indented muted replies, in one CockpitHtml pane (upload images resolved).
@@ -1135,6 +1205,9 @@ class MrDetailPanel(
         )
         card.add(bodyPane)
 
+        // Reactions row sits between the body and the thread actions (the GitLab web layout).
+        card.add(reactionsRow)
+
         // Actions: Reply · Resolve/Unresolve.
         val actions = JPanel(FlowLayout(FlowLayout.LEFT, JBUI.scale(8), 0)).apply { isOpaque = false }
         actions.add(
@@ -1147,7 +1220,271 @@ class MrDetailPanel(
             actions.add(ActionLink(CockpitBundle.message(key)) { onToggleResolve(thread) })
         }
         card.add(actions)
+
+        // Reveal the hover actions while the mouse is anywhere over the card (children included).
+        addHoverListenerRecursively(card, hoverListener)
+        // Fill the reactions row from cache or schedule its background load.
+        renderReactionsRow(reactionsRow, first, notesEpoch, hoverListener)
         return card
+    }
+
+    // --- Card hover actions & emoji reactions (GLC-40) ----------------------------------------
+
+    /**
+     * Populates a discussion card's top-right [panel] hover actions for its root [note]: 😊 add a
+     * reaction (always), ✏ edit and 🗑 delete (only when the note is the current user's own), and 🔗
+     * copy a permalink to the comment. [onReactionChanged] re-renders the card's reaction row after a
+     * reaction toggle from the emoji popup.
+     */
+    private fun fillCardHoverActions(panel: JPanel, note: GitLabDiscussionNote, onReactionChanged: () -> Unit) {
+        panel.add(
+            cardIconButton(CockpitIcons.addEmoji, CockpitIcons.addEmojiHovered, "detail.comment.action.react") {
+                showReactionPopup(panel, note, onReactionChanged)
+            },
+        )
+        val me = service.currentUser
+        if (me != null && note.author.id == me.id) {
+            panel.add(cardIconButton(AllIcons.Actions.Edit, null, "detail.comment.action.edit") { openEditComposer(note) })
+            panel.add(cardIconButton(AllIcons.Actions.GC, null, "detail.comment.action.delete") { onDeleteNote(note) })
+        }
+        panel.add(cardIconButton(AllIcons.Ide.Link, null, "detail.comment.action.copyLink") { onCopyCommentLink(note) })
+    }
+
+    /**
+     * A borderless clickable icon "button" (a [JBLabel]) for a card's hover row. When [hoverIcon] is
+     * non-null the icon swaps to it while the mouse is over the label (the AddEmoji resting/hover pair).
+     */
+    private fun cardIconButton(icon: Icon, hoverIcon: Icon?, tooltipKey: String, onClick: () -> Unit): JComponent {
+        val label = JBLabel(icon).apply {
+            toolTipText = CockpitBundle.message(tooltipKey)
+            cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
+            border = JBUI.Borders.empty(0, 2)
+        }
+        label.addMouseListener(object : MouseAdapter() {
+            override fun mouseClicked(e: MouseEvent) = onClick()
+            override fun mouseEntered(e: MouseEvent) { if (hoverIcon != null) label.icon = hoverIcon }
+            override fun mouseExited(e: MouseEvent) { if (hoverIcon != null) label.icon = icon }
+        })
+        return label
+    }
+
+    /** A [MouseListener] that shows [hoverActions] while the pointer is anywhere within [card]. */
+    private fun cardHoverListener(card: JComponent, hoverActions: JComponent): MouseListener =
+        object : MouseAdapter() {
+            override fun mouseEntered(e: MouseEvent) {
+                hoverActions.isVisible = true
+            }
+
+            override fun mouseExited(e: MouseEvent) {
+                // Moving onto a child fires exit on the parent; keep it shown while still inside the card.
+                val p = SwingUtilities.convertPoint(e.component, e.point, card)
+                if (!card.contains(p)) hoverActions.isVisible = false
+            }
+        }
+
+    /** Adds [listener] to [component] and every descendant so the card-hover fires over any child. */
+    private fun addHoverListenerRecursively(component: Component, listener: MouseListener) {
+        component.addMouseListener(listener)
+        if (component is Container) {
+            for (child in component.components) addHoverListenerRecursively(child, listener)
+        }
+    }
+
+    /**
+     * Renders [note]'s reaction chips into [container] from [awardsCache], or schedules a background
+     * load (bounded by [awardsSemaphore]) when the cache is missing/stale, repainting the row once it
+     * lands. The [epoch] guards against a superseded timeline; [hoverListener] is re-attached to each
+     * chip so hovering a chip still reveals the card's hover actions.
+     */
+    private fun renderReactionsRow(
+        container: JPanel,
+        note: GitLabDiscussionNote,
+        epoch: Int,
+        hoverListener: MouseListener,
+    ) {
+        val ref = currentRef ?: return
+        val cached = awardsCache[note.id]
+        if (cached != null && cached.updatedAt == note.updatedAt) {
+            populateReactionChips(container, note, cached.awards, hoverListener)
+            return
+        }
+        container.removeAll()
+        container.isVisible = false
+        container.revalidate()
+        container.repaint()
+        service.coroutineScope.launch {
+            awardsSemaphore.withPermit {
+                if (currentRef != ref || notesEpoch != epoch) return@withPermit
+                val result = service.getNoteAwards(ref, note.id)
+                if (result is GitLabResult.Success) {
+                    withContext(Dispatchers.EDT) {
+                        if (currentRef != ref || notesEpoch != epoch) return@withContext
+                        awardsCache[note.id] = CachedAwards(note.updatedAt, result.data)
+                        populateReactionChips(container, note, result.data, hoverListener)
+                    }
+                }
+            }
+        }
+    }
+
+    /** EDT. Rebuilds [container]'s reaction chips (one per emoji name, mine highlighted) for [awards]. */
+    private fun populateReactionChips(
+        container: JPanel,
+        note: GitLabDiscussionNote,
+        awards: List<GitLabAward>,
+        hoverListener: MouseListener,
+    ) {
+        container.removeAll()
+        val me = service.currentUser
+        val refresh = { renderReactionsRow(container, note, notesEpoch, hoverListener) }
+        awards.groupBy { it.name }.forEach { (name, list) ->
+            val mine = me != null && list.any { it.user.id == me.id }
+            val chip = reactionChip(name, list.size, mine) { toggleReaction(note, name, mine, refresh) }
+            chip.addMouseListener(hoverListener)
+            container.add(chip)
+        }
+        container.isVisible = awards.isNotEmpty()
+        container.revalidate()
+        container.repaint()
+    }
+
+    /** A rounded `emoji count` reaction chip; [highlighted] when the current user is among the reactors. */
+    private fun reactionChip(name: String, count: Int, highlighted: Boolean, onClick: () -> Unit): JComponent {
+        val chip = ReactionChip("${AwardEmoji.display(name)} $count", highlighted).apply {
+            toolTipText = CockpitBundle.message("detail.comment.reaction.tooltip")
+            cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
+        }
+        chip.addMouseListener(object : MouseAdapter() {
+            override fun mouseClicked(e: MouseEvent) = onClick()
+        })
+        return chip
+    }
+
+    /**
+     * Toggles the current user's [name] reaction on [note]: removes it when already mine (looking up my
+     * award id in the cache), otherwise adds it. On success the cache entry is dropped and [onChanged]
+     * re-renders the row (which re-fetches the fresh awards).
+     */
+    private fun toggleReaction(note: GitLabDiscussionNote, name: String, mine: Boolean, onChanged: () -> Unit) {
+        val ref = currentRef ?: return
+        val me = service.currentUser
+        val myAwardId = if (mine && me != null) {
+            awardsCache[note.id]?.awards?.firstOrNull { it.name == name && it.user.id == me.id }?.id
+        } else {
+            null
+        }
+        service.coroutineScope.launch {
+            val result: GitLabResult<*> = if (myAwardId != null) {
+                service.deleteNoteAward(ref, note.id, myAwardId)
+            } else {
+                service.addNoteAward(ref, note.id, name)
+            }
+            withContext(Dispatchers.EDT) {
+                if (currentRef != ref) return@withContext
+                when (result) {
+                    is GitLabResult.Success -> {
+                        awardsCache.remove(note.id)
+                        onChanged()
+                    }
+                    else -> showError("detail.error.reaction", result)
+                }
+            }
+        }
+    }
+
+    /**
+     * Shows the standard GitLab quick-reaction popup (👍 👎 😄 🎉 😕 ❤️ 🚀 👀) under [anchor]; picking one
+     * toggles that reaction on [note] and [onChanged] refreshes the row.
+     */
+    private fun showReactionPopup(anchor: JComponent, note: GitLabDiscussionNote, onChanged: () -> Unit) {
+        val me = service.currentUser
+        val mineNames = awardsCache[note.id]?.awards
+            ?.filter { me != null && it.user.id == me.id }
+            ?.map { it.name }
+            ?.toSet()
+            ?: emptySet()
+        val row = JPanel(FlowLayout(FlowLayout.CENTER, JBUI.scale(2), JBUI.scale(2))).apply { isOpaque = false }
+        lateinit var popup: JBPopup
+        for ((name, emoji) in AwardEmoji.STANDARD) {
+            val mine = name in mineNames
+            row.add(
+                JButton(emoji).apply {
+                    toolTipText = name
+                    margin = JBUI.insets(2)
+                    addActionListener {
+                        popup.closeOk(null)
+                        toggleReaction(note, name, mine, onChanged)
+                    }
+                },
+            )
+        }
+        popup = JBPopupFactory.getInstance()
+            .createComponentPopupBuilder(row, row)
+            .setRequestFocus(true)
+            .createPopup()
+        popup.showUnderneathOf(anchor)
+    }
+
+    /** Opens the composer in edit mode (GLC-40) pre-filled with [note]'s body; Submit calls [updateNote]. */
+    private fun openEditComposer(note: GitLabDiscussionNote) {
+        val ref = currentRef ?: return
+        ComposerDialog(
+            project,
+            CockpitBundle.message("detail.composer.title.edit"),
+            onSubmit = { text, _ -> submitEdit(ref, note.id, text) },
+            onSaveDraft = {},
+            initialText = note.body,
+            editMode = true,
+        ).show()
+    }
+
+    /** Edits a note off the EDT (GLC-40), then reloads the timeline on success. */
+    private fun submitEdit(ref: MrRef, noteId: Long, text: String) {
+        service.coroutineScope.launch {
+            val result = service.updateNote(ref, noteId, text)
+            withContext(Dispatchers.EDT) {
+                if (currentRef != ref) return@withContext
+                when (result) {
+                    is GitLabResult.Success -> loadNotes(ref)
+                    else -> showError("detail.error.comment", result)
+                }
+            }
+        }
+    }
+
+    /** Confirms, then deletes [note] off the EDT (GLC-40) and reloads the timeline on success. */
+    private fun onDeleteNote(note: GitLabDiscussionNote) {
+        val ref = currentRef ?: return
+        val confirmed = Messages.showYesNoDialog(
+            this,
+            CockpitBundle.message("detail.comment.delete.confirm"),
+            CockpitBundle.message("detail.comment.delete.title"),
+            Messages.getQuestionIcon(),
+        )
+        if (confirmed != Messages.YES) return
+        service.coroutineScope.launch {
+            val result = service.deleteNote(ref, note.id)
+            withContext(Dispatchers.EDT) {
+                if (currentRef != ref) return@withContext
+                when (result) {
+                    is GitLabResult.Success -> loadNotes(ref)
+                    else -> showError("detail.error.deleteComment", result)
+                }
+            }
+        }
+    }
+
+    /** Copies `<mr.webUrl>#note_<noteId>` to the clipboard (GLC-40) and confirms with a balloon. */
+    private fun onCopyCommentLink(note: GitLabDiscussionNote) {
+        val mr = currentMr ?: return
+        CopyPasteManager.getInstance().setContents(StringSelection("${mr.webUrl}#note_${note.id}"))
+        NotificationGroupManager.getInstance()
+            .getNotificationGroup(COCKPIT_NOTIFICATION_GROUP)
+            .createNotification(
+                CockpitBundle.message("detail.comment.copyLink.done"),
+                NotificationType.INFORMATION,
+            )
+            .notify(project)
     }
 
     /** Builds the root-markdown-plus-indented-replies HTML fragment for a discussion card body. */
@@ -1677,9 +2014,11 @@ class MrDetailPanel(
         dialogTitle: String,
         private val onSubmit: (text: String, startReview: Boolean) -> Unit,
         private val onSaveDraft: (text: String) -> Unit,
+        initialText: String = "",
+        private val editMode: Boolean = false,
     ) : DialogWrapper(project) {
 
-        private val area = JBTextArea(COMPOSER_ROWS, 60).apply {
+        private val area = JBTextArea(initialText, COMPOSER_ROWS, 60).apply {
             lineWrap = true
             wrapStyleWord = true
         }
@@ -1697,7 +2036,8 @@ class MrDetailPanel(
             row {
                 cell(JBScrollPane(area)).align(Align.FILL)
             }.resizableRow()
-            row { cell(startReviewCheck) }
+            // Edit mode publishes the change directly — there is no draft/"start review" flow.
+            if (!editMode) row { cell(startReviewCheck) }
         }.apply { preferredSize = CockpitTheme.EDIT_MR_DIALOG_SIZE }
 
         /** The markdown-format toolbar: B / I / S / inline code / code block / quote / link. */
@@ -1735,7 +2075,9 @@ class MrDetailPanel(
 
         override fun getPreferredFocusedComponent(): JComponent = area
 
-        override fun createActions(): Array<Action> = arrayOf(okAction, saveDraftAction, cancelAction)
+        // Edit mode drops the Save Draft exit (a note edit has no draft form).
+        override fun createActions(): Array<Action> =
+            if (editMode) arrayOf(okAction, cancelAction) else arrayOf(okAction, saveDraftAction, cancelAction)
 
         /** Save Draft: creates a draft note regardless of the "Start review" checkbox. */
         private val saveDraftAction: Action = object : DialogWrapperAction(
@@ -1752,7 +2094,7 @@ class MrDetailPanel(
         override fun doOKAction() {
             val text = area.text.trim()
             if (text.isEmpty()) return
-            onSubmit(text, startReviewCheck.isSelected)
+            onSubmit(text, !editMode && startReviewCheck.isSelected)
             super.doOKAction()
         }
     }
@@ -1777,6 +2119,38 @@ class MrDetailPanel(
                 g2.color = CockpitTheme.cardBackground()
                 g2.fill(rect)
                 g2.color = JBColor.border()
+                g2.draw(rect)
+            } finally {
+                g2.dispose()
+            }
+            super.paintComponent(g)
+        }
+    }
+
+    /** Cached emoji reactions of a note (GLC-40), keyed alongside the note's `updated_at` for freshness. */
+    private data class CachedAwards(val updatedAt: String?, val awards: List<GitLabAward>)
+
+    /**
+     * A small rounded reaction chip (GLC-40): an `emoji count` pill on a [CockpitTheme.chipBackground]
+     * fill with a [JBColor.border] outline, painted like [RoundedCardPanel] but at chip scale. When
+     * [highlighted] (the current user is among the reactors) it takes a translucent [CockpitTheme.info]
+     * fill and an info-colored outline so a reaction of the user's own reads at a glance.
+     */
+    private class ReactionChip(text: String, private val highlighted: Boolean) : JBLabel(text) {
+        init {
+            isOpaque = false
+            border = JBUI.Borders.empty(1, 6)
+        }
+
+        override fun paintComponent(g: Graphics) {
+            val g2 = g.create() as Graphics2D
+            try {
+                g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON)
+                val arc = JBUI.scale(REACTION_CHIP_ARC).toFloat()
+                val rect = RoundRectangle2D.Float(0.5f, 0.5f, width - 1f, height - 1f, arc, arc)
+                g2.color = if (highlighted) ColorUtil.toAlpha(CockpitTheme.info, 40) else CockpitTheme.chipBackground()
+                g2.fill(rect)
+                g2.color = if (highlighted) CockpitTheme.info else JBColor.border()
                 g2.draw(rect)
             } finally {
                 g2.dispose()
@@ -1812,6 +2186,9 @@ class MrDetailPanel(
 
         /** Corner radius (unscaled px) of a timeline card's rounded border/background (iter3 B5). */
         private const val CARD_ARC = 8
+
+        /** Corner radius (unscaled px) of an emoji reaction chip (GLC-40). */
+        private const val REACTION_CHIP_ARC = 10
 
         /** Rows of the composer popup's textarea (iter3 F14). */
         private const val COMPOSER_ROWS = 8

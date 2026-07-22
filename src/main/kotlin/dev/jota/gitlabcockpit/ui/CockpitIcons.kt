@@ -60,6 +60,15 @@ object CockpitIcons {
     val nonMergeable: Icon = IconLoader.getIcon("/icons/collab/nonMergeable.svg", CockpitIcons::class.java)
 
     /**
+     * "Add reaction" affordance (CollaborationToolsIcons.AddEmoji): a smiley with a small `+`, the
+     * resting state of a discussion card's hover reaction button (GLC-40 / iter4a).
+     */
+    val addEmoji: Icon = IconLoader.getIcon("/icons/collab/addEmoji.svg", CockpitIcons::class.java)
+
+    /** Hovered state of [addEmoji] (CollaborationToolsIcons.AddEmojiHovered): the same glyph, less faded. */
+    val addEmojiHovered: Icon = IconLoader.getIcon("/icons/collab/addEmojiHovered.svg", CockpitIcons::class.java)
+
+    /**
      * Maps a timeline [eventIconKey] to the concrete [Icon] a native event card paints (GLC-38 / iter3
      * B). The counterpart of the old HTML `<icon src>` mapping, now that the timeline is built from Swing
      * components instead of one HTML document. Every icon is verified to exist in the 2025.2 platform.

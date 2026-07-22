@@ -19,8 +19,8 @@ class MrTimelineTest {
     private fun note(id: Long, createdAt: String, system: Boolean, body: String = "body $id") =
         GitLabNote(id = id, body = body, system = system, author = author, createdAt = createdAt)
 
-    private fun discussionNote(id: Long, createdAt: String) =
-        GitLabDiscussionNote(id = id, body = "body $id", system = false, author = author, createdAt = createdAt)
+    private fun discussionNote(id: Long, createdAt: String, body: String = "body $id", author: GitLabUser = this.author) =
+        GitLabDiscussionNote(id = id, body = body, system = false, author = author, createdAt = createdAt)
 
     private fun thread(id: String, vararg notes: GitLabDiscussionNote) =
         commentThreads(listOf(GitLabDiscussion(id = id, notes = notes.toList()))).single()
@@ -106,6 +106,55 @@ class MrTimelineTest {
         assertEquals(true, timeline[0] is TimelineItem.DiscussionItem)
         assertEquals("2026-07-14T09:00:00Z", timeline[0].createdAt)
         assertEquals(true, timeline[1] is TimelineItem.EventItem)
+    }
+
+    // --- filterTimeline -----------------------------------------------------------------------
+
+    @Test
+    fun `a blank query keeps every item`() {
+        val notes = listOf(note(1, "2026-07-14T09:00:00Z", system = true, body = "added 2 commits"))
+        val threads = listOf(thread("d1", discussionNote(2, "2026-07-14T10:00:00Z", body = "please fix")))
+        val items = buildTimeline(notes, threads, TimelineFilter.ALL, ascending = true)
+        assertEquals(items, filterTimeline(items, ""))
+        assertEquals(items, filterTimeline(items, "   "))
+    }
+
+    @Test
+    fun `query matches an event body case-insensitively`() {
+        val notes = listOf(
+            note(1, "2026-07-14T09:00:00Z", system = true, body = "added 2 commits"),
+            note(2, "2026-07-14T09:30:00Z", system = true, body = "approved this merge request"),
+        )
+        val items = buildTimeline(notes, threads = emptyList(), TimelineFilter.ALL, ascending = true)
+        val filtered = filterTimeline(items, "COMMITS")
+        assertEquals(1, filtered.size)
+        assertEquals(1L, (filtered.single() as TimelineItem.EventItem).note.id)
+    }
+
+    @Test
+    fun `query matches a thread through any reply body`() {
+        // The opening note does not match; a later reply does — the whole thread is kept.
+        val threads = listOf(
+            thread(
+                "d1",
+                discussionNote(1, "2026-07-14T09:00:00Z", body = "looks good"),
+                discussionNote(2, "2026-07-14T10:00:00Z", body = "actually there is a regression here"),
+            ),
+        )
+        val items = buildTimeline(notes = emptyList(), threads, TimelineFilter.ALL, ascending = true)
+        val filtered = filterTimeline(items, "regression")
+        assertEquals(1, filtered.size)
+        assertEquals(true, filtered.single() is TimelineItem.DiscussionItem)
+    }
+
+    @Test
+    fun `query matches on author name and username`() {
+        val bob = GitLabUser(id = 2, username = "bmartin", name = "Bob Martin")
+        val threads = listOf(thread("d1", discussionNote(1, "2026-07-14T09:00:00Z", body = "hi", author = bob)))
+        val items = buildTimeline(notes = emptyList(), threads, TimelineFilter.ALL, ascending = true)
+        assertEquals(1, filterTimeline(items, "martin").size)
+        assertEquals(1, filterTimeline(items, "bmartin").size)
+        assertEquals(0, filterTimeline(items, "nobody").size)
     }
 
     // --- eventIconKey -------------------------------------------------------------------------

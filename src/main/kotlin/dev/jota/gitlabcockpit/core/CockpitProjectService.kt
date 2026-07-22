@@ -8,6 +8,7 @@ import dev.jota.gitlabcockpit.CockpitBundle
 import dev.jota.gitlabcockpit.api.DiffRefs
 import dev.jota.gitlabcockpit.api.GitLabApiClient
 import dev.jota.gitlabcockpit.api.GitLabApprovals
+import dev.jota.gitlabcockpit.api.GitLabAward
 import dev.jota.gitlabcockpit.api.GitLabDiffFile
 import dev.jota.gitlabcockpit.api.GitLabDiscussion
 import dev.jota.gitlabcockpit.api.GitLabDiscussionNote
@@ -232,6 +233,26 @@ class CockpitProjectService(
     /** Posts a general comment on an MR and returns the created note. */
     suspend fun addNote(ref: MrRef, body: String): GitLabResult<GitLabNote> =
         withClientAndProject { client, _ -> client.createMrNote(ref.projectId, ref.iid, body) }
+
+    /** Edits an existing note (GLC-40) and returns the updated note. */
+    suspend fun updateNote(ref: MrRef, noteId: Long, body: String): GitLabResult<GitLabNote> =
+        withClientAndProject { client, _ -> client.updateMrNote(ref.projectId, ref.iid, noteId, body) }
+
+    /** Deletes an existing note (GLC-40). */
+    suspend fun deleteNote(ref: MrRef, noteId: Long): GitLabResult<Unit> =
+        withClientAndProject { client, _ -> client.deleteMrNote(ref.projectId, ref.iid, noteId) }
+
+    /** The emoji reactions on a single note (GLC-40), for the lazily-loaded reactions row. */
+    suspend fun getNoteAwards(ref: MrRef, noteId: Long): GitLabResult<List<GitLabAward>> =
+        withClientAndProject { client, _ -> client.getNoteAwards(ref.projectId, ref.iid, noteId) }
+
+    /** Adds an emoji reaction ([name]) to a note (GLC-40) and returns the created award. */
+    suspend fun addNoteAward(ref: MrRef, noteId: Long, name: String): GitLabResult<GitLabAward> =
+        withClientAndProject { client, _ -> client.addNoteAward(ref.projectId, ref.iid, noteId, name) }
+
+    /** Removes the current user's emoji reaction ([awardId]) from a note (GLC-40). */
+    suspend fun deleteNoteAward(ref: MrRef, noteId: Long, awardId: Long): GitLabResult<Unit> =
+        withClientAndProject { client, _ -> client.deleteNoteAward(ref.projectId, ref.iid, noteId, awardId) }
 
     /**
      * Approves an MR as the current user. On success the MR's approvals cache entry is dropped so
