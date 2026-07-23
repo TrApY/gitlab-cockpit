@@ -1,5 +1,6 @@
 package dev.jota.gitlabcockpit.settings.ui
 
+import com.intellij.ide.BrowserUtil
 import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.application.ModalityState
 import com.intellij.openapi.options.Configurable
@@ -118,6 +119,9 @@ class GitLabCockpitConfigurable : Configurable {
                 row(CockpitBundle.message("settings.notifications.backgroundInterval")) {
                     cell(backgroundIntervalCombo)
                 }.rowComment(CockpitBundle.message("settings.notifications.backgroundInterval.help"))
+            }
+            row {
+                link(CockpitBundle.message("settings.help.link")) { BrowserUtil.browse(HELP_URL) }
             }
         }
         reset()
@@ -304,5 +308,10 @@ class GitLabCockpitConfigurable : Configurable {
         companion object {
             fun of(minutes: Int): PollInterval = values().firstOrNull { it.minutes == minutes } ?: TWO
         }
+    }
+
+    private companion object {
+        /** Target of the "Help and documentation" link at the bottom of this settings page. */
+        private const val HELP_URL = "https://github.com/TrApY/gitlab-cockpit#readme"
     }
 }
