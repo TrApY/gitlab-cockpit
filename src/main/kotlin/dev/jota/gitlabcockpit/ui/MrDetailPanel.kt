@@ -16,6 +16,8 @@ import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.application.EDT
 import com.intellij.openapi.application.ModalityState
 import com.intellij.openapi.application.asContextElement
+import com.intellij.openapi.fileChooser.FileChooser
+import com.intellij.openapi.fileChooser.FileChooserDescriptorFactory
 import com.intellij.openapi.ide.CopyPasteManager
 import com.intellij.openapi.progress.ProgressIndicator
 import com.intellij.openapi.progress.Task
@@ -25,6 +27,7 @@ import com.intellij.openapi.ui.DialogWrapper
 import com.intellij.openapi.ui.Messages
 import com.intellij.openapi.ui.popup.JBPopup
 import com.intellij.openapi.ui.popup.JBPopupFactory
+import com.intellij.openapi.vfs.VirtualFile
 import com.intellij.ui.CheckBoxList
 import com.intellij.ui.CollectionListModel
 import com.intellij.ui.ColorUtil
@@ -56,6 +59,7 @@ import dev.jota.gitlabcockpit.api.GitLabLabel
 import dev.jota.gitlabcockpit.api.GitLabMergeRequest
 import dev.jota.gitlabcockpit.api.GitLabNote
 import dev.jota.gitlabcockpit.api.GitLabResult
+import dev.jota.gitlabcockpit.api.GitLabUpload
 import dev.jota.gitlabcockpit.api.GitLabUser
 import dev.jota.gitlabcockpit.api.MergeRequestUpdate
 import dev.jota.gitlabcockpit.core.ApprovalsHealth
@@ -130,6 +134,8 @@ import java.awt.event.MouseListener
 import java.awt.event.WindowAdapter
 import java.awt.event.WindowEvent
 import java.awt.geom.RoundRectangle2D
+import java.io.IOException
+import java.nio.file.Files
 import java.util.concurrent.ConcurrentHashMap
 import javax.swing.Action
 import javax.swing.BoxLayout
@@ -1670,6 +1676,7 @@ class MrDetailPanel(
         ComposerDialog(
             project,
             CockpitBundle.message("detail.composer.title.edit"),
+            uploader = attachmentUploaderFor(ref.projectId),
             onSubmit = { text, _ -> submitEdit(ref, note.id, text) },
             onSaveDraft = {},
             initialText = note.body,
@@ -1812,6 +1819,7 @@ class MrDetailPanel(
         ComposerDialog(
             project,
             dialogTitle,
+            uploader = attachmentUploaderFor(ref.projectId),
             onSubmit = { text, startReview -> submitComposer(ref, replyToDiscussionId, text, startReview) },
             onSaveDraft = { text -> saveDraftComposer(ref, replyToDiscussionId, text) },
         ).show()
@@ -1885,6 +1893,7 @@ class MrDetailPanel(
             project,
             mr,
             projectPath = projectLabelOf(mr),
+            uploader = attachmentUploaderFor(mr.projectId),
             loadRoster = { onLoaded -> withMembers(mr.projectId, onLoaded) },
             pickLabels = { current, onPicked ->
                 withLabels(mr.projectId) { projectLabels ->
@@ -1993,6 +2002,23 @@ class MrDetailPanel(
         )
     }
 
+    /**
+     * The [AttachmentUploader] the format bar uses for [projectId] (GLC-56): runs the upload on the
+     * service scope and resumes on the EDT under the caller's modality (captured here, on the EDT, when
+     * the clip action fires) — so the result insertion lands inside a modal Edit dialog rather than
+     * being deferred until it closes, the same modality dance [withMembers] performs.
+     */
+    private fun attachmentUploaderFor(projectId: Long): AttachmentUploader =
+        AttachmentUploader { filename, bytes, contentType, onResult ->
+            val modality = ModalityState.current()
+            service.coroutineScope.launch {
+                val result = service.uploadAttachment(projectId, filename, bytes, contentType)
+                withContext(Dispatchers.EDT + modality.asContextElement()) {
+                    onResult(result)
+                }
+            }
+        }
+
     private fun badge(text: String, color: Color): JComponent =
         JBLabel(text).apply {
             foreground = color
@@ -2026,9 +2052,10 @@ class MrDetailPanel(
      * memory, each "+" popup then opens synchronously from the click with no round-trip to the background.
      */
     private class EditMrDialog(
-        project: Project,
+        private val project: Project,
         mr: GitLabMergeRequest,
         private val projectPath: String?,
+        private val uploader: AttachmentUploader,
         private val loadRoster: ((List<GitLabUser>) -> Unit) -> Unit,
         private val pickLabels: (List<String>, (List<String>) -> Unit) -> Unit,
     ) : DialogWrapper(project) {
@@ -2124,7 +2151,7 @@ class MrDetailPanel(
                 cell(titleField).align(AlignX.FILL)
             }
             row(CockpitBundle.message("dialog.editMr.descriptionLabel")) {
-                cell(MarkdownFormatBar(descriptionArea))
+                cell(MarkdownFormatBar(descriptionArea, project, uploader))
             }
             row {
                 // The editor field scrolls itself; sized like the old scroll wrapper.
@@ -2501,7 +2528,13 @@ class MrDetailPanel(
      */
     private class MarkdownFormatBar(
         private val field: MarkdownEditorField,
+        private val project: Project,
+        private val uploader: AttachmentUploader,
     ) : JPanel(BorderLayout()) {
+
+        /** True while an attachment upload is in flight, so the clip action greys and rejects re-entry. */
+        private var uploading = false
+
         init {
             isOpaque = false
             val group = DefaultActionGroup(
@@ -2518,6 +2551,7 @@ class MrDetailPanel(
                 formatAction("detail.composer.format.link", CockpitIcons.copyLink, MarkdownMarker.LINK),
                 tableAction(),
                 emojiAction(),
+                attachAction(),
             )
             val toolbar = ActionManager.getInstance().createActionToolbar(TOOLBAR_PLACE, group, true)
             toolbar.targetComponent = field
@@ -2622,15 +2656,112 @@ class MrDetailPanel(
                 }
             }
 
+        /**
+         * Attaches a file (GLC-56, the reference's clip button): opens the platform's single-file
+         * chooser, rejects anything over GitLab's default 10 MB attachment limit up front (no API
+         * call), reads the bytes and uploads them off the EDT through [uploader]. On success the
+         * markdown GitLab returns is inserted at the caret; a failure surfaces the same error dialog
+         * the composer's submit uses. The action greys while an upload is in flight (see [uploading]),
+         * which also blocks re-entry.
+         */
+        private fun attachAction(): AnAction =
+            object : AnAction(CockpitBundle.message("detail.composer.format.attach"), null, ATTACH_ICON) {
+                override fun getActionUpdateThread(): ActionUpdateThread = ActionUpdateThread.EDT
+                override fun update(e: AnActionEvent) {
+                    e.presentation.isEnabled = !uploading
+                }
+
+                override fun actionPerformed(e: AnActionEvent) {
+                    if (uploading) return
+                    val descriptor = FileChooserDescriptorFactory.singleFile()
+                        .withTitle(CockpitBundle.message("detail.composer.attach.chooserTitle"))
+                    val chosen = FileChooser.chooseFile(descriptor, project, null) ?: return
+                    if (chosen.length > MAX_ATTACHMENT_BYTES) {
+                        Messages.showErrorDialog(
+                            field,
+                            CockpitBundle.message("detail.error.attachTooLarge", MAX_ATTACHMENT_MB),
+                            CockpitBundle.message("detail.error.title"),
+                        )
+                        return
+                    }
+                    val bytes = try {
+                        chosen.contentsToByteArray()
+                    } catch (ex: IOException) {
+                        showAttachError(GitLabResult.NetworkError(ex))
+                        return
+                    }
+                    uploading = true
+                    uploader.upload(chosen.name, bytes, probeContentType(chosen)) { result ->
+                        uploading = false
+                        when (result) {
+                            is GitLabResult.Success -> field.insertAtCaret(result.data.markdown)
+                            else -> showAttachError(result)
+                        }
+                    }
+                }
+            }
+
+        /** The chosen file's MIME type via [Files.probeContentType], falling back to a generic binary type. */
+        private fun probeContentType(file: VirtualFile): String =
+            try {
+                Files.probeContentType(file.toNioPath())
+            } catch (ex: Exception) {
+                null
+            } ?: DEFAULT_CONTENT_TYPE
+
+        /** Reports an upload failure with the composer's error dialog (localized `HTTP nnn` / cause). */
+        private fun showAttachError(result: GitLabResult<*>) {
+            val detail = when (result) {
+                is GitLabResult.HttpError -> "HTTP ${result.status}"
+                is GitLabResult.NetworkError -> result.cause.message ?: result.cause.javaClass.simpleName
+                is GitLabResult.Success<*> -> ""
+            }
+            Messages.showErrorDialog(
+                field,
+                CockpitBundle.message("detail.error.attach", detail),
+                CockpitBundle.message("detail.error.title"),
+            )
+        }
+
         companion object {
             /** The toolbar "place" id for the shared markdown format bar. */
             private const val TOOLBAR_PLACE = "GitLabCockpitMarkdownFormatBar"
+
+            /**
+             * Clip-button icon: [AllIcons.Vcs.Patch]. AllIcons ships no dedicated paperclip glyph, so the
+             * patch icon — a small document with a corner fold, read as "a file to attach" — is used, in
+             * the same spirit as the checkout actions that borrow [AllIcons.Vcs] glyphs.
+             */
+            private val ATTACH_ICON = AllIcons.Vcs.Patch
+
+            /** GitLab's default per-file attachment limit; larger files are rejected before any API call. */
+            private const val MAX_ATTACHMENT_MB = 10
+            private const val MAX_ATTACHMENT_BYTES = MAX_ATTACHMENT_MB * 1024L * 1024L
+
+            /** Fallback MIME type when [Files.probeContentType] cannot determine one. */
+            private const val DEFAULT_CONTENT_TYPE = "application/octet-stream"
         }
     }
 
+    /**
+     * Uploads a file the format bar's clip button chose (GLC-56). The bar owns the file chooser, the
+     * size guard and the caret insertion; the panel supplies this to run the actual
+     * `POST …/uploads` on its coroutine scope and hand the [GitLabUpload] (or the failure) back on the
+     * EDT — under the caller's modality, so the result lands inside a modal Edit dialog too.
+     */
+    private fun interface AttachmentUploader {
+        fun upload(
+            filename: String,
+            bytes: ByteArray,
+            contentType: String,
+            onResult: (GitLabResult<GitLabUpload>) -> Unit,
+        )
+    }
+
     private class ComposerDialog(
-        project: Project,
+        private val project: Project,
         dialogTitle: String,
+        private val uploader: AttachmentUploader,
         private val onSubmit: (text: String, startReview: Boolean) -> Unit,
         private val onSaveDraft: (text: String) -> Unit,
         initialText: String = "",
@@ -2649,7 +2780,7 @@ class MrDetailPanel(
         }
 
         override fun createCenterPanel(): JComponent = panel {
-            row { cell(MarkdownFormatBar(area)) }
+            row { cell(MarkdownFormatBar(area, project, uploader)) }
             row {
                 // The editor field scrolls itself when multiline; no JBScrollPane wrapper needed.
                 cell(area).align(Align.FILL)

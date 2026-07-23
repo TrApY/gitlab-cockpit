@@ -321,4 +321,37 @@ class GitLabModelSerializationTest {
         assertEquals("General draft", draft.note)
         assertNull(draft.position)
     }
+
+    @Test
+    fun `upload parses the real uploads payload and ignores unknown fields`() {
+        // Real POST /projects/:id/uploads response (GLC-56); the extra id/secret/file_name are ignored.
+        val payload = """
+            {
+              "id": 5,
+              "alt": "dk",
+              "url": "/uploads/66dbcd21ec5d24ed6ea225176098d52b/dk.png",
+              "full_path": "/-/project/1234/uploads/66dbcd21ec5d24ed6ea225176098d52b/dk.png",
+              "markdown": "![dk](/uploads/66dbcd21ec5d24ed6ea225176098d52b/dk.png)",
+              "secret": "66dbcd21ec5d24ed6ea225176098d52b",
+              "file_name": "dk.png"
+            }
+        """.trimIndent()
+
+        val upload = json.decodeFromString<GitLabUpload>(payload)
+
+        assertEquals("dk", upload.alt)
+        assertEquals("/uploads/66dbcd21ec5d24ed6ea225176098d52b/dk.png", upload.url)
+        assertEquals("/-/project/1234/uploads/66dbcd21ec5d24ed6ea225176098d52b/dk.png", upload.fullPath)
+        assertEquals("![dk](/uploads/66dbcd21ec5d24ed6ea225176098d52b/dk.png)", upload.markdown)
+    }
+
+    @Test
+    fun `upload defaults every field to empty when absent`() {
+        val upload = json.decodeFromString<GitLabUpload>("{}")
+
+        assertEquals("", upload.alt)
+        assertEquals("", upload.url)
+        assertEquals("", upload.fullPath)
+        assertEquals("", upload.markdown)
+    }
 }

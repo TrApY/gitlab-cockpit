@@ -21,6 +21,7 @@ import dev.jota.gitlabcockpit.api.GitLabNote
 import dev.jota.gitlabcockpit.api.GitLabPipeline
 import dev.jota.gitlabcockpit.api.GitLabProject
 import dev.jota.gitlabcockpit.api.GitLabResult
+import dev.jota.gitlabcockpit.api.GitLabUpload
 import dev.jota.gitlabcockpit.api.GitLabUser
 import dev.jota.gitlabcockpit.api.MergeRequestQuery
 import dev.jota.gitlabcockpit.api.MergeRequestUpdate
@@ -253,6 +254,19 @@ class CockpitProjectService(
     /** Posts a general comment on an MR and returns the created note. */
     suspend fun addNote(ref: MrRef, body: String): GitLabResult<GitLabNote> =
         withClientAndProject { client, _ -> client.createMrNote(ref.projectId, ref.iid, body) }
+
+    /**
+     * Uploads an attachment to [projectId] via `POST …/uploads` (GLC-56, the composer's clip button)
+     * and returns the created [GitLabUpload], whose `markdown` the editor inserts at the caret. A thin
+     * pass-through to the client, like the other note/upload wrappers.
+     */
+    suspend fun uploadAttachment(
+        projectId: Long,
+        filename: String,
+        bytes: ByteArray,
+        contentType: String,
+    ): GitLabResult<GitLabUpload> =
+        withClientAndProject { client, _ -> client.uploadProjectFile(projectId, filename, bytes, contentType) }
 
     /** Edits an existing note (GLC-40) and returns the updated note. */
     suspend fun updateNote(ref: MrRef, noteId: Long, body: String): GitLabResult<GitLabNote> =

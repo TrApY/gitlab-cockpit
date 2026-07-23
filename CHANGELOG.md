@@ -7,6 +7,7 @@
 ### Added
 
 - Merge-request notifications now include an "Approved by X" balloon when a merge request you authored or are assigned to gains a new approver (GLC-55)
+- The comment composer and the Edit merge request description now have an "Attach file" button: it opens a file chooser, uploads the file to the project and inserts the Markdown GitLab returns at the caret (files over 10 MB are rejected before upload) (GLC-56)
 
 ## [0.14.0] - 2026-07-22
 

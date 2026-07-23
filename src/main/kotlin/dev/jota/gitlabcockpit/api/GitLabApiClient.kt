@@ -15,6 +15,7 @@ import java.net.http.HttpRequest
 import java.net.http.HttpResponse
 import java.nio.charset.StandardCharsets
 import java.time.Duration
+import java.util.UUID
 
 /**
  * GitLab `/version` payload. Unknown fields are ignored by the configured [Json] instance,
@@ -47,6 +48,22 @@ data class GitLabProject(
     val id: Long,
     @SerialName("path_with_namespace") val pathWithNamespace: String,
     @SerialName("web_url") val webUrl: String,
+)
+
+/**
+ * The response of `POST /projects/:id/uploads` — a Markdown attachment upload (GLC-56, the composer's
+ * clip button). Only the fields the composer needs are modeled and every one defaults, so a trimmed
+ * or future payload still decodes (like the other tolerant models). [markdown] is the ready-to-insert
+ * snippet GitLab returns (`![name](/uploads/…/x.png)` for images, `[name](/uploads/…/x.pdf)`
+ * otherwise) — the caret insertion uses it verbatim; [url] / [fullPath] are the relative and absolute
+ * upload paths and [alt] the file's display name.
+ */
+@Serializable
+data class GitLabUpload(
+    val alt: String = "",
+    val url: String = "",
+    @SerialName("full_path") val fullPath: String = "",
+    val markdown: String = "",
 )
 
 /** A merge request from `/projects/:id/merge_requests` (list) or `/merge_requests/:iid` (detail). */
@@ -829,6 +846,41 @@ class GitLabApiClient(
     ): GitLabResult<ByteArray> {
         val encodedFilename = URLEncoder.encode(filename, StandardCharsets.UTF_8)
         return getBytes("/projects/$projectId/uploads/$secret/$encodedFilename")
+    }
+
+    /**
+     * Uploads [bytes] as [filename] to `POST /projects/:id/uploads` (GLC-56) — the endpoint that
+     * backs the composer's clip button. The request carries a hand-built `multipart/form-data` body
+     * (the JDK [HttpClient] has no multipart publisher) with a single `file` part declaring [filename]
+     * and [contentType]; [buildFileMultipart] does the byte encoding so it stays independently
+     * testable, and a fresh random [boundary] guarantees it never collides with the payload. GitLab
+     * answers `201` with the created upload JSON — decoded to [GitLabUpload], whose
+     * [GitLabUpload.markdown] the caret insertion uses; any non-2xx becomes [GitLabResult.HttpError]
+     * (e.g. `413` when the instance's attachment size limit is exceeded) and a transport failure a
+     * [GitLabResult.NetworkError].
+     */
+    suspend fun uploadProjectFile(
+        projectId: Long,
+        filename: String,
+        bytes: ByteArray,
+        contentType: String,
+    ): GitLabResult<GitLabUpload> {
+        val boundary = "GitLabCockpitBoundary" + UUID.randomUUID().toString().replace("-", "")
+        val multipart = buildFileMultipart(boundary, filename, contentType, bytes)
+        val request = try {
+            HttpRequest.newBuilder()
+                .uri(URI.create("$apiBase/projects/$projectId/uploads"))
+                .timeout(REQUEST_TIMEOUT)
+                .header("PRIVATE-TOKEN", tokenProvider().orEmpty())
+                .header("Content-Type", multipart.contentType)
+                .POST(HttpRequest.BodyPublishers.ofByteArray(multipart.body))
+                .build()
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            return GitLabResult.NetworkError(e)
+        }
+        return send(request, GitLabUpload.serializer())
     }
 
     /** Calls `GET /projects/:id/merge_requests/:iid/discussions?per_page=100` — the MR's threads. */
