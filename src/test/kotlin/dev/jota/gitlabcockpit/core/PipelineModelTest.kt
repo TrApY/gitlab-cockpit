@@ -257,6 +257,56 @@ class PipelineModelTest {
         assertEquals(listOf(head, pipeline(1)), mergeHeadPipeline(list, head))
     }
 
+    // --- mergePostMergePipelines (GLC-62) -----------------------------------------------------
+
+    @Test
+    fun `mergePostMergePipelines prepends post-merge pipelines missing from the list`() {
+        val list = listOf(pipeline(1), pipeline(2))
+        val postMerge = listOf(pipeline(9, status = "failed"))
+        assertEquals(
+            listOf(pipeline(9, status = "failed"), pipeline(1), pipeline(2)),
+            mergePostMergePipelines(list, postMerge),
+        )
+    }
+
+    @Test
+    fun `mergePostMergePipelines does not duplicate a post-merge pipeline already present by id`() {
+        val list = listOf(pipeline(1), pipeline(2))
+        // id 2 already present (even with a different status) → only the missing id 9 is prepended.
+        val postMerge = listOf(pipeline(9), pipeline(2, status = "failed"))
+        assertEquals(
+            listOf(pipeline(9), pipeline(1), pipeline(2)),
+            mergePostMergePipelines(list, postMerge),
+        )
+    }
+
+    @Test
+    fun `mergePostMergePipelines returns the list unchanged when there are no post-merge pipelines`() {
+        val list = listOf(pipeline(1), pipeline(2))
+        assertEquals(list, mergePostMergePipelines(list, emptyList()))
+    }
+
+    @Test
+    fun `mergePostMergePipelines yields the post-merge pipelines when the MR list is empty`() {
+        val postMerge = listOf(pipeline(9), pipeline(8))
+        assertEquals(postMerge, mergePostMergePipelines(emptyList(), postMerge))
+    }
+
+    @Test
+    fun `mergePostMergePipelines with both lists empty is empty`() {
+        assertEquals(emptyList<GitLabPipeline>(), mergePostMergePipelines(emptyList(), emptyList()))
+    }
+
+    @Test
+    fun `mergePostMergePipelines keeps a stable order when prepending several`() {
+        val list = listOf(pipeline(1))
+        val postMerge = listOf(pipeline(30), pipeline(20), pipeline(10))
+        assertEquals(
+            listOf(pipeline(30), pipeline(20), pipeline(10), pipeline(1)),
+            mergePostMergePipelines(list, postMerge),
+        )
+    }
+
     // --- isPipelineLive (GLC-43 B) ------------------------------------------------------------
 
     @Test

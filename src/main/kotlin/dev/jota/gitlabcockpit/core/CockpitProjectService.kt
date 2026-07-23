@@ -494,6 +494,15 @@ class CockpitProjectService(
     suspend fun getMrPipelines(ref: MrRef): GitLabResult<List<GitLabPipeline>> =
         withClientAndProject { client, _ -> client.getMrPipelines(ref.projectId, ref.iid) }
 
+    /**
+     * Pipelines that ran on a commit [sha] (a commit's pipelines are few), for a merged MR's
+     * post-merge pipeline — the target-branch run of the merge commit that
+     * `/merge_requests/:iid/pipelines` omits (GLC-62). See
+     * [dev.jota.gitlabcockpit.core.mergePostMergePipelines].
+     */
+    suspend fun getProjectPipelines(projectId: Long, sha: String): GitLabResult<List<GitLabPipeline>> =
+        withClientAndProject { client, _ -> client.getProjectPipelines(projectId, sha) }
+
     /** All jobs of a pipeline (stage-ordered), for the stage → job tree. */
     suspend fun getPipelineJobs(projectId: Long, pipelineId: Long): GitLabResult<List<GitLabJob>> =
         withClientAndProject { client, _ -> client.getPipelineJobs(projectId, pipelineId) }

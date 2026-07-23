@@ -804,8 +804,12 @@ class MrDetailPanel(
         draftBanner.isVisible = false
         setTimelineTabTitle(null)
 
-        // Rebind the pipelines drill-in; it reloads lazily the first time its card is shown.
-        pipelinesPanel.setMr(ref, mr.sourceBranch, mr.headPipeline)
+        // Rebind the pipelines drill-in; it reloads lazily the first time its card is shown. For a
+        // merged MR, pass the merge commit's SHA (squash commit when squashed) so the Pipelines tab can
+        // also surface the post-merge (target-branch) pipeline that /merge_requests/:iid/pipelines omits
+        // (GLC-62); null for any other state.
+        val postMergeSha = if (mr.state == "merged") mr.mergeCommitSha ?: mr.squashCommitSha else null
+        pipelinesPanel.setMr(ref, mr.sourceBranch, mr.headPipeline, postMergeSha)
 
         // Rebind the changes tree; it is always visible now, so it is (re)loaded eagerly below.
         changesPanel.setMr(ref, mr.diffRefs, projectWebUrlOf(mr))

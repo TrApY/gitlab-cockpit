@@ -36,6 +36,7 @@ import dev.jota.gitlabcockpit.core.isJobPlayable
 import dev.jota.gitlabcockpit.core.isJobRetryable
 import dev.jota.gitlabcockpit.core.isPipelineLive
 import dev.jota.gitlabcockpit.core.mergeHeadPipeline
+import dev.jota.gitlabcockpit.core.mergePostMergePipelines
 import dev.jota.gitlabcockpit.core.stagesToExpand
 import dev.jota.gitlabcockpit.settings.GitLabCockpitSettings
 import dev.jota.gitlabcockpit.ui.log.JobLogVirtualFile
@@ -184,6 +185,25 @@ class PipelinesPanel(
      */
     private var headPipeline: GitLabPipeline? = null
 
+    /**
+     * The SHA of a merged MR's merge commit (`merge_commit_sha`, or `squash_commit_sha` when squashed),
+     * set by [setMr]; null for an open MR or when GitLab did not report it. When non-null, the pipelines
+     * that ran on that commit — the target-branch (master/develop) run that
+     * `/merge_requests/:iid/pipelines` omits — are fetched and folded into the combo by [loadPipelines]
+     * and the poll's list refresh (GLC-62).
+     */
+    private var postMergeSha: String? = null
+
+    /**
+     * The post-merge pipelines from the last successful fetch (GLC-62), kept so a later transient fetch
+     * failure reuses them (the MR list still shows) instead of dropping the post-merge pipeline from the
+     * combo. Reset whenever the bound MR changes.
+     */
+    private var lastPostMergePipelines: List<GitLabPipeline> = emptyList()
+
+    /** Ids of [lastPostMergePipelines]; the combo prefixes exactly these items with "post-merge ·". */
+    private var postMergePipelineIds: Set<Long> = emptySet()
+
     /** The ref whose pipelines have been loaded, so the tab only reloads when it changes. */
     private var loadedForRef: MrRef? = null
 
@@ -233,7 +253,7 @@ class PipelinesPanel(
     private var lastHeadAggregate: String? = null
 
     private val pipelineCombo = ComboBox<GitLabPipeline>().apply {
-        renderer = textCellRenderer<GitLabPipeline>("") { pipelineLabel(it) }
+        renderer = textCellRenderer<GitLabPipeline>("") { comboLabel(it) }
     }
 
     private val refreshButton = JButton(AllIcons.Actions.Refresh).apply {
@@ -364,14 +384,19 @@ class PipelinesPanel(
     // --- Lifecycle called by MrDetailPanel ----------------------------------------------------
 
     /**
-     * Binds this tab to [iid] / [branch] and marks the pipelines as needing a (re)load. [headPipeline]
+     * Binds this tab to [ref] / [branch] and marks the pipelines as needing a (re)load. [headPipeline]
      * is the MR detail's `head_pipeline`, folded into the loaded list by [loadPipelines] so external
-     * pipelines still show even when `/pipelines` returns nothing.
+     * pipelines still show even when `/pipelines` returns nothing. [postMergeSha] is a merged MR's
+     * merge-commit SHA (see [postMergeSha]); when non-null the pipelines of that commit — the
+     * target-branch (master/develop) run — are folded in too (GLC-62), null for an open MR.
      */
-    fun setMr(ref: MrRef, branch: String, headPipeline: GitLabPipeline?) {
+    fun setMr(ref: MrRef, branch: String, headPipeline: GitLabPipeline?, postMergeSha: String? = null) {
         currentRef = ref
         sourceBranch = branch
         this.headPipeline = headPipeline
+        this.postMergeSha = postMergeSha
+        lastPostMergePipelines = emptyList()
+        postMergePipelineIds = emptySet()
         loadedForRef = null
         selectedPipelineId = null
         stopPolling()
@@ -392,6 +417,9 @@ class PipelinesPanel(
         currentRef = null
         sourceBranch = null
         headPipeline = null
+        postMergeSha = null
+        lastPostMergePipelines = emptyList()
+        postMergePipelineIds = emptySet()
         loadedForRef = null
         selectedPipelineId = null
         stopPolling()
@@ -469,11 +497,14 @@ class PipelinesPanel(
                 if (selectedPipelineId != pipelineId) break
                 if (cycle % PIPELINE_LIST_EVERY == 0) {
                     val listResult = service.getMrPipelines(ref)
+                    val postMergeResult = fetchPostMerge(ref)
                     withContext(Dispatchers.EDT) {
                         if (currentRef == ref && selectedPipelineId == pipelineId &&
                             listResult is GitLabResult.Success
                         ) {
-                            refreshPipelinesInPlace(mergeHeadPipeline(listResult.data, headPipeline))
+                            refreshPipelinesInPlace(
+                                withPostMerge(mergeHeadPipeline(listResult.data, headPipeline), postMergeResult),
+                            )
                         }
                     }
                 }
@@ -537,10 +568,12 @@ class PipelinesPanel(
         pipelinesJob?.cancel()
         pipelinesJob = service.coroutineScope.launch {
             val result = service.getMrPipelines(ref)
+            val postMergeResult = fetchPostMerge(ref)
             withContext(Dispatchers.EDT) {
                 if (currentRef != ref) return@withContext
                 when (result) {
-                    is GitLabResult.Success -> renderPipelines(mergeHeadPipeline(result.data, headPipeline))
+                    is GitLabResult.Success ->
+                        renderPipelines(withPostMerge(mergeHeadPipeline(result.data, headPipeline), postMergeResult))
                     else -> {
                         loadedForRef = null
                         tree.emptyText.text = CockpitBundle.message("pipelines.error.pipelines", describe(result))
@@ -548,6 +581,32 @@ class PipelinesPanel(
                 }
             }
         }
+    }
+
+    /**
+     * Off-EDT. Fetches the pipelines of the merged MR's merge commit ([postMergeSha]) — the
+     * target-branch run `/merge_requests/:iid/pipelines` omits (GLC-62) — or null when the MR is not
+     * merged (no SHA to query). Failures are returned as-is; [withPostMerge] decides how to fold them.
+     */
+    private suspend fun fetchPostMerge(ref: MrRef): GitLabResult<List<GitLabPipeline>>? =
+        postMergeSha?.let { service.getProjectPipelines(ref.projectId, it) }
+
+    /**
+     * EDT. Folds a post-merge pipelines fetch into [mrPipelines] (already [mergeHeadPipeline]-merged):
+     * a successful [postMergeResult] replaces the remembered post-merge list and the label id set; a
+     * failed or absent one (no merge SHA) reuses the last known list, so a transient failure never drops
+     * the post-merge pipeline from the combo (the ticket's "ignore the failure, show the MR list"). The
+     * fold itself is the pure [mergePostMergePipelines].
+     */
+    private fun withPostMerge(
+        mrPipelines: List<GitLabPipeline>,
+        postMergeResult: GitLabResult<List<GitLabPipeline>>?,
+    ): List<GitLabPipeline> {
+        if (postMergeResult is GitLabResult.Success) {
+            lastPostMergePipelines = postMergeResult.data
+            postMergePipelineIds = postMergeResult.data.mapTo(mutableSetOf()) { it.id }
+        }
+        return mergePostMergePipelines(mrPipelines, lastPostMergePipelines)
     }
 
     /** EDT. Fills the combo and selects the target pipeline, then loads its jobs. */
@@ -658,6 +717,20 @@ class PipelinesPanel(
         suppressComboEvents = false
         updatePipelineButtons(target.status)
     }
+
+    /**
+     * The combo label for [pipeline]: the shared `#id · status · ref · when` ([pipelineLabel]) prefixed
+     * with "post-merge ·" when the pipeline is one of the post-merge ones from the last fetch
+     * ([postMergePipelineIds]) — the target-branch run of a merged MR's merge commit (GLC-62). The ref
+     * segment already shows the target branch (master/develop), so the prefix only flags *why* it is
+     * there. Read by the combo renderer at paint time, after [withPostMerge] refreshed the id set.
+     */
+    private fun comboLabel(pipeline: GitLabPipeline): String =
+        if (pipeline.id in postMergePipelineIds) {
+            CockpitBundle.message("pipelines.postMerge.prefix") + " · " + pipelineLabel(pipeline)
+        } else {
+            pipelineLabel(pipeline)
+        }
 
     /** The persisted "Show all stages" flag the render paths read (GLC-59). */
     private fun showAllStages(): Boolean = GitLabCockpitSettings.getInstance().pipelinesShowAllStages

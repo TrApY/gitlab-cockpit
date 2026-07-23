@@ -176,3 +176,27 @@ fun mergeHeadPipeline(pipelines: List<GitLabPipeline>, head: GitLabPipeline?): L
     if (pipelines.any { it.id == head.id }) return pipelines
     return listOf(head) + pipelines
 }
+
+/**
+ * Folds a merged MR's [postMerge] pipelines into the list `/merge_requests/:iid/pipelines` returned
+ * (already [mergeHeadPipeline]-merged). That endpoint stops at the MR's *source* branch, so the
+ * pipeline CI runs on the *target* branch (master/develop) for the merge commit — the one that can
+ * fail after the merge — never appears there. [postMerge] comes from
+ * `GET /projects/:id/pipelines?sha=<merge_sha>`. Mirroring [mergeHeadPipeline]:
+ *
+ * - [postMerge] empty → [pipelines] unchanged (nothing to merge).
+ * - every post-merge pipeline already in [pipelines] (same [GitLabPipeline.id]) is skipped, so it is
+ *   never duplicated (and a repeated id inside [postMerge] is prepended only once).
+ * - the rest are **prepended**, keeping their order, ahead of [pipelines] — they are the most recent,
+ *   most relevant runs right after the merge.
+ */
+fun mergePostMergePipelines(
+    pipelines: List<GitLabPipeline>,
+    postMerge: List<GitLabPipeline>,
+): List<GitLabPipeline> {
+    if (postMerge.isEmpty()) return pipelines
+    val seen = pipelines.mapTo(mutableSetOf()) { it.id }
+    val prepend = postMerge.filter { seen.add(it.id) }
+    if (prepend.isEmpty()) return pipelines
+    return prepend + pipelines
+}

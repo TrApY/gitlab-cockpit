@@ -4,6 +4,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- The Pipelines view now also shows a merged merge request's post-merge pipeline — the pipeline CI runs on the target branch (e.g. `master`/`develop`) for the merge commit, which `/merge_requests/:iid/pipelines` does not list. So when an MR is merged and its target-branch pipeline then fails, that pipeline (with its jobs, stages and live refresh) now surfaces in the plugin instead of silently missing; post-merge pipelines are prefixed with "post-merge ·" in the pipeline combo, and a failed post-merge fetch is ignored (the MR's own pipelines still show) (GLC-62)
+
 ## [0.16.0] - 2026-07-23
 
 ### Added

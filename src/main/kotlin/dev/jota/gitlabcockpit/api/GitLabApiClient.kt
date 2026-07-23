@@ -143,6 +143,20 @@ data class GitLabMergeRequest(
     @SerialName("merged_at") val mergedAt: String? = null,
     /** ISO-8601 close timestamp; present only once the MR is closed. */
     @SerialName("closed_at") val closedAt: String? = null,
+    /**
+     * The SHA of the merge commit CI ran on the target branch (`merge_commit_sha`), present only once
+     * the MR is merged **without** squashing. It is the commit the plugin fetches the post-merge
+     * pipeline for — the target-branch (master/develop) run that `/merge_requests/:iid/pipelines`
+     * never lists (GLC-62); nullable because open MRs and squashed merges do not carry it (then
+     * [squashCommitSha] does). See [dev.jota.gitlabcockpit.core.mergePostMergePipelines].
+     */
+    @SerialName("merge_commit_sha") val mergeCommitSha: String? = null,
+    /**
+     * The SHA of the squashed merge commit (`squash_commit_sha`), present instead of [mergeCommitSha]
+     * once a *squashing* merge completes. Used as the post-merge pipeline's commit when it is set and
+     * [mergeCommitSha] is not (GLC-62); nullable for open MRs and non-squashed merges.
+     */
+    @SerialName("squash_commit_sha") val squashCommitSha: String? = null,
     /** Whether the MR is set to squash its commits on merge; the default pre-check of the merge dialog. */
     val squash: Boolean = false,
     /**
@@ -1112,6 +1126,20 @@ class GitLabApiClient(
         get(
             "/projects/$projectId/merge_requests/$mrIid/pipelines",
             listOf("per_page" to "100"),
+            ListSerializer(GitLabPipeline.serializer()),
+        )
+
+    /**
+     * Calls `GET /projects/:id/pipelines?sha=<sha>&per_page=20` — the pipelines that ran on the commit
+     * [sha] (newest-first). A single commit has few pipelines, so one small page suffices. Used to
+     * surface a merged MR's post-merge pipeline: the target-branch (master/develop) run of the merge
+     * commit, which `/merge_requests/:iid/pipelines` does not include (GLC-62). See
+     * [dev.jota.gitlabcockpit.core.mergePostMergePipelines].
+     */
+    suspend fun getProjectPipelines(projectId: Long, sha: String): GitLabResult<List<GitLabPipeline>> =
+        get(
+            "/projects/$projectId/pipelines",
+            listOf("sha" to sha, "per_page" to "20"),
             ListSerializer(GitLabPipeline.serializer()),
         )
 

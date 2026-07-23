@@ -160,6 +160,52 @@ class GitLabModelSerializationTest {
     }
 
     @Test
+    fun `merge request parses merge_commit_sha and squash_commit_sha when present`() {
+        val payload = """
+            {
+              "iid": 42,
+              "project_id": 100,
+              "title": "Merged MR",
+              "state": "merged",
+              "source_branch": "feature",
+              "target_branch": "develop",
+              "web_url": "https://gitlab.com/g/r/-/merge_requests/42",
+              "updated_at": "2026-07-15T10:00:00Z",
+              "merge_commit_sha": "mergesha123",
+              "squash_commit_sha": "squashsha456",
+              "author": {"id": 1, "username": "jota", "name": "Jo Ta"}
+            }
+        """.trimIndent()
+
+        val mr = json.decodeFromString<GitLabMergeRequest>(payload)
+
+        assertEquals("mergesha123", mr.mergeCommitSha)
+        assertEquals("squashsha456", mr.squashCommitSha)
+    }
+
+    @Test
+    fun `merge request defaults merge_commit_sha and squash_commit_sha to null when absent`() {
+        val payload = """
+            {
+              "iid": 42,
+              "project_id": 100,
+              "title": "Open MR",
+              "state": "opened",
+              "source_branch": "feature",
+              "target_branch": "develop",
+              "web_url": "https://gitlab.com/g/r/-/merge_requests/42",
+              "updated_at": "2026-07-15T10:00:00Z",
+              "author": {"id": 1, "username": "jota", "name": "Jo Ta"}
+            }
+        """.trimIndent()
+
+        val mr = json.decodeFromString<GitLabMergeRequest>(payload)
+
+        assertNull(mr.mergeCommitSha)
+        assertNull(mr.squashCommitSha)
+    }
+
+    @Test
     fun `approvals parses approvals_required and approvals_left when present`() {
         val approvals = json.decodeFromString<GitLabApprovals>(
             """{"approvals_required": 2, "approvals_left": 1, "approved_by": []}""",
