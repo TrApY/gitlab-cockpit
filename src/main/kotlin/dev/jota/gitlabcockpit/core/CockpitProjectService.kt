@@ -10,6 +10,7 @@ import dev.jota.gitlabcockpit.api.GitLabApiClient
 import dev.jota.gitlabcockpit.api.GitLabApprovals
 import dev.jota.gitlabcockpit.api.GitLabAward
 import dev.jota.gitlabcockpit.api.GitLabBranch
+import dev.jota.gitlabcockpit.api.GitLabBridge
 import dev.jota.gitlabcockpit.api.GitLabDiffFile
 import dev.jota.gitlabcockpit.api.GitLabDiscussion
 import dev.jota.gitlabcockpit.api.GitLabDiscussionNote
@@ -496,6 +497,10 @@ class CockpitProjectService(
     /** All jobs of a pipeline (stage-ordered), for the stage → job tree. */
     suspend fun getPipelineJobs(projectId: Long, pipelineId: Long): GitLabResult<List<GitLabJob>> =
         withClientAndProject { client, _ -> client.getPipelineJobs(projectId, pipelineId) }
+
+    /** The bridge (trigger) jobs of a pipeline and the downstream pipelines they started (GLC-60). */
+    suspend fun getPipelineBridges(projectId: Long, pipelineId: Long): GitLabResult<List<GitLabBridge>> =
+        withClientAndProject { client, _ -> client.getPipelineBridges(projectId, pipelineId) }
 
     /** Retries a whole pipeline. */
     suspend fun retryPipeline(projectId: Long, pipelineId: Long): GitLabResult<Unit> =

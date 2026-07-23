@@ -338,6 +338,34 @@ data class GitLabJob(
 )
 
 /**
+ * A bridge (trigger) job of a pipeline (`/pipelines/:id/bridges`): a job whose sole purpose is to
+ * start another pipeline. [status] is the bridge job's own status; [downstream] is the pipeline it
+ * triggered — **null** while the bridge has not fired yet (e.g. still `created` / `manual`), so a not
+ * yet triggered bridge carries no downstream pipeline. Unknown fields are ignored by the configured
+ * [Json].
+ */
+@Serializable
+data class GitLabBridge(
+    val name: String,
+    val status: String,
+    @SerialName("downstream_pipeline") val downstream: GitLabDownstreamPipeline? = null,
+)
+
+/**
+ * The pipeline a [GitLabBridge] triggered, possibly in **another** project of the group (the real
+ * cross-project case: an MR pipeline triggering a `release-management` pipeline elsewhere).
+ * [projectId] is that other project's id — the id to fetch its jobs with — and [status] mirrors
+ * [GitLabPipeline.status]. Unknown fields are ignored by the configured [Json].
+ */
+@Serializable
+data class GitLabDownstreamPipeline(
+    val id: Long,
+    @SerialName("project_id") val projectId: Long,
+    val status: String,
+    @SerialName("web_url") val webUrl: String,
+)
+
+/**
  * A slice of a CI job's raw trace (`/jobs/:job_id/trace`, plain text — not JSON). [content] is the
  * new text that starts at the requested offset; [nextOffset] is the byte offset the next incremental
  * poll should resume from (counted in UTF-8 bytes so it lines up with the `Range: bytes=` header).
@@ -1093,6 +1121,18 @@ class GitLabApiClient(
             "/projects/$projectId/pipelines/$pipelineId/jobs",
             listOf("per_page" to "100"),
             ListSerializer(GitLabJob.serializer()),
+        )
+
+    /**
+     * Calls `GET /projects/:id/pipelines/:pipeline_id/bridges?per_page=100` — the pipeline's bridge
+     * (trigger) jobs and the downstream pipelines they started (GLC-60). A single page is enough: a
+     * pipeline never has 100 bridges, so no pagination loop is needed.
+     */
+    suspend fun getPipelineBridges(projectId: Long, pipelineId: Long): GitLabResult<List<GitLabBridge>> =
+        get(
+            "/projects/$projectId/pipelines/$pipelineId/bridges",
+            listOf("per_page" to "100"),
+            ListSerializer(GitLabBridge.serializer()),
         )
 
     /** Calls `GET /projects/:id/jobs/:job_id` — a single job, used to poll its status while streaming. */

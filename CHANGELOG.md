@@ -4,6 +4,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- The Pipelines view now shows the downstream pipelines a pipeline's bridges (trigger jobs) started, as "→ <bridge> #<id> · <status>" rows after the stages — so a merge-request pipeline that triggers a `release-management` pipeline in another project of the group now surfaces that pipeline (and its failures) in the plugin; a failed downstream auto-expands, expanding one lazily loads that (possibly cross-project) pipeline's stages, a load failure (e.g. a 403 on a project you cannot read) shows an inline error instead of breaking the view, and the stage strip gains a "→" separator with one status dot per downstream (GLC-60)
+
 ### Changed
 
 - The Pipelines view is now compact and attention-first: fully passed stages fold into a single expandable "N stages passed (M jobs)" row and single-job stages flatten to one "stage · job" line, so only stages needing attention (failed, running, pending, manual, canceled, warning) keep their own row; a persisted "Show all stages" checkbox restores the classic full tree, and expansion/selection survive the live 5-second refresh (GLC-59)

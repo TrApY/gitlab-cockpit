@@ -390,4 +390,61 @@ class GitLabModelSerializationTest {
         assertEquals("feature/x", branch.name)
         assertFalse(branch.default)
     }
+
+    @Test
+    fun `bridge parses the downstream pipeline and ignores unknown fields`() {
+        // Real GET /projects/:id/pipelines/:pipeline_id/bridges item (GLC-60): a trigger job carrying
+        // the downstream_pipeline it started, here in another project of the group. id/stage/sha/ref
+        // and allow_failure are all ignored — only name/status/downstream_pipeline are modeled.
+        val payload = """
+            {
+              "id": 4001,
+              "name": "trigger-release-management",
+              "stage": "release",
+              "status": "failed",
+              "allow_failure": false,
+              "downstream_pipeline": {
+                "id": 9002,
+                "sha": "abc123",
+                "ref": "main",
+                "status": "failed",
+                "project_id": 555,
+                "web_url": "https://gitlab.com/g/release-management/-/pipelines/9002"
+              }
+            }
+        """.trimIndent()
+
+        val bridge = json.decodeFromString<GitLabBridge>(payload)
+
+        assertEquals("trigger-release-management", bridge.name)
+        assertEquals("failed", bridge.status)
+        val downstream = bridge.downstream
+        assertNotNull(downstream)
+        assertEquals(9002L, downstream!!.id)
+        assertEquals(555L, downstream.projectId)
+        assertEquals("failed", downstream.status)
+        assertEquals("https://gitlab.com/g/release-management/-/pipelines/9002", downstream.webUrl)
+    }
+
+    @Test
+    fun `bridge without a downstream pipeline defaults it to null`() {
+        // A bridge that has not fired yet (e.g. a manual trigger) omits downstream_pipeline entirely.
+        val bridge = json.decodeFromString<GitLabBridge>(
+            """{"id": 4002, "name": "trigger-not-yet", "status": "manual"}""",
+        )
+
+        assertEquals("trigger-not-yet", bridge.name)
+        assertEquals("manual", bridge.status)
+        assertNull(bridge.downstream)
+    }
+
+    @Test
+    fun `bridge with an explicit null downstream pipeline parses as null`() {
+        // GitLab may also serialize the field explicitly as null before the bridge triggers.
+        val bridge = json.decodeFromString<GitLabBridge>(
+            """{"id": 4003, "name": "trigger", "status": "created", "downstream_pipeline": null}""",
+        )
+
+        assertNull(bridge.downstream)
+    }
 }

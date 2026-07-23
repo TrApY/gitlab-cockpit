@@ -18,6 +18,8 @@ import com.intellij.ui.components.panels.VerticalLayout
 import com.intellij.ui.treeStructure.Tree
 import com.intellij.util.ui.JBUI
 import dev.jota.gitlabcockpit.CockpitBundle
+import dev.jota.gitlabcockpit.api.GitLabBridge
+import dev.jota.gitlabcockpit.api.GitLabDownstreamPipeline
 import dev.jota.gitlabcockpit.api.GitLabJob
 import dev.jota.gitlabcockpit.api.GitLabPipeline
 import dev.jota.gitlabcockpit.api.GitLabResult
@@ -54,6 +56,8 @@ import javax.swing.JMenuItem
 import javax.swing.JPanel
 import javax.swing.JPopupMenu
 import javax.swing.JTree
+import javax.swing.event.TreeExpansionEvent
+import javax.swing.event.TreeWillExpandListener
 import javax.swing.tree.DefaultMutableTreeNode
 import javax.swing.tree.DefaultTreeModel
 import javax.swing.tree.TreePath
@@ -76,12 +80,51 @@ private data class FlatStageNodeData(val stage: StageGroup) {
 private data class SummaryNodeData(val summary: PipelineRow.Summary)
 
 /**
- * What the tree had selected before an in-place rebuild, reduced to identities that survive it
- * (GLC-59): a job id (job rows and flattened `stage · job` rows), a stage name (stage rows and
- * flattened rows, as the fallback when the job disappeared) and whether the summary row itself was
- * selected.
+ * Tree node payload for a downstream pipeline a bridge (trigger job) started, shown as a top-level
+ * "→ <bridge name> #<downstream id> · <status>" row after the stage rows (GLC-60). When the bridge
+ * has not fired yet ([GitLabBridge.downstream] is null) the row carries the bridge's own status and
+ * has no children; otherwise its children are the downstream's stages, lazily loaded on first expand.
  */
-private data class SelectionSnapshot(val jobId: Long?, val stageName: String?, val summary: Boolean)
+private data class DownstreamNodeData(val bridge: GitLabBridge)
+
+/**
+ * Placeholder child under a downstream row whose jobs have not been fetched yet (GLC-60): it gives the
+ * row an expand handle and shows "Loading jobs…" while the fetch the expansion kicks off is in flight.
+ */
+private object DownstreamLoadingNodeData
+
+/**
+ * Child row shown under a downstream row when fetching its jobs failed (GLC-60) — typically a `403`
+ * on a cross-project downstream the user cannot read. Carries the already-localized [message]; a
+ * failed fetch never breaks the rest of the tree.
+ */
+private data class DownstreamErrorNodeData(val message: String)
+
+/**
+ * The lazily-loaded state of one downstream pipeline's jobs, cached by downstream pipeline id so it
+ * survives the whole-tree rebuild every poll / view-toggle does (GLC-60). Absent from the cache means
+ * "not fetched yet" (rendered as [DownstreamLoadingNodeData]).
+ */
+private sealed interface DownstreamState {
+    /** The downstream's jobs, fetched successfully; rendered as compact stage rows. */
+    data class Loaded(val jobs: List<GitLabJob>) : DownstreamState
+
+    /** The fetch failed; [message] is the localized error rendered as a single child row. */
+    data class Failed(val message: String) : DownstreamState
+}
+
+/**
+ * What the tree had selected before an in-place rebuild, reduced to identities that survive it
+ * (GLC-59, extended GLC-60): a job id (job rows and flattened `stage · job` rows), a stage name (stage
+ * rows and flattened rows, as the fallback when the job disappeared), whether the summary row itself
+ * was selected, and the downstream pipeline id when a downstream row was selected.
+ */
+private data class SelectionSnapshot(
+    val jobId: Long?,
+    val stageName: String?,
+    val summary: Boolean,
+    val downstreamId: Long?,
+)
 
 /**
  * The "Pipelines" tab of the MR detail. Shows the pipelines a merge request has triggered and lets
@@ -96,6 +139,11 @@ private data class SelectionSnapshot(val jobId: Long?, val stageName: String?, v
  *   collapsed "N stages passed (M jobs)" summary row placed last; failed multi-job stages are
  *   auto-expanded. A persisted "Show all stages" checkbox ([GitLabCockpitSettings]) restores the
  *   classic stage → job tree (no summary, no flattening), re-rendering in place without a re-fetch,
+ * - the downstream pipelines the pipeline's bridges (trigger jobs) started, shown after the stage
+ *   rows as "→ <bridge> #<id> · <status>" rows (GLC-60); a failed downstream auto-expands, and
+ *   expanding one lazily fetches that (possibly cross-project) pipeline's jobs and paints its stages
+ *   below — a fetch failure (e.g. a `403` on a project the user cannot read) shows an error child
+ *   instead of breaking the view,
  * - a toolbar to retry / cancel the selected pipeline and a right-click menu to retry a stage's
  *   failed jobs or retry / cancel / play / open a single job (flattened rows get the job menu).
  *
@@ -161,6 +209,26 @@ class PipelinesPanel(
     /** The jobs last rendered into the tree; the poll's start guard reads their liveness. */
     private var lastRenderedJobs: List<GitLabJob> = emptyList()
 
+    /**
+     * The bridges (downstream trigger jobs) last rendered as "→ …" rows (GLC-60). Kept as a field so
+     * every rebuild path (poll refresh, the show-all toggle, the strip) reads the same list without a
+     * re-fetch; the poll refreshes it, the toggle leaves it untouched.
+     */
+    private var lastRenderedBridges: List<GitLabBridge> = emptyList()
+
+    /**
+     * Lazily-loaded jobs of expanded downstream pipelines, keyed by downstream pipeline id (GLC-60).
+     * Populated on first expand and refreshed by the poll; survives the whole-tree rebuild so an open
+     * downstream keeps its stages across refreshes and the show-all toggle.
+     */
+    private val downstreamState = mutableMapOf<Long, DownstreamState>()
+
+    /** Downstream pipeline ids with a jobs fetch in flight, so an expand never fires a duplicate one. */
+    private val downstreamLoading = mutableSetOf<Long>()
+
+    /** The in-flight downstream jobs-load coroutines, by downstream pipeline id, cancelled on reset. */
+    private val downstreamJobsJobs = mutableMapOf<Long, Job>()
+
     /** Last head-pipeline aggregate status reported to the detail, so only real changes fire the callback. */
     private var lastHeadAggregate: String? = null
 
@@ -223,14 +291,44 @@ class PipelinesPanel(
             override fun onDoubleClick(event: MouseEvent): Boolean {
                 val path = tree.getPathForLocation(event.x, event.y) ?: return false
                 val node = path.lastPathComponent as? DefaultMutableTreeNode ?: return false
+                // GLC-60: inside a downstream, jobs live in another project, so double-click opens the
+                // job on GitLab (its absolute web URL) rather than the cross-project log viewer; a
+                // downstream stage row falls through to the tree's expand/collapse toggle.
+                val inDownstream = isInsideDownstream(node)
                 return when (val data = node.userObject) {
-                    is JobNodeData -> { openJobLog(data.job); true }
-                    is FlatStageNodeData -> { data.job?.let { openJobLog(it) }; true }
-                    is StageNodeData -> { openStageLogs(data.stage); true }
-                    else -> false // summary row: keep the tree's default expand/collapse toggle
+                    is JobNodeData -> {
+                        if (inDownstream) BrowserUtil.browse(data.job.webUrl) else openJobLog(data.job)
+                        true
+                    }
+                    is FlatStageNodeData -> {
+                        data.job?.let { if (inDownstream) BrowserUtil.browse(it.webUrl) else openJobLog(it) }
+                        true
+                    }
+                    is StageNodeData -> if (inDownstream) {
+                        false
+                    } else {
+                        openStageLogs(data.stage)
+                        true
+                    }
+                    else -> false // summary / downstream row: keep the tree's default expand/collapse toggle
                 }
             }
         }.installOn(tree)
+
+        // GLC-60: expanding a downstream row for the first time lazily fetches that (possibly
+        // cross-project) pipeline's jobs. The fetch is guarded so an already-loaded / in-flight
+        // downstream never re-triggers, which also makes the failed-downstream auto-expand safe.
+        tree.addTreeWillExpandListener(object : TreeWillExpandListener {
+            override fun treeWillExpand(event: TreeExpansionEvent) {
+                val node = event.path.lastPathComponent as? DefaultMutableTreeNode ?: return
+                val downstream = (node.userObject as? DownstreamNodeData)?.bridge?.downstream ?: return
+                if (downstream.id !in downstreamState && downstream.id !in downstreamLoading) {
+                    loadDownstreamJobs(downstream)
+                }
+            }
+
+            override fun treeWillCollapse(event: TreeExpansionEvent) = Unit
+        })
 
         // GLC-43 B: no timer may survive the tool window being hidden. When this panel stops showing,
         // the poll loop is cancelled; when it shows again it resumes if the card is up and still alive.
@@ -279,6 +377,7 @@ class PipelinesPanel(
         stopPolling()
         lastRenderedJobs = emptyList()
         lastHeadAggregate = headPipeline?.status
+        resetDownstreamState()
         pipelinesJob?.cancel()
         jobsJob?.cancel()
         actionJob?.cancel()
@@ -298,6 +397,7 @@ class PipelinesPanel(
         stopPolling()
         lastRenderedJobs = emptyList()
         lastHeadAggregate = null
+        resetDownstreamState()
         pipelinesJob?.cancel()
         jobsJob?.cancel()
         actionJob?.cancel()
@@ -336,9 +436,21 @@ class PipelinesPanel(
         if (!cardVisible || !isShowing) return
         if (pollJob?.isActive == true) return
         val pipeline = pipelineCombo.selectedItem as? GitLabPipeline ?: return
-        if (lastRenderedJobs.isNotEmpty() && !isPipelineLive(lastRenderedJobs)) return
+        if (lastRenderedJobs.isNotEmpty() && !isPipelineLive(lastRenderedJobs) &&
+            !hasLiveDownstream(lastRenderedBridges)
+        ) {
+            return
+        }
         startPollingLoop(pipeline.id)
     }
+
+    /**
+     * GLC-60: whether any bridge in [bridges] is still worth polling — its downstream pipeline (or the
+     * bridge itself, still waiting to trigger) is `created` / `pending` / `running` ([isJobCancelable]).
+     * Lets the poll outlive a terminal upstream so a downstream that fails afterwards still updates live.
+     */
+    private fun hasLiveDownstream(bridges: List<GitLabBridge>): Boolean =
+        bridges.any { isJobCancelable(it.status) || it.downstream?.let { ds -> isJobCancelable(ds.status) } == true }
 
     /**
      * The 5-second poll loop for [pipelineId]. Each cycle reloads that pipeline's jobs (and, every
@@ -366,14 +478,28 @@ class PipelinesPanel(
                     }
                 }
                 val jobsResult = service.getPipelineJobs(ref.projectId, pipelineId)
+                val bridgesResult = service.getPipelineBridges(ref.projectId, pipelineId)
+                // GLC-60: refresh the jobs of every currently expanded downstream in the same cycle, so
+                // an open downstream's stages stay live. Its expanded set is EDT state, snapshotted here.
+                val expandedDownstreams = withContext(Dispatchers.EDT) {
+                    if (currentRef == ref && selectedPipelineId == pipelineId) expandedDownstreamPipelines() else emptyList()
+                }
+                val refreshedDownstream = expandedDownstreams.associate { ds ->
+                    ds.id to service.getPipelineJobs(ds.projectId, ds.id)
+                }
                 val stop = withContext(Dispatchers.EDT) {
                     if (currentRef != ref || selectedPipelineId != pipelineId) return@withContext true
                     if (!cardVisible || !isShowing) return@withContext true
                     when (jobsResult) {
                         is GitLabResult.Success -> {
+                            for ((dsId, result) in refreshedDownstream) applyDownstreamResult(dsId, result)
+                            lastRenderedBridges = bridgesOrEmpty(bridgesResult)
                             refreshJobsInPlace(jobsResult.data)
                             maybeReportHeadStatus(pipelineId, jobsResult.data)
-                            !isPipelineLive(jobsResult.data)
+                            // GLC-60: keep polling while a downstream is still live even after the
+                            // upstream turned terminal — the ticket's case is a downstream that fails
+                            // after the MR pipeline already succeeded.
+                            !isPipelineLive(jobsResult.data) && !hasLiveDownstream(lastRenderedBridges)
                         }
                         else -> false
                     }
@@ -457,6 +583,8 @@ class PipelinesPanel(
         val ref = currentRef ?: return
         // A (re)load re-targets the tree; cancel any live poll — renderJobs restarts it for this pipeline.
         stopPolling()
+        // GLC-60: a new pipeline's bridges/downstreams are unrelated to the old one's; drop the caches.
+        resetDownstreamState()
         rootNode.removeAllChildren()
         treeModel.reload()
         stageStrip.removeAll()
@@ -467,10 +595,11 @@ class PipelinesPanel(
         jobsJob?.cancel()
         jobsJob = service.coroutineScope.launch {
             val result = service.getPipelineJobs(ref.projectId, pipeline.id)
+            val bridgesResult = service.getPipelineBridges(ref.projectId, pipeline.id)
             withContext(Dispatchers.EDT) {
                 if (currentRef != ref || selectedPipelineId != pipeline.id) return@withContext
                 when (result) {
-                    is GitLabResult.Success -> renderJobs(result.data)
+                    is GitLabResult.Success -> renderJobs(result.data, bridgesOrEmpty(bridgesResult))
                     else -> tree.emptyText.text = CockpitBundle.message("pipelines.error.jobs", describe(result))
                 }
             }
@@ -483,11 +612,12 @@ class PipelinesPanel(
      * resets the selection. Records the jobs and (re)starts live polling if the card is up and the
      * pipeline is still alive.
      */
-    private fun renderJobs(jobs: List<GitLabJob>) {
+    private fun renderJobs(jobs: List<GitLabJob>, bridges: List<GitLabBridge>) {
         val stages = groupByStage(jobs)
+        lastRenderedBridges = bridges
         rebuildRows(compactStages(stages, showAllStages()))
         treeModel.reload()
-        applyExpansion(stagesToExpand(emptySet(), stages), summaryExpanded = false)
+        applyExpansion(stagesToExpand(emptySet(), stages), summaryExpanded = false, expandedDownstreamIds = emptySet())
         tree.emptyText.text = if (jobs.isEmpty()) CockpitBundle.message("pipelines.jobs.empty") else ""
         renderStageStrip(stages)
         lastRenderedJobs = jobs
@@ -505,10 +635,11 @@ class PipelinesPanel(
         val stages = groupByStage(jobs)
         val previouslyExpanded = expandedStageNames()
         val summaryWasExpanded = isSummaryExpanded()
+        val expandedDownstreams = expandedDownstreamIds()
         val selection = selectionSnapshot()
         rebuildRows(compactStages(stages, showAllStages()))
         treeModel.reload()
-        applyExpansion(stagesToExpand(previouslyExpanded, stages), summaryWasExpanded)
+        applyExpansion(stagesToExpand(previouslyExpanded, stages), summaryWasExpanded, expandedDownstreams)
         restoreSelection(selection)
         tree.emptyText.text = if (jobs.isEmpty()) CockpitBundle.message("pipelines.jobs.empty") else ""
         renderStageStrip(stages)
@@ -539,13 +670,85 @@ class PipelinesPanel(
      */
     private fun onShowAllStagesToggled() {
         GitLabCockpitSettings.getInstance().pipelinesShowAllStages = showAllStagesCheckBox.isSelected
-        if (lastRenderedJobs.isNotEmpty()) refreshJobsInPlace(lastRenderedJobs)
+        if (lastRenderedJobs.isNotEmpty() || lastRenderedBridges.isNotEmpty()) refreshJobsInPlace(lastRenderedJobs)
     }
 
-    /** EDT. Rebuilds the row nodes under the (cleared) root from [rows]; no reload/expansion. */
+    /** The bridges of a bridges fetch, or empty when it failed: downstream rows are additive, never fatal. */
+    private fun bridgesOrEmpty(result: GitLabResult<List<GitLabBridge>>): List<GitLabBridge> =
+        (result as? GitLabResult.Success)?.data ?: emptyList()
+
+    /** EDT. Drops every downstream cache and cancels in-flight downstream loads (pipeline switch / clear). */
+    private fun resetDownstreamState() {
+        downstreamJobsJobs.values.forEach { it.cancel() }
+        downstreamJobsJobs.clear()
+        downstreamLoading.clear()
+        downstreamState.clear()
+        lastRenderedBridges = emptyList()
+    }
+
+    /**
+     * Off-EDT fetches [downstream]'s jobs (the pipeline may live in another project, hence its own
+     * [GitLabDownstreamPipeline.projectId]) and, back on the EDT, caches the result — [DownstreamState]
+     * Loaded or Failed — and re-renders in place so the downstream row shows its stages or an error
+     * child. Guarded by [downstreamLoading] so an expand never launches a duplicate; the whole set is
+     * cancelled by [resetDownstreamState] when the selected pipeline changes.
+     */
+    private fun loadDownstreamJobs(downstream: GitLabDownstreamPipeline) {
+        val ref = currentRef ?: return
+        val pipelineId = selectedPipelineId
+        val dsId = downstream.id
+        downstreamLoading.add(dsId)
+        val job = service.coroutineScope.launch {
+            val result = service.getPipelineJobs(downstream.projectId, dsId)
+            withContext(Dispatchers.EDT) {
+                downstreamLoading.remove(dsId)
+                downstreamJobsJobs.remove(dsId)
+                // Drop the result if the user moved to another MR or pipeline while it was in flight.
+                if (currentRef != ref || selectedPipelineId != pipelineId) return@withContext
+                applyDownstreamResult(dsId, result)
+                refreshJobsInPlace(lastRenderedJobs)
+            }
+        }
+        downstreamJobsJobs[dsId] = job
+    }
+
+    /** EDT. Caches a downstream jobs fetch as Loaded, or Failed with the localized load-error message. */
+    private fun applyDownstreamResult(dsId: Long, result: GitLabResult<List<GitLabJob>>) {
+        downstreamState[dsId] = when (result) {
+            is GitLabResult.Success -> DownstreamState.Loaded(result.data)
+            else -> DownstreamState.Failed(CockpitBundle.message("pipelines.downstream.loadError", describe(result)))
+        }
+    }
+
+    /**
+     * EDT. Rebuilds the row nodes under the (cleared) root from [rows], then appends one downstream
+     * row per bridge in [lastRenderedBridges] after them (GLC-60); no reload/expansion.
+     */
     private fun rebuildRows(rows: List<PipelineRow>) {
         rootNode.removeAllChildren()
         for (row in rows) rootNode.add(rowNode(row))
+        for (bridge in lastRenderedBridges) rootNode.add(downstreamNode(bridge))
+    }
+
+    /**
+     * The subtree one bridge renders as (GLC-60): a top-level [DownstreamNodeData] row. A bridge with
+     * no downstream pipeline (not fired yet) is a childless leaf. Otherwise its children come from the
+     * [downstreamState] cache — the downstream's jobs shaped by [compactStages] when loaded, a single
+     * [DownstreamErrorNodeData] when the fetch failed, or a [DownstreamLoadingNodeData] placeholder
+     * (which gives the row its expand handle) while the jobs are not fetched yet.
+     */
+    private fun downstreamNode(bridge: GitLabBridge): DefaultMutableTreeNode {
+        val node = DefaultMutableTreeNode(DownstreamNodeData(bridge))
+        val downstream = bridge.downstream ?: return node
+        when (val state = downstreamState[downstream.id]) {
+            is DownstreamState.Loaded -> {
+                val rows = compactStages(groupByStage(state.jobs), showAllStages())
+                for (row in rows) node.add(rowNode(row))
+            }
+            is DownstreamState.Failed -> node.add(DefaultMutableTreeNode(DownstreamErrorNodeData(state.message)))
+            null -> node.add(DefaultMutableTreeNode(DownstreamLoadingNodeData))
+        }
+        return node
     }
 
     /**
@@ -570,14 +773,25 @@ class PipelinesPanel(
      * parent chain, which would pop the summary open the moment a previously expanded stage turns
      * green and folds into it, defeating the collapse the compact view exists for.
      */
-    private fun applyExpansion(names: Set<String>, summaryExpanded: Boolean) {
+    private fun applyExpansion(names: Set<String>, summaryExpanded: Boolean, expandedDownstreamIds: Set<Long>) {
         val summary = summaryNode()
         if (summaryExpanded && summary != null) tree.expandPath(TreePath(summary.path))
         forEachNode { node ->
+            // Stages *inside* a downstream subtree are governed by the downstream loop below, not by the
+            // upstream name set — otherwise an upstream and a downstream stage of the same name collide.
+            if (isInsideDownstream(node)) return@forEachNode
             val stage = (node.userObject as? StageNodeData)?.stage ?: return@forEachNode
             if (stage.name !in names) return@forEachNode
             if (summary != null && node.parent === summary && !summaryExpanded) return@forEachNode
             tree.expandPath(TreePath(node.path))
+        }
+        // GLC-60: a downstream row re-opens when it was open before, or auto-expands when its downstream
+        // pipeline is failed (coherent with the failed-stage rule). Expanding a not-yet-loaded one kicks
+        // the lazy fetch via the TreeWillExpandListener; an already-loaded one just shows again.
+        forEachDownstreamNode { node, downstream ->
+            if (downstream.id in expandedDownstreamIds || downstream.status == "failed") {
+                tree.expandPath(TreePath(node.path))
+            }
         }
     }
 
@@ -589,10 +803,48 @@ class PipelinesPanel(
     private fun expandedStageNames(): Set<String> {
         val result = mutableSetOf<String>()
         forEachNode { node ->
+            if (isInsideDownstream(node)) return@forEachNode
             val stage = (node.userObject as? StageNodeData)?.stage ?: return@forEachNode
             if (tree.isExpanded(TreePath(node.path))) result.add(stage.name)
         }
         return result
+    }
+
+    /** EDT. The downstream pipeline ids whose top-level "→ …" row is currently expanded (GLC-60). */
+    private fun expandedDownstreamIds(): Set<Long> {
+        val result = mutableSetOf<Long>()
+        forEachDownstreamNode { node, downstream ->
+            if (tree.isExpanded(TreePath(node.path))) result.add(downstream.id)
+        }
+        return result
+    }
+
+    /** EDT. The downstream pipelines whose row is currently expanded; the poll re-fetches their jobs. */
+    private fun expandedDownstreamPipelines(): List<GitLabDownstreamPipeline> {
+        val result = mutableListOf<GitLabDownstreamPipeline>()
+        forEachDownstreamNode { node, downstream ->
+            if (tree.isExpanded(TreePath(node.path))) result.add(downstream)
+        }
+        return result
+    }
+
+    /** Runs [action] on every top-level downstream row that actually has a downstream pipeline. */
+    private fun forEachDownstreamNode(action: (DefaultMutableTreeNode, GitLabDownstreamPipeline) -> Unit) {
+        for (index in 0 until rootNode.childCount) {
+            val node = rootNode.getChildAt(index) as? DefaultMutableTreeNode ?: continue
+            val downstream = (node.userObject as? DownstreamNodeData)?.bridge?.downstream ?: continue
+            action(node, downstream)
+        }
+    }
+
+    /** Whether [node] lives *inside* a downstream subtree (a descendant of a [DownstreamNodeData] node). */
+    private fun isInsideDownstream(node: DefaultMutableTreeNode): Boolean {
+        var parent = node.parent
+        while (parent != null) {
+            if ((parent as? DefaultMutableTreeNode)?.userObject is DownstreamNodeData) return true
+            parent = parent.parent
+        }
+        return false
     }
 
     /** The summary row's node, when the compact view rendered one; null in show-all mode. */
@@ -611,36 +863,47 @@ class PipelinesPanel(
     /** EDT. Captures the current selection as refresh-stable identities; see [SelectionSnapshot]. */
     private fun selectionSnapshot(): SelectionSnapshot =
         when (val data = (tree.lastSelectedPathComponent as? DefaultMutableTreeNode)?.userObject) {
-            is JobNodeData -> SelectionSnapshot(data.job.id, null, summary = false)
-            is FlatStageNodeData -> SelectionSnapshot(data.job?.id, data.stage.name, summary = false)
-            is StageNodeData -> SelectionSnapshot(null, data.stage.name, summary = false)
-            is SummaryNodeData -> SelectionSnapshot(null, null, summary = true)
-            else -> SelectionSnapshot(null, null, summary = false)
+            is JobNodeData -> SelectionSnapshot(data.job.id, null, summary = false, downstreamId = null)
+            is FlatStageNodeData -> SelectionSnapshot(data.job?.id, data.stage.name, summary = false, downstreamId = null)
+            is StageNodeData -> SelectionSnapshot(null, data.stage.name, summary = false, downstreamId = null)
+            is SummaryNodeData -> SelectionSnapshot(null, null, summary = true, downstreamId = null)
+            is DownstreamNodeData ->
+                SelectionSnapshot(null, null, summary = false, downstreamId = data.bridge.downstream?.id)
+            else -> SelectionSnapshot(null, null, summary = false, downstreamId = null)
         }
 
     /**
-     * EDT. Reselects what [snapshot] recorded: the summary row, else the job by id (whether it is now
-     * a job row or a flattened `stage · job` row), else the stage by name (stage or flattened row).
-     * A target that folded into a *collapsed* summary since the snapshot selects the summary row
-     * instead — selecting the hidden node would leave no visible selection at all.
+     * EDT. Reselects what [snapshot] recorded: the summary row, else the downstream row by id, else the
+     * job by id (whether it is now a job row or a flattened `stage · job` row), else the stage by name
+     * (stage or flattened row). A target now hidden inside a *collapsed* ancestor (a folded summary or a
+     * collapsed downstream) resolves to its [nearestVisible] ancestor — selecting the hidden node would
+     * leave no visible selection at all.
      */
     private fun restoreSelection(snapshot: SelectionSnapshot) {
         val target = when {
             snapshot.summary -> summaryNode()
+            snapshot.downstreamId != null -> findNode { nodeDownstreamId(it) == snapshot.downstreamId }
             else ->
                 snapshot.jobId?.let { id -> findNode { nodeJobId(it) == id } }
                     ?: snapshot.stageName?.let { name -> findNode { nodeStageName(it) == name } }
         } ?: return
-        val summary = summaryNode()
-        val visibleTarget =
-            if (summary != null && target !== summary && target.isNodeAncestor(summary) &&
-                !tree.isExpanded(TreePath(summary.path))
-            ) {
-                summary
-            } else {
-                target
-            }
-        tree.selectionPath = TreePath(visibleTarget.path)
+        tree.selectionPath = TreePath(nearestVisible(target).path)
+    }
+
+    /**
+     * The shallowest node on [target]'s path that the user can actually see: [target] itself when every
+     * ancestor is expanded, otherwise the first collapsed ancestor (which is visible, since everything
+     * above it is expanded). Never the invisible root. Keeps a restored selection visible when the node
+     * folded into a collapsed summary or downstream since the snapshot.
+     */
+    private fun nearestVisible(target: DefaultMutableTreeNode): DefaultMutableTreeNode {
+        for (element in target.path) {
+            val node = element as? DefaultMutableTreeNode ?: continue
+            if (node === rootNode) continue
+            if (node === target) break
+            if (!tree.isExpanded(TreePath(node.path))) return node
+        }
+        return target
     }
 
     /** The job id a node stands for: a job row's own, or a flattened `stage · job` row's single job. */
@@ -656,6 +919,10 @@ class PipelinesPanel(
         is FlatStageNodeData -> data.stage.name
         else -> null
     }
+
+    /** The downstream pipeline id a node stands for: a downstream "→ …" row's, else null. */
+    private fun nodeDownstreamId(node: DefaultMutableTreeNode): Long? =
+        (node.userObject as? DownstreamNodeData)?.bridge?.downstream?.id
 
     /** Top-down (preorder) search for the first node at any depth matching [match]. */
     private fun findNode(match: (DefaultMutableTreeNode) -> Boolean): DefaultMutableTreeNode? {
@@ -684,6 +951,19 @@ class PipelinesPanel(
                 toolTipText = stage.status
             }
             stageStrip.add(label)
+        }
+        // GLC-60: a gray "\u2192" separator then one status-colored dot per downstream pipeline, tail of the
+        // strip. Bridges not yet fired (no downstream) add nothing \u2014 there is no status to show yet.
+        val downstreams = lastRenderedBridges.mapNotNull { bridge -> bridge.downstream?.let { bridge.name to it } }
+        if (downstreams.isNotEmpty()) {
+            stageStrip.add(JBLabel("\u2192").apply { foreground = CockpitTheme.muted() })
+            for ((name, downstream) in downstreams) {
+                val label = JBLabel("\u25CF").apply {
+                    foreground = CockpitTheme.statusColor(downstream.status)
+                    toolTipText = "$name \u00B7 ${downstream.status}"
+                }
+                stageStrip.add(label)
+            }
         }
         stageStrip.revalidate()
         stageStrip.repaint()
@@ -864,13 +1144,38 @@ class PipelinesPanel(
     /**
      * The popup for a tree row: stage rows get the stage menu, job rows the job menu, and a flattened
      * `stage · job` row (GLC-59) gets the *job* menu — the row stands for its single job, and every
-     * stage action on a one-job stage is that job's action anyway. The summary row has no popup.
+     * stage action on a one-job stage is that job's action anyway. A downstream "→ …" row (GLC-60) gets
+     * an "Open in GitLab" menu; the rows *inside* a downstream only get "Open in browser" (their jobs
+     * live in another project, so the log viewer and retry/cancel — which target the upstream project —
+     * would hit the wrong pipeline). The summary row has no popup.
      */
-    private fun buildContextMenu(node: DefaultMutableTreeNode): JPopupMenu? = when (val data = node.userObject) {
-        is StageNodeData -> stageMenu(data.stage)
-        is JobNodeData -> jobMenu(data.job)
-        is FlatStageNodeData -> data.job?.let { jobMenu(it) }
-        else -> null
+    private fun buildContextMenu(node: DefaultMutableTreeNode): JPopupMenu? {
+        val inDownstream = isInsideDownstream(node)
+        return when (val data = node.userObject) {
+            is DownstreamNodeData -> data.bridge.downstream?.let { downstreamMenu(it) }
+            is StageNodeData -> if (inDownstream) null else stageMenu(data.stage)
+            is JobNodeData -> if (inDownstream) downstreamJobMenu(data.job) else jobMenu(data.job)
+            is FlatStageNodeData -> data.job?.let { if (inDownstream) downstreamJobMenu(it) else jobMenu(it) }
+            else -> null
+        }
+    }
+
+    /** The downstream "→ …" row's menu (GLC-60): open that pipeline's page on GitLab (its [webUrl]). */
+    private fun downstreamMenu(downstream: GitLabDownstreamPipeline): JPopupMenu = JPopupMenu().apply {
+        add(
+            JMenuItem(CockpitBundle.message("pipelines.downstream.open")).apply {
+                addActionListener { BrowserUtil.browse(downstream.webUrl) }
+            },
+        )
+    }
+
+    /** A downstream job/flattened row's menu (GLC-60): only "Open in browser" — see [buildContextMenu]. */
+    private fun downstreamJobMenu(job: GitLabJob): JPopupMenu = JPopupMenu().apply {
+        add(
+            JMenuItem(CockpitBundle.message("pipelines.job.open")).apply {
+                addActionListener { BrowserUtil.browse(job.webUrl) }
+            },
+        )
     }
 
     private fun stageMenu(stage: StageGroup): JPopupMenu = JPopupMenu().apply {
@@ -970,6 +1275,26 @@ class PipelinesPanel(
                         "  " + CockpitBundle.message("pipelines.summary.jobs", data.summary.jobCount),
                         SimpleTextAttributes.GRAYED_ATTRIBUTES,
                     )
+                }
+                // GLC-60: "→ <bridge> #<id> · <status>". The icon and status come from the downstream
+                // pipeline, or from the bridge itself when it has not triggered one yet (no #id then).
+                is DownstreamNodeData -> {
+                    val downstream = data.bridge.downstream
+                    val status = downstream?.status ?: data.bridge.status
+                    icon = CockpitIcons.status(status)
+                    append("→ ", SimpleTextAttributes.GRAYED_ATTRIBUTES)
+                    append(data.bridge.name, SimpleTextAttributes.REGULAR_BOLD_ATTRIBUTES)
+                    if (downstream != null) append("  #${downstream.id}", SimpleTextAttributes.GRAYED_ATTRIBUTES)
+                    append("  · $status", SimpleTextAttributes.GRAYED_ATTRIBUTES)
+                }
+                // GLC-60: placeholder shown while an expanded downstream's jobs are being fetched.
+                DownstreamLoadingNodeData -> {
+                    append(CockpitBundle.message("pipelines.jobs.loading"), SimpleTextAttributes.GRAYED_ATTRIBUTES)
+                }
+                // GLC-60: the downstream's jobs could not be loaded (e.g. a 403 on a cross-project pipeline).
+                is DownstreamErrorNodeData -> {
+                    icon = AllIcons.General.Error
+                    append(data.message, SimpleTextAttributes.ERROR_ATTRIBUTES)
                 }
             }
         }
