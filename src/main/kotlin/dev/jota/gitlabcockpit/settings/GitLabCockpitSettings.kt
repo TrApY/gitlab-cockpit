@@ -82,6 +82,14 @@ class GitLabCockpitSettings : PersistentStateComponent<GitLabCockpitSettings.Sta
          * the user's role scope (+ watched MRs). Defaults to `false` (GLC-28).
          */
         var notifyScopeAllFiltered: Boolean = false
+
+        /**
+         * Pipelines view mode (GLC-59). `false` (default) is the compact, attention-first view:
+         * fully successful stages fold into one "N stages passed" row and single-job stages flatten
+         * to one `stage · job` line. `true` restores the classic tree — every stage as its own
+         * parent node. Toggled by the "Show all stages" checkbox of the Pipelines tab.
+         */
+        var pipelinesShowAllStages: Boolean = false
     }
 
     private var state = State()
@@ -158,6 +166,11 @@ class GitLabCockpitSettings : PersistentStateComponent<GitLabCockpitSettings.Sta
     var notifyScopeAllFiltered: Boolean
         get() = state.notifyScopeAllFiltered
         set(value) { state.notifyScopeAllFiltered = value }
+
+    /** Pipelines view: show every stage as a classic tree row; see [State.pipelinesShowAllStages]. */
+    var pipelinesShowAllStages: Boolean
+        get() = state.pipelinesShowAllStages
+        set(value) { state.pipelinesShowAllStages = value }
 
     private fun decodeTriState(raw: String): Boolean? = when (raw) {
         TRUE -> true

@@ -4,6 +4,10 @@
 
 ## [Unreleased]
 
+### Changed
+
+- The Pipelines view is now compact and attention-first: fully passed stages fold into a single expandable "N stages passed (M jobs)" row and single-job stages flatten to one "stage · job" line, so only stages needing attention (failed, running, pending, manual, canceled, warning) keep their own row; a persisted "Show all stages" checkbox restores the classic full tree, and expansion/selection survive the live 5-second refresh (GLC-59)
+
 ## [0.15.0] - 2026-07-23
 
 ### Added

@@ -87,6 +87,69 @@ fun stagesToExpand(previouslyExpanded: Set<String>, stages: List<StageGroup>): S
         .map { it.name }
         .toSet()
 
+/**
+ * One row of the pipelines tree in its compact, attention-first shape (GLC-59), produced by
+ * [compactStages] from the [groupByStage] output. The compact view's premise: green stages carry no
+ * signal, so they fold into one [Summary] row, while every stage that needs attention keeps its own
+ * row — flattened to a single line when it holds a single job ([FlatStage]).
+ */
+sealed interface PipelineRow {
+
+    /** A stage rendered as a parent node with one child row per job — the classic tree shape. */
+    data class Stage(val stage: StageGroup) : PipelineRow
+
+    /**
+     * A single-job stage flattened to one `stage · job` row: the job's status and duration shown
+     * directly on the stage's line, with no expandable parent, so a one-job stage costs one row
+     * instead of two. Only ever built for a stage with exactly one job ([compactStageRow]).
+     */
+    data class FlatStage(val stage: StageGroup) : PipelineRow {
+        /** The stage's single job, whose status/duration the flattened row displays. */
+        val job: GitLabJob get() = stage.jobs.first()
+    }
+
+    /**
+     * Every fully successful stage of the pipeline folded into one collapsed "N stages passed
+     * (M jobs)" row. Deliberately *all* of them, even when they are not consecutive: the compact view
+     * shows pipeline *state*, not execution order — the real order is still visible in the stage
+     * strip and in the show-all tree. Only built when there are at least two such stages.
+     */
+    data class Summary(val stages: List<StageGroup>) : PipelineRow {
+        /** Total number of jobs across the summarized [stages], for the "(M jobs)" suffix. */
+        val jobCount: Int get() = stages.sumOf { it.jobs.size }
+    }
+}
+
+/**
+ * Compacts the [groupByStage] output into the rows the pipelines tree shows (GLC-59):
+ *
+ * - With [showAll] every stage becomes a classic [PipelineRow.Stage] in pipeline order — no summary,
+ *   no flattening — restoring the traditional tree.
+ * - Otherwise the stages that need attention (any aggregate but `success`: `failed`, `running`,
+ *   `pending`, `manual`, `canceled` and `warning`) come first, in pipeline order, each shaped by
+ *   [compactStageRow]; the fully successful stages fold into a single [PipelineRow.Summary] appended
+ *   *last*, after the rows the user actually needs to look at.
+ * - A summary needs at least two successful stages; with one (or none) every stage stays an
+ *   individual row, in plain pipeline order, still shaped by [compactStageRow].
+ *
+ * Pure and platform-free so the summarize/flatten decisions are unit-testable without Swing.
+ */
+fun compactStages(stages: List<StageGroup>, showAll: Boolean): List<PipelineRow> {
+    if (showAll) return stages.map { PipelineRow.Stage(it) }
+    val passed = stages.filter { it.status == "success" }
+    if (passed.size < 2) return stages.map { compactStageRow(it) }
+    return stages.filterNot { it.status == "success" }.map { compactStageRow(it) } + PipelineRow.Summary(passed)
+}
+
+/**
+ * The compact view's flattening rule for one stage: a single-job stage becomes a
+ * [PipelineRow.FlatStage] (one `stage · job` line), anything else a classic [PipelineRow.Stage].
+ * Shared by [compactStages] and by the UI when it shapes the rows *inside* an expanded summary, so
+ * both apply the exact same rule.
+ */
+fun compactStageRow(stage: StageGroup): PipelineRow =
+    if (stage.jobs.size == 1) PipelineRow.FlatStage(stage) else PipelineRow.Stage(stage)
+
 /** A job whose [status] allows a retry: it has finished (`failed` / `canceled` / `success`). */
 fun isJobRetryable(status: String): Boolean = status in RETRYABLE_STATUSES
 

@@ -9,8 +9,9 @@ import org.junit.Test
 
 /**
  * Pure tests for the platform-free pipeline logic: [groupByStage] order preservation,
- * [aggregateStatus] worst-of precedence (including the failed-with-allow_failure special case) and
- * the [isJobRetryable] / [isJobCancelable] / [isJobPlayable] truth tables.
+ * [aggregateStatus] worst-of precedence (including the failed-with-allow_failure special case),
+ * the [isJobRetryable] / [isJobCancelable] / [isJobPlayable] truth tables and the compact
+ * attention-first rows of [compactStages] / [compactStageRow] (GLC-59).
  */
 class PipelineModelTest {
 
@@ -319,5 +320,132 @@ class PipelineModelTest {
             StageGroup("deploy", listOf(job("c", "deploy", "failed")), "failed"),
         )
         assertEquals(setOf("build", "deploy"), stagesToExpand(setOf("build"), stages))
+    }
+
+    // --- compactStages / compactStageRow (GLC-59) ---------------------------------------------
+
+    /**
+     * A stage with [jobCount] jobs named `name-1..n` and the given aggregate [status]; the jobs carry
+     * a status consistent with the aggregate (`warning` → `failed` with allow_failure).
+     */
+    private fun stage(name: String, status: String, jobCount: Int = 1): StageGroup {
+        val jobStatus = if (status == "warning") "failed" else status
+        val jobs = (1..jobCount).map { job("$name-$it", name, jobStatus, allowFailure = status == "warning") }
+        return StageGroup(name, jobs, status)
+    }
+
+    @Test
+    fun `compactStages folds an all-success pipeline into a single summary row`() {
+        val stages = listOf(
+            stage("build", "success"),
+            stage("test", "success", jobCount = 2),
+            stage("deploy", "success"),
+        )
+
+        val rows = compactStages(stages, showAll = false)
+
+        val summary = rows.single() as PipelineRow.Summary
+        assertEquals(listOf("build", "test", "deploy"), summary.stages.map { it.name })
+        assertEquals(4, summary.jobCount)
+    }
+
+    @Test
+    fun `compactStages keeps a failed multi-job stage as a stage row and folds even non-consecutive greens`() {
+        val stages = listOf(
+            stage("build", "success"),
+            stage("test", "failed", jobCount = 2),
+            stage("deploy", "success"),
+        )
+
+        val rows = compactStages(stages, showAll = false)
+
+        assertEquals(2, rows.size)
+        assertEquals("test", (rows[0] as PipelineRow.Stage).stage.name)
+        assertEquals(listOf("build", "deploy"), (rows[1] as PipelineRow.Summary).stages.map { it.name })
+    }
+
+    @Test
+    fun `compactStages flattens a running single-job stage and keeps the summary last`() {
+        val stages = listOf(
+            stage("build", "success"),
+            stage("deploy", "running"),
+            stage("verify", "success"),
+        )
+
+        val rows = compactStages(stages, showAll = false)
+
+        val flat = rows[0] as PipelineRow.FlatStage
+        assertEquals("deploy", flat.stage.name)
+        assertEquals("deploy-1", flat.job.name)
+        assertTrue(rows[1] is PipelineRow.Summary)
+        assertEquals(2, rows.size)
+    }
+
+    @Test
+    fun `compactStages leaves a lone success stage as a flattened row instead of a summary`() {
+        val rows = compactStages(listOf(stage("build", "success")), showAll = false)
+        assertEquals("build", (rows.single() as PipelineRow.FlatStage).stage.name)
+    }
+
+    @Test
+    fun `compactStages keeps a lone multi-job success stage as a classic stage row`() {
+        val rows = compactStages(listOf(stage("build", "success", jobCount = 3)), showAll = false)
+        assertEquals("build", (rows.single() as PipelineRow.Stage).stage.name)
+    }
+
+    @Test
+    fun `compactStages keeps pipeline order when only one stage passed and no summary is built`() {
+        val stages = listOf(stage("build", "success"), stage("test", "failed", jobCount = 2))
+
+        val rows = compactStages(stages, showAll = false)
+
+        assertEquals("build", (rows[0] as PipelineRow.FlatStage).stage.name)
+        assertEquals("test", (rows[1] as PipelineRow.Stage).stage.name)
+    }
+
+    @Test
+    fun `compactStages treats warning as needing attention and never folds it into the summary`() {
+        val stages = listOf(stage("lint", "warning"), stage("build", "success"), stage("test", "success"))
+
+        val rows = compactStages(stages, showAll = false)
+
+        assertEquals("lint", (rows[0] as PipelineRow.FlatStage).stage.name)
+        assertEquals(listOf("build", "test"), (rows[1] as PipelineRow.Summary).stages.map { it.name })
+    }
+
+    @Test
+    fun `compactStages keeps every non-success aggregate as its own row in pipeline order`() {
+        val attention = listOf("failed", "running", "pending", "manual", "canceled", "warning")
+        val stages = attention.map { stage("s-$it", it) } + listOf(stage("g1", "success"), stage("g2", "success"))
+
+        val rows = compactStages(stages, showAll = false)
+
+        assertEquals(attention.map { "s-$it" }, rows.dropLast(1).map { (it as PipelineRow.FlatStage).stage.name })
+        assertEquals(listOf("g1", "g2"), (rows.last() as PipelineRow.Summary).stages.map { it.name })
+    }
+
+    @Test
+    fun `compactStages with showAll renders every stage as a classic stage row in pipeline order`() {
+        val stages = listOf(
+            stage("build", "success"),
+            stage("test", "failed", jobCount = 2),
+            stage("deploy", "success"),
+        )
+
+        val rows = compactStages(stages, showAll = true)
+
+        assertEquals(listOf("build", "test", "deploy"), rows.map { (it as PipelineRow.Stage).stage.name })
+    }
+
+    @Test
+    fun `compactStages of an empty pipeline is empty in both modes`() {
+        assertEquals(emptyList<PipelineRow>(), compactStages(emptyList(), showAll = false))
+        assertEquals(emptyList<PipelineRow>(), compactStages(emptyList(), showAll = true))
+    }
+
+    @Test
+    fun `compactStageRow flattens only single-job stages`() {
+        assertTrue(compactStageRow(stage("build", "failed")) is PipelineRow.FlatStage)
+        assertTrue(compactStageRow(stage("test", "failed", jobCount = 2)) is PipelineRow.Stage)
     }
 }

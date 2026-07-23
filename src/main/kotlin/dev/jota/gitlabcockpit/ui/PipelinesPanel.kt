@@ -11,6 +11,7 @@ import com.intellij.ui.ColoredTreeCellRenderer
 import com.intellij.ui.DoubleClickListener
 import com.intellij.ui.PopupHandler
 import com.intellij.ui.SimpleTextAttributes
+import com.intellij.ui.components.JBCheckBox
 import com.intellij.ui.components.JBLabel
 import com.intellij.ui.components.JBScrollPane
 import com.intellij.ui.components.panels.VerticalLayout
@@ -22,8 +23,11 @@ import dev.jota.gitlabcockpit.api.GitLabPipeline
 import dev.jota.gitlabcockpit.api.GitLabResult
 import dev.jota.gitlabcockpit.core.CockpitProjectService
 import dev.jota.gitlabcockpit.core.MrRef
+import dev.jota.gitlabcockpit.core.PipelineRow
 import dev.jota.gitlabcockpit.core.StageGroup
 import dev.jota.gitlabcockpit.core.aggregateStatus
+import dev.jota.gitlabcockpit.core.compactStageRow
+import dev.jota.gitlabcockpit.core.compactStages
 import dev.jota.gitlabcockpit.core.groupByStage
 import dev.jota.gitlabcockpit.core.isJobCancelable
 import dev.jota.gitlabcockpit.core.isJobPlayable
@@ -31,6 +35,7 @@ import dev.jota.gitlabcockpit.core.isJobRetryable
 import dev.jota.gitlabcockpit.core.isPipelineLive
 import dev.jota.gitlabcockpit.core.mergeHeadPipeline
 import dev.jota.gitlabcockpit.core.stagesToExpand
+import dev.jota.gitlabcockpit.settings.GitLabCockpitSettings
 import dev.jota.gitlabcockpit.ui.log.JobLogVirtualFile
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -61,6 +66,23 @@ private data class StageNodeData(val stage: StageGroup)
 /** Tree node payload for a single CI job. */
 private data class JobNodeData(val job: GitLabJob)
 
+/** Tree node payload for a single-job stage flattened to one `stage · job` row (GLC-59). */
+private data class FlatStageNodeData(val stage: StageGroup) {
+    /** The stage's single job; null only if a malformed stage ever arrives without jobs. */
+    val job: GitLabJob? get() = stage.jobs.firstOrNull()
+}
+
+/** Tree node payload for the "N stages passed (M jobs)" summary row (GLC-59). */
+private data class SummaryNodeData(val summary: PipelineRow.Summary)
+
+/**
+ * What the tree had selected before an in-place rebuild, reduced to identities that survive it
+ * (GLC-59): a job id (job rows and flattened `stage · job` rows), a stage name (stage rows and
+ * flattened rows, as the fallback when the job disappeared) and whether the summary row itself was
+ * selected.
+ */
+private data class SelectionSnapshot(val jobId: Long?, val stageName: String?, val summary: Boolean)
+
 /**
  * The "Pipelines" tab of the MR detail. Shows the pipelines a merge request has triggered and lets
  * the user drive them:
@@ -68,9 +90,14 @@ private data class JobNodeData(val job: GitLabJob)
  * - a combo of the MR's pipelines (`#id · status · ref · when`) plus refresh and "Run pipeline"
  *   (which creates a pipeline on the MR's source branch, after a confirmation),
  * - a horizontal strip of stage dots colored by each stage's aggregated status,
- * - a stage → job tree with per-status icons and job durations; failed stages are auto-expanded,
+ * - a compact, attention-first stage tree (GLC-59): stages that need attention (failed / running /
+ *   pending / manual / canceled / warning) show as individual rows — flattened to a single
+ *   `stage · job` line when they hold one job — while fully successful stages fold into one
+ *   collapsed "N stages passed (M jobs)" summary row placed last; failed multi-job stages are
+ *   auto-expanded. A persisted "Show all stages" checkbox ([GitLabCockpitSettings]) restores the
+ *   classic stage → job tree (no summary, no flattening), re-rendering in place without a re-fetch,
  * - a toolbar to retry / cancel the selected pipeline and a right-click menu to retry a stage's
- *   failed jobs or retry / cancel / play / open a single job.
+ *   failed jobs or retry / cancel / play / open a single job (flattened rows get the job menu).
  *
  * All network calls run on the service's coroutine scope (never the EDT); results are marshaled back
  * with [Dispatchers.EDT] and dropped when stale (re-checking [currentRef] and the selected pipeline).
@@ -82,7 +109,8 @@ private data class JobNodeData(val job: GitLabJob)
  * hidden) and the selected pipeline is still alive ([isPipelineLive]), a poll every
  * [POLL_INTERVAL_MS]ms reloads that pipeline's jobs — and the pipeline list every
  * [PIPELINE_LIST_EVERY] cycles — and updates the combo / strip / tree **in place**, preserving the
- * tree's per-stage expansion ([stagesToExpand]) and the current selection. The loop stops the moment
+ * tree's expansion (per-stage via [stagesToExpand], plus whether the summary row was open) and the
+ * current selection ([SelectionSnapshot]). The loop stops the moment
  * the card is hidden, the panel is unbound/cleared, the tool window stops showing, or the pipeline
  * turns terminal (one last pass first). When the polled pipeline is the head one and its aggregate
  * status changes, [onHeadPipelineStatusChange] lets the detail's Info "Pipeline status" line follow.
@@ -148,6 +176,18 @@ class PipelinesPanel(
     private val retryPipelineButton = JButton(CockpitBundle.message("pipelines.retryPipeline"))
     private val cancelPipelineButton = JButton(CockpitBundle.message("pipelines.cancelPipeline"))
 
+    /**
+     * The persisted "Show all stages" view toggle (GLC-59). A plain checkbox rather than a
+     * [com.intellij.openapi.actionSystem.ToggleAction]: this panel composes plain Swing buttons (no
+     * `ActionToolbar`), so a labeled checkbox on the actions row reads as the native "view option"
+     * here — self-explanatory, stateful at a glance and consistent with the row's idiom.
+     */
+    private val showAllStagesCheckBox = JBCheckBox(CockpitBundle.message("pipelines.showAllStages")).apply {
+        isOpaque = false
+        toolTipText = CockpitBundle.message("pipelines.showAllStages.tooltip")
+        isSelected = GitLabCockpitSettings.getInstance().pipelinesShowAllStages
+    }
+
     private val stageStrip = JPanel(FlowLayout(FlowLayout.LEFT, JBUI.scale(10), 0)).apply { isOpaque = false }
 
     private val rootNode = DefaultMutableTreeNode()
@@ -167,6 +207,7 @@ class PipelinesPanel(
         runButton.addActionListener { onRunPipeline() }
         retryPipelineButton.addActionListener { onRetryPipeline() }
         cancelPipelineButton.addActionListener { onCancelPipeline() }
+        showAllStagesCheckBox.addActionListener { onShowAllStagesToggled() }
         pipelineCombo.addActionListener { if (!suppressComboEvents) onPipelineSelected() }
 
         tree.addMouseListener(object : PopupHandler() {
@@ -184,8 +225,9 @@ class PipelinesPanel(
                 val node = path.lastPathComponent as? DefaultMutableTreeNode ?: return false
                 return when (val data = node.userObject) {
                     is JobNodeData -> { openJobLog(data.job); true }
+                    is FlatStageNodeData -> { data.job?.let { openJobLog(it) }; true }
                     is StageNodeData -> { openStageLogs(data.stage); true }
-                    else -> false
+                    else -> false // summary row: keep the tree's default expand/collapse toggle
                 }
             }
         }.installOn(tree)
@@ -213,6 +255,7 @@ class PipelinesPanel(
         val actions = JPanel(FlowLayout(FlowLayout.LEFT, JBUI.scale(6), 0)).apply { isOpaque = false }
         actions.add(retryPipelineButton)
         actions.add(cancelPipelineButton)
+        actions.add(showAllStagesCheckBox)
 
         north.add(controls)
         north.add(actions)
@@ -435,15 +478,16 @@ class PipelinesPanel(
     }
 
     /**
-     * EDT. First render of a pipeline's jobs: builds the stage → job tree and the stage strip,
-     * auto-expanding failed stages, and resets the selection. Records the jobs and (re)starts live
-     * polling if the card is up and the pipeline is still alive.
+     * EDT. First render of a pipeline's jobs: builds the compact row tree ([compactStages]) and the
+     * stage strip, auto-expanding failed multi-job stages — the summary row starts collapsed — and
+     * resets the selection. Records the jobs and (re)starts live polling if the card is up and the
+     * pipeline is still alive.
      */
     private fun renderJobs(jobs: List<GitLabJob>) {
         val stages = groupByStage(jobs)
-        rebuildStageNodes(stages)
+        rebuildRows(compactStages(stages, showAllStages()))
         treeModel.reload()
-        expandStages(stagesToExpand(emptySet(), stages))
+        applyExpansion(stagesToExpand(emptySet(), stages), summaryExpanded = false)
         tree.emptyText.text = if (jobs.isEmpty()) CockpitBundle.message("pipelines.jobs.empty") else ""
         renderStageStrip(stages)
         lastRenderedJobs = jobs
@@ -452,19 +496,20 @@ class PipelinesPanel(
 
     /**
      * EDT. In-place refresh of the selected pipeline's jobs (GLC-43 B): rebuilds the tree/strip while
-     * **preserving** the per-stage expansion the user had ([stagesToExpand] folds it with the failed
-     * auto-expand rule) and the current selection (by job id, else by stage name). Never touches the
-     * combo or restarts polling — that is the loop's job.
+     * **preserving** the expansion the user had — per-stage names folded with the failed auto-expand
+     * rule by [stagesToExpand], plus whether the summary row was open — and the current selection
+     * ([SelectionSnapshot]: by job id, else stage name, else the summary row itself). Never touches
+     * the combo or restarts polling — that is the loop's job.
      */
     private fun refreshJobsInPlace(jobs: List<GitLabJob>) {
         val stages = groupByStage(jobs)
         val previouslyExpanded = expandedStageNames()
-        val selectedJobId = selectedJobId()
-        val selectedStage = selectedStageName()
-        rebuildStageNodes(stages)
+        val summaryWasExpanded = isSummaryExpanded()
+        val selection = selectionSnapshot()
+        rebuildRows(compactStages(stages, showAllStages()))
         treeModel.reload()
-        expandStages(stagesToExpand(previouslyExpanded, stages))
-        restoreSelection(selectedJobId, selectedStage)
+        applyExpansion(stagesToExpand(previouslyExpanded, stages), summaryWasExpanded)
+        restoreSelection(selection)
         tree.emptyText.text = if (jobs.isEmpty()) CockpitBundle.message("pipelines.jobs.empty") else ""
         renderStageStrip(stages)
         lastRenderedJobs = jobs
@@ -483,63 +528,152 @@ class PipelinesPanel(
         updatePipelineButtons(target.status)
     }
 
-    /** EDT. Rebuilds the stage → job nodes under the (cleared) root; no reload/expansion. */
-    private fun rebuildStageNodes(stages: List<StageGroup>) {
+    /** The persisted "Show all stages" flag the render paths read (GLC-59). */
+    private fun showAllStages(): Boolean = GitLabCockpitSettings.getInstance().pipelinesShowAllStages
+
+    /**
+     * EDT. Persists the toggled "Show all stages" value and re-renders the current pipeline's rows
+     * immediately from [lastRenderedJobs] — no re-fetch — through [refreshJobsInPlace], so expansion
+     * and selection carry over between the compact and the classic view where they still apply.
+     * Nothing rendered yet (no pipeline, jobs still loading) → nothing to re-render.
+     */
+    private fun onShowAllStagesToggled() {
+        GitLabCockpitSettings.getInstance().pipelinesShowAllStages = showAllStagesCheckBox.isSelected
+        if (lastRenderedJobs.isNotEmpty()) refreshJobsInPlace(lastRenderedJobs)
+    }
+
+    /** EDT. Rebuilds the row nodes under the (cleared) root from [rows]; no reload/expansion. */
+    private fun rebuildRows(rows: List<PipelineRow>) {
         rootNode.removeAllChildren()
-        for (stage in stages) {
-            val stageNode = DefaultMutableTreeNode(StageNodeData(stage))
-            for (job in stage.jobs) stageNode.add(DefaultMutableTreeNode(JobNodeData(job)))
-            rootNode.add(stageNode)
+        for (row in rows) rootNode.add(rowNode(row))
+    }
+
+    /**
+     * The subtree one [PipelineRow] renders as: a flattened single-row stage, a stage node with its
+     * job children, or the summary node whose children are its stages re-shaped by the same
+     * [compactStageRow] flattening rule (never a nested summary, so the recursion is one level deep).
+     */
+    private fun rowNode(row: PipelineRow): DefaultMutableTreeNode = when (row) {
+        is PipelineRow.FlatStage -> DefaultMutableTreeNode(FlatStageNodeData(row.stage))
+        is PipelineRow.Stage -> DefaultMutableTreeNode(StageNodeData(row.stage)).also { node ->
+            for (job in row.stage.jobs) node.add(DefaultMutableTreeNode(JobNodeData(job)))
+        }
+        is PipelineRow.Summary -> DefaultMutableTreeNode(SummaryNodeData(row)).also { node ->
+            for (stage in row.stages) node.add(rowNode(compactStageRow(stage)))
         }
     }
 
-    /** EDT. Expands every top-level stage node whose name is in [names]. */
-    private fun expandStages(names: Set<String>) {
-        for (index in 0 until rootNode.childCount) {
-            val node = rootNode.getChildAt(index) as? DefaultMutableTreeNode ?: continue
-            val stage = (node.userObject as? StageNodeData)?.stage ?: continue
-            if (stage.name in names) tree.expandPath(TreePath(node.path))
+    /**
+     * EDT. Applies the expansion state after a rebuild: re-opens the summary row when
+     * [summaryExpanded], then expands every stage node whose name is in [names]. Stage nodes living
+     * *inside* a collapsed summary are deliberately left alone — [Tree.expandPath] expands the whole
+     * parent chain, which would pop the summary open the moment a previously expanded stage turns
+     * green and folds into it, defeating the collapse the compact view exists for.
+     */
+    private fun applyExpansion(names: Set<String>, summaryExpanded: Boolean) {
+        val summary = summaryNode()
+        if (summaryExpanded && summary != null) tree.expandPath(TreePath(summary.path))
+        forEachNode { node ->
+            val stage = (node.userObject as? StageNodeData)?.stage ?: return@forEachNode
+            if (stage.name !in names) return@forEachNode
+            if (summary != null && node.parent === summary && !summaryExpanded) return@forEachNode
+            tree.expandPath(TreePath(node.path))
         }
     }
 
-    /** EDT. The names of the stage nodes currently expanded in the tree. */
+    /**
+     * EDT. The names of the stage nodes currently expanded in the tree, at any depth. A stage inside
+     * a collapsed summary reports as not expanded ([Tree.isExpanded] is false for hidden paths),
+     * matching what the user actually sees.
+     */
     private fun expandedStageNames(): Set<String> {
         val result = mutableSetOf<String>()
-        for (index in 0 until rootNode.childCount) {
-            val node = rootNode.getChildAt(index) as? DefaultMutableTreeNode ?: continue
-            val stage = (node.userObject as? StageNodeData)?.stage ?: continue
+        forEachNode { node ->
+            val stage = (node.userObject as? StageNodeData)?.stage ?: return@forEachNode
             if (tree.isExpanded(TreePath(node.path))) result.add(stage.name)
         }
         return result
     }
 
-    private fun selectedJobId(): Long? =
-        ((tree.lastSelectedPathComponent as? DefaultMutableTreeNode)?.userObject as? JobNodeData)?.job?.id
-
-    private fun selectedStageName(): String? =
-        ((tree.lastSelectedPathComponent as? DefaultMutableTreeNode)?.userObject as? StageNodeData)?.stage?.name
-
-    /** EDT. Reselects the job (by id) or stage (by name) that was selected before an in-place refresh. */
-    private fun restoreSelection(jobId: Long?, stageName: String?) {
-        val target = when {
-            jobId != null -> findNode { (it.userObject as? JobNodeData)?.job?.id == jobId }
-            stageName != null -> findNode { (it.userObject as? StageNodeData)?.stage?.name == stageName }
-            else -> null
-        } ?: return
-        tree.selectionPath = TreePath(target.path)
-    }
-
-    /** Depth-first (2 levels: stage → job) search for the first node matching [match]. */
-    private fun findNode(match: (DefaultMutableTreeNode) -> Boolean): DefaultMutableTreeNode? {
+    /** The summary row's node, when the compact view rendered one; null in show-all mode. */
+    private fun summaryNode(): DefaultMutableTreeNode? {
         for (index in 0 until rootNode.childCount) {
-            val stageNode = rootNode.getChildAt(index) as? DefaultMutableTreeNode ?: continue
-            if (match(stageNode)) return stageNode
-            for (childIndex in 0 until stageNode.childCount) {
-                val jobNode = stageNode.getChildAt(childIndex) as? DefaultMutableTreeNode ?: continue
-                if (match(jobNode)) return jobNode
-            }
+            val node = rootNode.getChildAt(index) as? DefaultMutableTreeNode ?: continue
+            if (node.userObject is SummaryNodeData) return node
         }
         return null
+    }
+
+    /** EDT. Whether the summary row exists and is expanded; the boolean [refreshJobsInPlace] preserves. */
+    private fun isSummaryExpanded(): Boolean =
+        summaryNode()?.let { tree.isExpanded(TreePath(it.path)) } ?: false
+
+    /** EDT. Captures the current selection as refresh-stable identities; see [SelectionSnapshot]. */
+    private fun selectionSnapshot(): SelectionSnapshot =
+        when (val data = (tree.lastSelectedPathComponent as? DefaultMutableTreeNode)?.userObject) {
+            is JobNodeData -> SelectionSnapshot(data.job.id, null, summary = false)
+            is FlatStageNodeData -> SelectionSnapshot(data.job?.id, data.stage.name, summary = false)
+            is StageNodeData -> SelectionSnapshot(null, data.stage.name, summary = false)
+            is SummaryNodeData -> SelectionSnapshot(null, null, summary = true)
+            else -> SelectionSnapshot(null, null, summary = false)
+        }
+
+    /**
+     * EDT. Reselects what [snapshot] recorded: the summary row, else the job by id (whether it is now
+     * a job row or a flattened `stage · job` row), else the stage by name (stage or flattened row).
+     * A target that folded into a *collapsed* summary since the snapshot selects the summary row
+     * instead — selecting the hidden node would leave no visible selection at all.
+     */
+    private fun restoreSelection(snapshot: SelectionSnapshot) {
+        val target = when {
+            snapshot.summary -> summaryNode()
+            else ->
+                snapshot.jobId?.let { id -> findNode { nodeJobId(it) == id } }
+                    ?: snapshot.stageName?.let { name -> findNode { nodeStageName(it) == name } }
+        } ?: return
+        val summary = summaryNode()
+        val visibleTarget =
+            if (summary != null && target !== summary && target.isNodeAncestor(summary) &&
+                !tree.isExpanded(TreePath(summary.path))
+            ) {
+                summary
+            } else {
+                target
+            }
+        tree.selectionPath = TreePath(visibleTarget.path)
+    }
+
+    /** The job id a node stands for: a job row's own, or a flattened `stage · job` row's single job. */
+    private fun nodeJobId(node: DefaultMutableTreeNode): Long? = when (val data = node.userObject) {
+        is JobNodeData -> data.job.id
+        is FlatStageNodeData -> data.job?.id
+        else -> null
+    }
+
+    /** The stage name a node stands for: a stage row's, or a flattened `stage · job` row's. */
+    private fun nodeStageName(node: DefaultMutableTreeNode): String? = when (val data = node.userObject) {
+        is StageNodeData -> data.stage.name
+        is FlatStageNodeData -> data.stage.name
+        else -> null
+    }
+
+    /** Top-down (preorder) search for the first node at any depth matching [match]. */
+    private fun findNode(match: (DefaultMutableTreeNode) -> Boolean): DefaultMutableTreeNode? {
+        val nodes = rootNode.preorderEnumeration()
+        while (nodes.hasMoreElements()) {
+            val node = nodes.nextElement() as? DefaultMutableTreeNode ?: continue
+            if (node !== rootNode && match(node)) return node
+        }
+        return null
+    }
+
+    /** Runs [action] on every node under the root, at any depth, in top-down (preorder) order. */
+    private fun forEachNode(action: (DefaultMutableTreeNode) -> Unit) {
+        val nodes = rootNode.preorderEnumeration()
+        while (nodes.hasMoreElements()) {
+            val node = nodes.nextElement() as? DefaultMutableTreeNode ?: continue
+            if (node !== rootNode) action(node)
+        }
     }
 
     private fun renderStageStrip(stages: List<StageGroup>) {
@@ -727,56 +861,63 @@ class PipelinesPanel(
 
     // --- Context menu -------------------------------------------------------------------------
 
+    /**
+     * The popup for a tree row: stage rows get the stage menu, job rows the job menu, and a flattened
+     * `stage · job` row (GLC-59) gets the *job* menu — the row stands for its single job, and every
+     * stage action on a one-job stage is that job's action anyway. The summary row has no popup.
+     */
     private fun buildContextMenu(node: DefaultMutableTreeNode): JPopupMenu? = when (val data = node.userObject) {
-        is StageNodeData -> JPopupMenu().apply {
-            add(
-                JMenuItem(CockpitBundle.message("pipelines.stage.viewLogs")).apply {
-                    addActionListener { openStageLogs(data.stage) }
-                },
-            )
-            addSeparator()
-            add(
-                JMenuItem(CockpitBundle.message("pipelines.retryStage")).apply {
-                    addActionListener { onRetryStage(data.stage) }
-                },
-            )
-        }
-        is JobNodeData -> {
-            val job = data.job
-            JPopupMenu().apply {
-                add(
-                    JMenuItem(CockpitBundle.message("log.viewLog")).apply {
-                        addActionListener { openJobLog(job) }
-                    },
-                )
-                addSeparator()
-                add(
-                    JMenuItem(CockpitBundle.message("pipelines.job.retry")).apply {
-                        isEnabled = isJobRetryable(job.status)
-                        addActionListener { onRetryJob(job) }
-                    },
-                )
-                add(
-                    JMenuItem(CockpitBundle.message("pipelines.job.cancel")).apply {
-                        isEnabled = isJobCancelable(job.status)
-                        addActionListener { onCancelJob(job) }
-                    },
-                )
-                add(
-                    JMenuItem(CockpitBundle.message("pipelines.job.play")).apply {
-                        isEnabled = isJobPlayable(job.status)
-                        addActionListener { onPlayJob(job) }
-                    },
-                )
-                addSeparator()
-                add(
-                    JMenuItem(CockpitBundle.message("pipelines.job.open")).apply {
-                        addActionListener { BrowserUtil.browse(job.webUrl) }
-                    },
-                )
-            }
-        }
+        is StageNodeData -> stageMenu(data.stage)
+        is JobNodeData -> jobMenu(data.job)
+        is FlatStageNodeData -> data.job?.let { jobMenu(it) }
         else -> null
+    }
+
+    private fun stageMenu(stage: StageGroup): JPopupMenu = JPopupMenu().apply {
+        add(
+            JMenuItem(CockpitBundle.message("pipelines.stage.viewLogs")).apply {
+                addActionListener { openStageLogs(stage) }
+            },
+        )
+        addSeparator()
+        add(
+            JMenuItem(CockpitBundle.message("pipelines.retryStage")).apply {
+                addActionListener { onRetryStage(stage) }
+            },
+        )
+    }
+
+    private fun jobMenu(job: GitLabJob): JPopupMenu = JPopupMenu().apply {
+        add(
+            JMenuItem(CockpitBundle.message("log.viewLog")).apply {
+                addActionListener { openJobLog(job) }
+            },
+        )
+        addSeparator()
+        add(
+            JMenuItem(CockpitBundle.message("pipelines.job.retry")).apply {
+                isEnabled = isJobRetryable(job.status)
+                addActionListener { onRetryJob(job) }
+            },
+        )
+        add(
+            JMenuItem(CockpitBundle.message("pipelines.job.cancel")).apply {
+                isEnabled = isJobCancelable(job.status)
+                addActionListener { onCancelJob(job) }
+            },
+        )
+        add(
+            JMenuItem(CockpitBundle.message("pipelines.job.play")).apply {
+                isEnabled = isJobPlayable(job.status)
+                addActionListener { onPlayJob(job) }
+            },
+        )
+        addSeparator()
+        add(
+            JMenuItem(CockpitBundle.message("pipelines.job.open")).apply {
+                addActionListener { BrowserUtil.browse(job.webUrl) }
+            },
+        )
     }
 
     // --- Tree cell rendering ------------------------------------------------------------------
@@ -803,6 +944,32 @@ class PipelinesPanel(
                     icon = CockpitIcons.status(job.status, job.allowFailure)
                     append(job.name)
                     job.duration?.let { append("  ${formatDuration(it)}", SimpleTextAttributes.GRAYED_ATTRIBUTES) }
+                }
+                // GLC-59: one `stage · job` line carrying the job's status icon and duration. When the
+                // job is named like its stage (a very common CI shape) the name is shown only once.
+                is FlatStageNodeData -> {
+                    val job = data.job
+                    icon = if (job != null) {
+                        CockpitIcons.status(job.status, job.allowFailure)
+                    } else {
+                        CockpitIcons.status(data.stage.status)
+                    }
+                    append(data.stage.name, SimpleTextAttributes.REGULAR_BOLD_ATTRIBUTES)
+                    if (job != null && job.name != data.stage.name) {
+                        append(" \u00B7 ", SimpleTextAttributes.GRAYED_ATTRIBUTES)
+                        append(job.name)
+                    }
+                    job?.duration?.let { append("  ${formatDuration(it)}", SimpleTextAttributes.GRAYED_ATTRIBUTES) }
+                }
+                // GLC-59: the folded "N stages passed (M jobs)" row. The success icon carries the
+                // green; the text stays regular-weight so the row reads as quiet, not as a stage.
+                is SummaryNodeData -> {
+                    icon = CockpitIcons.status("success")
+                    append(CockpitBundle.message("pipelines.summary.passed", data.summary.stages.size))
+                    append(
+                        "  " + CockpitBundle.message("pipelines.summary.jobs", data.summary.jobCount),
+                        SimpleTextAttributes.GRAYED_ATTRIBUTES,
+                    )
                 }
             }
         }
