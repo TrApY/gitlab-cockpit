@@ -36,6 +36,7 @@ import com.intellij.ui.DoubleClickListener
 import com.intellij.ui.JBColor
 import com.intellij.ui.OnePixelSplitter
 import com.intellij.ui.SearchTextField
+import com.intellij.ui.TextFieldWithAutoCompletion
 import com.intellij.ui.components.ActionLink
 import com.intellij.ui.components.JBCheckBox
 import com.intellij.ui.components.JBLabel
@@ -54,6 +55,7 @@ import com.intellij.util.ui.UIUtil
 import dev.jota.gitlabcockpit.CockpitBundle
 import dev.jota.gitlabcockpit.api.GitLabApprovals
 import dev.jota.gitlabcockpit.api.GitLabAward
+import dev.jota.gitlabcockpit.api.GitLabBranch
 import dev.jota.gitlabcockpit.api.GitLabDiscussionNote
 import dev.jota.gitlabcockpit.api.GitLabLabel
 import dev.jota.gitlabcockpit.api.GitLabMergeRequest
@@ -94,6 +96,7 @@ import dev.jota.gitlabcockpit.core.filterTimeline
 import dev.jota.gitlabcockpit.core.mergeButtonState
 import dev.jota.gitlabcockpit.core.mrHeaderPresentation
 import dev.jota.gitlabcockpit.core.mrParticipants
+import dev.jota.gitlabcockpit.core.orderBranchNames
 import dev.jota.gitlabcockpit.core.projectLabelOf
 import dev.jota.gitlabcockpit.core.projectWebUrlOf
 import dev.jota.gitlabcockpit.core.stripDraftPrefix
@@ -1895,6 +1898,7 @@ class MrDetailPanel(
             projectPath = projectLabelOf(mr),
             uploader = attachmentUploaderFor(mr.projectId),
             loadRoster = { onLoaded -> withMembers(mr.projectId, onLoaded) },
+            loadBranches = { onLoaded -> withBranches(mr.projectId, onLoaded) },
             pickLabels = { current, onPicked ->
                 withLabels(mr.projectId) { projectLabels ->
                     // Keep any current label absent from the project roster so it is not silently dropped.
@@ -1941,6 +1945,27 @@ class MrDetailPanel(
                 when (result) {
                     is GitLabResult.Success -> onLoaded(result.data)
                     else -> showError("detail.error.members", result)
+                }
+            }
+        }
+    }
+
+    /**
+     * Loads [projectId]'s branches off the EDT (with a wait cursor), then runs [onLoaded] on the EDT — the
+     * "Destination branch" completion analogue of [withMembers] (GLC-57). The MR's own project id is used
+     * so, in the "All projects" mode, the completion lists the branches of the MR's project rather than the
+     * git-resolved one. The same modality capture as [withMembers] (GLC-49): resume inside the open modal.
+     */
+    private fun withBranches(projectId: Long, onLoaded: (List<GitLabBranch>) -> Unit) {
+        val modality = ModalityState.current()
+        cursor = Cursor.getPredefinedCursor(Cursor.WAIT_CURSOR)
+        service.coroutineScope.launch {
+            val result = service.getBranches(projectId)
+            withContext(Dispatchers.EDT + modality.asContextElement()) {
+                cursor = Cursor.getDefaultCursor()
+                when (result) {
+                    is GitLabResult.Success -> onLoaded(result.data)
+                    else -> showError("detail.error.branches", result)
                 }
             }
         }
@@ -2057,6 +2082,7 @@ class MrDetailPanel(
         private val projectPath: String?,
         private val uploader: AttachmentUploader,
         private val loadRoster: ((List<GitLabUser>) -> Unit) -> Unit,
+        private val loadBranches: ((List<GitLabBranch>) -> Unit) -> Unit,
         private val pickLabels: (List<String>, (List<String>) -> Unit) -> Unit,
     ) : DialogWrapper(project) {
 
@@ -2067,7 +2093,18 @@ class MrDetailPanel(
 
         /** The MR's original target branch, for change detection (GLC-52). */
         private val originalTargetBranch: String = mr.targetBranch
-        private val targetBranchField = JBTextField(mr.targetBranch, 30)
+
+        /** Feeds [targetBranchField] with the project's branch names once [loadBranches] lands (GLC-57). */
+        private val branchCompletionProvider = BranchCompletionProvider()
+
+        /**
+         * The "Destination branch" field: a platform [TextFieldWithAutoCompletion] over the project's
+         * branches (GLC-57) instead of the former free-text [JBTextField]. Still plain text — the value
+         * is [mr.targetBranch] initially and free text stays valid (the API rejects a non-existent
+         * branch); the completion just offers the real branches, preloaded in-modal like the roster.
+         */
+        private val targetBranchField =
+            TextFieldWithAutoCompletion(project, branchCompletionProvider, true, mr.targetBranch)
 
         private val originalRemoveSourceBranch: Boolean = mr.forceRemoveSourceBranch ?: false
         private val removeSourceBranchCheck =
@@ -2121,9 +2158,14 @@ class MrDetailPanel(
         init {
             title = CockpitBundle.message("dialog.editMr.title")
             init()
-            // Preload the roster once the modal is on screen so the continuation lands in-modal (GLC-49).
+            // Preload the roster and branches once the modal is on screen so each continuation lands
+            // in-modal (GLC-49/57): a preload kicked off before show() would resume under NON_MODAL and
+            // be deferred until the dialog closes.
             window?.addWindowListener(object : WindowAdapter() {
-                override fun windowOpened(e: WindowEvent) = loadRoster(::onRosterLoaded)
+                override fun windowOpened(e: WindowEvent) {
+                    loadRoster(::onRosterLoaded)
+                    loadBranches(::onBranchesLoaded)
+                }
             })
         }
 
@@ -2131,6 +2173,11 @@ class MrDetailPanel(
         private fun onRosterLoaded(members: List<GitLabUser>) {
             roster = members
             rosterLoaded = true
+        }
+
+        /** EDT, in-modal: the branches arrived — the "Destination branch" completion now offers them (GLC-57). */
+        private fun onBranchesLoaded(branches: List<GitLabBranch>) {
+            targetBranchField.setVariants(orderBranchNames(branches))
         }
 
         override fun createCenterPanel(): JComponent = panel {

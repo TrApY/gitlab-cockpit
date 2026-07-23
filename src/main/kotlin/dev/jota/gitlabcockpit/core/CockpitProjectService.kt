@@ -9,6 +9,7 @@ import dev.jota.gitlabcockpit.api.DiffRefs
 import dev.jota.gitlabcockpit.api.GitLabApiClient
 import dev.jota.gitlabcockpit.api.GitLabApprovals
 import dev.jota.gitlabcockpit.api.GitLabAward
+import dev.jota.gitlabcockpit.api.GitLabBranch
 import dev.jota.gitlabcockpit.api.GitLabDiffFile
 import dev.jota.gitlabcockpit.api.GitLabDiscussion
 import dev.jota.gitlabcockpit.api.GitLabDiscussionNote
@@ -111,6 +112,9 @@ class CockpitProjectService(
     /** Project members, keyed by project id (loaded lazily by [getMembers] / [getResolvedMembers]). */
     private val cachedMembers = ConcurrentHashMap<Long, List<GitLabUser>>()
 
+    /** Repository branches, keyed by project id (loaded lazily by [getBranches]; GLC-57). */
+    private val cachedBranches = ConcurrentHashMap<Long, List<GitLabBranch>>()
+
     /** Keyed by [MrRef] (project + iid); invalidated per-MR when its `updated_at` changes. */
     private val approvalsCache = ConcurrentHashMap<MrRef, CachedApprovals>()
 
@@ -136,6 +140,7 @@ class CockpitProjectService(
         cachedProject = null
         cachedUser = null
         cachedMembers.clear()
+        cachedBranches.clear()
         approvalsCache.clear()
     }
 
@@ -220,6 +225,22 @@ class CockpitProjectService(
                 if (it is GitLabResult.Success) cachedMembers[glProject.id] = it.data
             }
         }
+
+    /**
+     * Returns the branches of [projectId], cached in memory per project (invalidated by [refresh]), for
+     * the Edit dialog's "Destination branch" autocomplete (GLC-57). Only the first successful load of a
+     * given project hits the network; the edit dialog passes the MR's own project id so, in the "All
+     * projects" mode, the completion lists the branches of the MR's project rather than the git-resolved
+     * one. Mirrors [getMembers].
+     */
+    suspend fun getBranches(projectId: Long): GitLabResult<List<GitLabBranch>> {
+        cachedBranches[projectId]?.let { return GitLabResult.Success(it) }
+        return withClientAndProject { client, _ ->
+            client.getRepositoryBranches(projectId).also {
+                if (it is GitLabResult.Success) cachedBranches[projectId] = it.data
+            }
+        }
+    }
 
     /**
      * The labels defined in [projectId] (its own plus ancestor-group labels), for the Edit dialog's

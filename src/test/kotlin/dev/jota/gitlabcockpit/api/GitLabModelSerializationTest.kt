@@ -354,4 +354,40 @@ class GitLabModelSerializationTest {
         assertEquals("", upload.fullPath)
         assertEquals("", upload.markdown)
     }
+
+    @Test
+    fun `branch parses the real payload and ignores unknown fields`() {
+        // Real GET /projects/:id/repository/branches item (GLC-57); every field but name/default is ignored.
+        val payload = """
+            {
+              "name": "main",
+              "merged": false,
+              "protected": true,
+              "default": true,
+              "developers_can_push": false,
+              "developers_can_merge": false,
+              "can_push": true,
+              "web_url": "https://gitlab.com/g/r/-/tree/main",
+              "commit": {
+                "id": "abc123",
+                "short_id": "abc123",
+                "title": "Initial commit",
+                "created_at": "2026-07-14T08:00:00Z"
+              }
+            }
+        """.trimIndent()
+
+        val branch = json.decodeFromString<GitLabBranch>(payload)
+
+        assertEquals("main", branch.name)
+        assertTrue(branch.default)
+    }
+
+    @Test
+    fun `branch defaults default to false when absent`() {
+        val branch = json.decodeFromString<GitLabBranch>("""{"name": "feature/x"}""")
+
+        assertEquals("feature/x", branch.name)
+        assertFalse(branch.default)
+    }
 }

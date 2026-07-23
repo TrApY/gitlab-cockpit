@@ -51,6 +51,19 @@ data class GitLabProject(
 )
 
 /**
+ * A branch from `GET /projects/:id/repository/branches`, feeding the Edit dialog's "Destination branch"
+ * autocomplete (GLC-57). Only [name] (the value the field holds and sends) and [default] (so the default
+ * branch can lead the completion order) are modeled; every other field GitLab returns (`merged`,
+ * `protected`, `web_url`, `commit`, …) is ignored, and [default] defaults to `false` so a trimmed payload
+ * still decodes — tolerant like the other models.
+ */
+@Serializable
+data class GitLabBranch(
+    val name: String,
+    val default: Boolean = false,
+)
+
+/**
  * The response of `POST /projects/:id/uploads` — a Markdown attachment upload (GLC-56, the composer's
  * clip button). Only the fields the composer needs are modeled and every one defaults, so a trimmed
  * or future payload still decodes (like the other tolerant models). [markdown] is the ready-to-insert
@@ -626,6 +639,36 @@ class GitLabApiClient(
                 is GitLabResult.Success -> {
                     all += result.data
                     if (result.data.size < MEMBER_PAGE_SIZE) return GitLabResult.Success(all)
+                    page++
+                }
+                is GitLabResult.HttpError -> return result
+                is GitLabResult.NetworkError -> return result
+            }
+        }
+        return GitLabResult.Success(all)
+    }
+
+    /**
+     * Calls `GET /projects/:id/repository/branches`, paging through the result with `per_page=100` +
+     * `page=N` until a page comes back short (fewer than [BRANCH_PAGE_SIZE] items, i.e. the last page)
+     * or the [MAX_BRANCH_PAGES] safety cap is hit (GLC-57). The accumulated branches of every page are
+     * concatenated; any page that fails short-circuits with its error rather than a partial accumulation.
+     * The exact same pagination shape as [getProjectMembers]. Extra fields such as `protected` / `commit`
+     * are ignored by the model. Feeds the Edit dialog's "Destination branch" autocomplete.
+     */
+    suspend fun getRepositoryBranches(projectId: Long): GitLabResult<List<GitLabBranch>> {
+        val all = mutableListOf<GitLabBranch>()
+        var page = 1
+        while (page <= MAX_BRANCH_PAGES) {
+            val result = get(
+                "/projects/$projectId/repository/branches",
+                listOf("per_page" to BRANCH_PAGE_SIZE.toString(), "page" to page.toString()),
+                ListSerializer(GitLabBranch.serializer()),
+            )
+            when (result) {
+                is GitLabResult.Success -> {
+                    all += result.data
+                    if (result.data.size < BRANCH_PAGE_SIZE) return GitLabResult.Success(all)
                     page++
                 }
                 is GitLabResult.HttpError -> return result
@@ -1359,6 +1402,12 @@ class GitLabApiClient(
 
         /** Safety cap on how many member pages [getProjectMembers] will request. */
         private const val MAX_MEMBER_PAGES = 20
+
+        /** Page size for the paginated `repository/branches` fetch; a short page signals the last one. */
+        private const val BRANCH_PAGE_SIZE = 100
+
+        /** Safety cap on how many branch pages [getRepositoryBranches] will request. */
+        private const val MAX_BRANCH_PAGES = 20
 
         /**
          * Trims trailing slashes and ensures the URL ends with `/api/v4`, so callers may pass
