@@ -4,6 +4,8 @@
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-07-23
+
 ### Added
 
 - Merge-request notifications now also fire for the terminal transitions of downstream (bridge-triggered) pipelines: when a merge request you authored or are assigned to has its pipeline succeed and a downstream pipeline it triggered (e.g. `release-management`, possibly in another project) then fails afterwards, you now get a "Downstream pipeline failed — <bridge>" balloon instead of silence — reusing the same pipeline-notifications setting and the single existing watcher pass (GLC-61)
@@ -12,6 +14,10 @@
 ### Changed
 
 - The Pipelines view is now compact and attention-first: fully passed stages fold into a single expandable "N stages passed (M jobs)" row and single-job stages flatten to one "stage · job" line, so only stages needing attention (failed, running, pending, manual, canceled, warning) keep their own row; a persisted "Show all stages" checkbox restores the classic full tree, and expansion/selection survive the live 5-second refresh (GLC-59)
+
+### Fixed
+
+- The approvals notification setting is now labeled "Merge request approved" and its help spells out that it fires when someone presses Approve — not when a reviewer is assigned (GLC-55)
 
 ## [0.15.0] - 2026-07-23
 
