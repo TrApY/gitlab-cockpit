@@ -6,6 +6,7 @@
 
 ### Added
 
+- Merge-request notifications now also fire for the terminal transitions of downstream (bridge-triggered) pipelines: when a merge request you authored or are assigned to has its pipeline succeed and a downstream pipeline it triggered (e.g. `release-management`, possibly in another project) then fails afterwards, you now get a "Downstream pipeline failed — <bridge>" balloon instead of silence — reusing the same pipeline-notifications setting and the single existing watcher pass (GLC-61)
 - The Pipelines view now shows the downstream pipelines a pipeline's bridges (trigger jobs) started, as "→ <bridge> #<id> · <status>" rows after the stages — so a merge-request pipeline that triggers a `release-management` pipeline in another project of the group now surfaces that pipeline (and its failures) in the plugin; a failed downstream auto-expands, expanding one lazily loads that (possibly cross-project) pipeline's stages, a load failure (e.g. a 403 on a project you cannot read) shows an inline error instead of breaking the view, and the stage strip gains a "→" separator with one status dot per downstream (GLC-60)
 
 ### Changed

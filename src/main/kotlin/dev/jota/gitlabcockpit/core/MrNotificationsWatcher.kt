@@ -8,6 +8,7 @@ import com.intellij.openapi.project.Project
 import com.intellij.openapi.util.text.StringUtil
 import dev.jota.gitlabcockpit.CockpitBundle
 import dev.jota.gitlabcockpit.api.ApprovedBy
+import dev.jota.gitlabcockpit.api.GitLabBridge
 import dev.jota.gitlabcockpit.api.GitLabMergeRequest
 import dev.jota.gitlabcockpit.api.GitLabUser
 import dev.jota.gitlabcockpit.settings.GitLabCockpitSettings
@@ -43,6 +44,45 @@ fun notificationGroupFor(sticky: Boolean): String =
  * terminal [status] (`success` or `failed`).
  */
 data class PipelineStatusChange(val mr: GitLabMergeRequest, val status: String)
+
+/**
+ * A detected downstream (bridge-triggered) pipeline transition worth notifying (GLC-61): the [mr]
+ * whose latest pipeline triggered a downstream pipeline via the bridge named [bridgeName] which just
+ * reached a terminal [status] (`success` or `failed`). Covers the real case of an MR pipeline that
+ * goes `success` while its `release-management` downstream fails *afterwards* — a transition the
+ * upstream pipeline watcher alone never sees.
+ */
+data class DownstreamStatusChange(val mr: GitLabMergeRequest, val bridgeName: String, val status: String)
+
+/**
+ * The full outcome of one pipeline watcher pass (GLC-61): the upstream [pipelines] transitions (as
+ * before) plus the [downstreams] — the terminal transitions of the downstream pipelines the watched
+ * MRs' bridges triggered. Both are gathered in the single pass so no extra network round of MR
+ * pipeline fetches is spent (the bridges are fetched off the pipeline id already resolved per MR).
+ */
+data class PipelineWatchResult(
+    val pipelines: List<PipelineStatusChange>,
+    val downstreams: List<DownstreamStatusChange>,
+)
+
+/**
+ * Pure delta for the downstream watcher (GLC-61): given [prev] (the last known status of this
+ * [bridge]'s downstream pipeline, `null` on its first observation) and the [bridge] itself, returns
+ * the [DownstreamStatusChange] worth notifying for [mr], or `null`. Reuses [shouldNotify] so it obeys
+ * exactly the same rules as the upstream watcher:
+ * - a bridge that has not triggered a downstream yet ([GitLabBridge.downstream] == null) yields nothing;
+ * - the first observation ([prev] == null) only memorizes (in the caller) and yields nothing;
+ * - an unchanged status or a non-terminal one yields nothing;
+ * - only a *changed* transition into `success` / `failed` with a known previous status produces a change.
+ */
+fun downstreamChange(prev: String?, bridge: GitLabBridge, mr: GitLabMergeRequest): DownstreamStatusChange? {
+    val downstream = bridge.downstream ?: return null
+    return if (shouldNotify(prev, downstream.status)) {
+        DownstreamStatusChange(mr, bridge.name, downstream.status)
+    } else {
+        null
+    }
+}
 
 /**
  * A detected approval gain worth notifying (GLC-55): the [mr] that just gained [newApprovers] — the
@@ -117,6 +157,22 @@ fun pipelineNotificationText(change: PipelineStatusChange, messages: Notificatio
 }
 
 /**
+ * Builds a downstream pipeline event's balloon text (GLC-61). Same unified hierarchy as the upstream
+ * pipeline balloon: the title is the outcome carrying the bridge's name ("Downstream pipeline failed —
+ * release-management") and the body is the MR line — the same line every other event uses as its body.
+ * Pure; escapes BOTH the bridge name and the MR title before interpolating them, since a bridge name is
+ * just as user-controlled as a title (a name like `Q&A Bot` would otherwise corrupt the balloon HTML).
+ */
+fun downstreamNotificationText(change: DownstreamStatusChange, messages: NotificationMessages): NotificationText {
+    val titleKey =
+        if (change.status == "success") "notification.downstream.success" else "notification.downstream.failed"
+    return NotificationText(
+        title = messages.format(titleKey, listOf(escapeHtml(change.bridgeName))),
+        content = messages.format("notification.mr.line", listOf(change.mr.iid, escapeHtml(change.mr.title))),
+    )
+}
+
+/**
  * Builds an approval event's balloon text (GLC-55). Unified hierarchy like the other events: the title
  * lists the new approvers ("Approved by Alice, Bob") and the body is the MR line — the same line every
  * other event uses as its body — so an approval balloon reads like the rest. Pure; escapes BOTH the
@@ -176,7 +232,9 @@ class MrNotificationsWatcher(
         if (!settings.notificationsEnabled) return
 
         if (settings.notifyPipeline) {
-            for (change in service.detectPipelineStatusChanges(ready)) notifyPipeline(change)
+            val result = service.detectPipelineStatusChanges(ready)
+            for (change in result.pipelines) notifyPipeline(change)
+            for (change in result.downstreams) notifyDownstream(change)
         }
 
         if (settings.notifyApprovals) {
@@ -208,6 +266,13 @@ class MrNotificationsWatcher(
         val text = pipelineNotificationText(change, messages)
         val type = if (success) NotificationType.INFORMATION else NotificationType.ERROR
         post(text, type, CockpitIcons.status(if (success) "success" else "failed"), change.mr)
+    }
+
+    private fun notifyDownstream(change: DownstreamStatusChange) {
+        val success = change.status == "success"
+        val text = downstreamNotificationText(change, messages)
+        val type = if (success) NotificationType.INFORMATION else NotificationType.ERROR
+        post(text, type, CockpitIcons.status(change.status), change.mr)
     }
 
     private fun notifyApproval(change: ApprovalChange) {

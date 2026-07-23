@@ -568,6 +568,15 @@ class CockpitProjectService(
     private val lastPipelineStatus = ConcurrentHashMap<MrRef, String>()
 
     /**
+     * Last known status of each downstream (bridge-triggered) pipeline, keyed by its own pipeline id
+     * (GLC-61); the downstream watcher diffs against it. Keyed by pipeline id rather than [MrRef]
+     * because a downstream pipeline has a stable identity of its own (possibly in another project) and
+     * one MR pipeline can fan out to several bridges. Its own snapshot, separate from [lastPipelineStatus]
+     * (which tracks the *upstream* MR pipeline), so the two deltas never interfere.
+     */
+    private val lastDownstreamStatus = ConcurrentHashMap<Long, String>()
+
+    /**
      * Last known set of approver ids of each watched MR, keyed by [MrRef]; the approval watcher (GLC-55)
      * diffs against it. Deliberately its own snapshot, separate from the detail/list [approvalsCache]:
      * that cache is `updated_at`-keyed for the "reviewer, not approved" filter and answers a different
@@ -594,32 +603,71 @@ class CockpitProjectService(
 
     /**
      * One watcher pass: for the (at most [MAX_WATCHED_MRS] most recent) MRs the current user authored
-     * or is assigned to, fetches each MR's latest pipeline status in parallel and compares it to the
-     * last known one, returning the transitions worth notifying ([shouldNotify]). The status cache is
-     * updated on every pass via an atomic [ConcurrentHashMap.put] (so overlapping passes never notify
-     * twice); the first observation of an MR only memorizes. Never throws — unreachable MRs are
-     * skipped. [ready.mrs] arrives newest-first (`order_by=updated_at`), so `take` keeps the recents.
+     * or is assigned to, fetches each MR's latest pipeline in parallel and compares its status to the
+     * last known one, returning the transitions worth notifying ([shouldNotify]). In the same async —
+     * off the single pipeline fetch, no extra round — it also fetches that pipeline's bridges and diffs
+     * their downstream pipelines (GLC-61), so a downstream that fails *after* the MR pipeline succeeded
+     * is caught too. Both snapshots are updated on every pass via an atomic [ConcurrentHashMap.put] (so
+     * overlapping passes never notify twice); the first observation of a pipeline or a downstream only
+     * memorizes. Never throws — unreachable MRs (and MRs whose bridges cannot be fetched) are skipped.
+     * [ready.mrs] arrives newest-first (`order_by=updated_at`), so `take` keeps the recents.
      */
-    suspend fun detectPipelineStatusChanges(ready: CockpitState.Ready): List<PipelineStatusChange> {
+    suspend fun detectPipelineStatusChanges(ready: CockpitState.Ready): PipelineWatchResult {
         val meId = ready.currentUser.id
         val candidates = ready.mrs
             .filter { mr -> mr.author.id == meId || mr.assignees.any { it.id == meId } }
             .take(MAX_WATCHED_MRS)
-        if (candidates.isEmpty()) return emptyList()
-        return coroutineScope {
+        if (candidates.isEmpty()) return PipelineWatchResult(emptyList(), emptyList())
+        val passes = coroutineScope {
             candidates.map { mr ->
                 async {
                     val ref = MrRef(mr.projectId, mr.iid)
-                    val status = when (val r = getMrPipelines(ref)) {
-                        is GitLabResult.Success -> r.data.firstOrNull()?.status
+                    val pipeline = when (val r = getMrPipelines(ref)) {
+                        is GitLabResult.Success -> r.data.firstOrNull()
                         else -> null
                     } ?: return@async null
-                    val prev = lastPipelineStatus.put(ref, status)
-                    if (shouldNotify(prev, status)) PipelineStatusChange(mr, status) else null
+                    val prev = lastPipelineStatus.put(ref, pipeline.status)
+                    val pipelineChange =
+                        if (shouldNotify(prev, pipeline.status)) PipelineStatusChange(mr, pipeline.status) else null
+                    MrPipelinePass(pipelineChange, detectDownstreamChanges(mr, ref.projectId, pipeline.id))
                 }
             }.awaitAll().filterNotNull()
         }
+        return PipelineWatchResult(
+            pipelines = passes.mapNotNull { it.pipeline },
+            downstreams = passes.flatMap { it.downstreams },
+        )
     }
+
+    /**
+     * The downstream half of a single MR's pipeline pass (GLC-61): fetches the [pipelineId]'s bridges
+     * in [projectId] and diffs each bridge's downstream pipeline against [lastDownstreamStatus] via the
+     * pure [downstreamChange], memorizing every observed downstream status with an atomic
+     * [ConcurrentHashMap.put]. A failed bridge fetch is ignored (this MR contributes no downstreams this
+     * pass, and nothing is memorized, so the next pass retries); a bridge that has not triggered a
+     * downstream yet contributes nothing.
+     */
+    private suspend fun detectDownstreamChanges(
+        mr: GitLabMergeRequest,
+        projectId: Long,
+        pipelineId: Long,
+    ): List<DownstreamStatusChange> {
+        val bridges = when (val r = getPipelineBridges(projectId, pipelineId)) {
+            is GitLabResult.Success -> r.data
+            else -> return emptyList()
+        }
+        return bridges.mapNotNull { bridge ->
+            val downstream = bridge.downstream ?: return@mapNotNull null
+            val prev = lastDownstreamStatus.put(downstream.id, downstream.status)
+            downstreamChange(prev, bridge, mr)
+        }
+    }
+
+    /** The outcome of one MR's pipeline pass: its upstream [pipeline] change (if any) and [downstreams]. */
+    private data class MrPipelinePass(
+        val pipeline: PipelineStatusChange?,
+        val downstreams: List<DownstreamStatusChange>,
+    )
 
     /**
      * One approval-watcher pass (GLC-55): for the (at most [MAX_WATCHED_MRS] most recent) MRs the

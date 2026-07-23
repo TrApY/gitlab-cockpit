@@ -164,6 +164,64 @@ class NotificationTextTest {
         assertFalse(text.content.contains("<T>"))
     }
 
+    // --- downstream balloon (GLC-61): "Downstream pipeline <outcome> — <bridge>" over the MR line -
+
+    @Test
+    fun `a succeeded downstream uses the outcome with the bridge name as title and the MR line as body`() {
+        val text = downstreamNotificationText(
+            DownstreamStatusChange(mr(42, "Fix login"), "release-management", "success"),
+            messages,
+        )
+
+        assertEquals("Downstream pipeline succeeded — release-management", text.title)
+        assertEquals("!42  Fix login", text.content)
+    }
+
+    @Test
+    fun `a failed downstream uses the failed outcome with the bridge name as title and the MR line as body`() {
+        val text = downstreamNotificationText(
+            DownstreamStatusChange(mr(42, "Fix login"), "release-management", "failed"),
+            messages,
+        )
+
+        assertEquals("Downstream pipeline failed — release-management", text.title)
+        assertEquals("!42  Fix login", text.content)
+    }
+
+    @Test
+    fun `a downstream bridge name with an ampersand is escaped in the title`() {
+        val text = downstreamNotificationText(
+            DownstreamStatusChange(mr(42, "Fix login"), "Q&A pipeline", "failed"),
+            messages,
+        )
+
+        assertEquals("Downstream pipeline failed — Q&amp;A pipeline", text.title)
+        assertTrue(text.title.contains("&amp;"))
+        assertFalse("raw ampersand leaked into the balloon: ${text.title}", text.title.contains("Q&A pipeline"))
+    }
+
+    @Test
+    fun `a downstream bridge name with angle brackets is escaped in the title`() {
+        val text = downstreamNotificationText(
+            DownstreamStatusChange(mr(42, "Fix login"), "<deploy>", "success"),
+            messages,
+        )
+
+        assertEquals("Downstream pipeline succeeded — &lt;deploy&gt;", text.title)
+        assertFalse(text.title.contains("<deploy>"))
+    }
+
+    @Test
+    fun `a downstream body is the MR line with an escaped title`() {
+        val text = downstreamNotificationText(
+            DownstreamStatusChange(mr(11, "Fix <T> handling"), "release-management", "failed"),
+            messages,
+        )
+
+        assertEquals("!11  Fix &lt;T&gt; handling", text.content)
+        assertFalse(text.content.contains("<T>"))
+    }
+
     // --- the GLC-54 bug: dynamic MR title must be HTML-escaped in the final text ---------------
 
     @Test
