@@ -7,7 +7,9 @@ import com.intellij.notification.NotificationType
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.util.text.StringUtil
 import dev.jota.gitlabcockpit.CockpitBundle
+import dev.jota.gitlabcockpit.api.ApprovedBy
 import dev.jota.gitlabcockpit.api.GitLabMergeRequest
+import dev.jota.gitlabcockpit.api.GitLabUser
 import dev.jota.gitlabcockpit.settings.GitLabCockpitSettings
 import dev.jota.gitlabcockpit.ui.CockpitIcons
 import dev.jota.gitlabcockpit.ui.CockpitNavigation
@@ -43,6 +45,28 @@ fun notificationGroupFor(sticky: Boolean): String =
 data class PipelineStatusChange(val mr: GitLabMergeRequest, val status: String)
 
 /**
+ * A detected approval gain worth notifying (GLC-55): the [mr] that just gained [newApprovers] — the
+ * users whose approval appeared since the previous watcher pass. Only genuinely new approvers are ever
+ * carried here; an unapprove (an approver dropping off) never produces an [ApprovalChange].
+ */
+data class ApprovalChange(val mr: GitLabMergeRequest, val newApprovers: List<GitLabUser>)
+
+/**
+ * Pure delta for the approval watcher (GLC-55): given the [prev] snapshot of approver ids (`null` on
+ * the very first observation of an MR) and the MR's [current] approvers, returns the users whose ids
+ * are NEW since the last pass — the ones worth an "Approved by X" balloon. Mirrors the spirit of
+ * [shouldNotify] / [detectMrEvents]:
+ * - `prev == null` (first observation) yields nothing: that pass only memorizes the baseline.
+ * - Only approvers absent from [prev] are returned; an approver that disappeared (an unapprove) yields
+ *   nothing — it simply drops out of the next snapshot.
+ * - Order follows [current], so the balloon lists approvers in GitLab's own order.
+ */
+fun newApprovers(prev: Set<Long>?, current: List<ApprovedBy>): List<GitLabUser> {
+    if (prev == null) return emptyList()
+    return current.map { it.user }.filter { it.id !in prev }
+}
+
+/**
  * Pure decision for the pipeline watcher. Notify only when [new] is a terminal status we care about
  * (`success` / `failed`), a previous status was already known ([prev] non-null) and it actually
  * changed. The first time an MR's pipeline is observed ([prev] == null) nothing is notified — that
@@ -69,11 +93,13 @@ fun interface NotificationMessages {
 }
 
 /**
- * Escapes the one piece of dynamic, user-controlled data an MR notification interpolates — the MR
- * title — so it is safe inside the HTML the balloon renders (GLC-54). `Fix <T> handling` becomes
- * `Fix &lt;T&gt; handling` instead of losing the `<T>`.
+ * Escapes a piece of dynamic, user-controlled data a notification interpolates — an MR title (GLC-54)
+ * or an approver's display name (GLC-55) — so it is safe inside the HTML the balloon renders. The
+ * platform renders both the title and body as HTML, so an unescaped `<`, `>` or `&` would corrupt the
+ * balloon or silently drop text: `Fix <T> handling` becomes `Fix &lt;T&gt; handling` and `Q&A Bot`
+ * becomes `Q&amp;A Bot`.
  */
-private fun escapeMrTitle(title: String): String = StringUtil.escapeXmlEntities(title)
+private fun escapeHtml(text: String): String = StringUtil.escapeXmlEntities(text)
 
 /**
  * Builds a pipeline event's balloon text (GLC-54). Unified hierarchy: the title is the outcome
@@ -86,7 +112,22 @@ fun pipelineNotificationText(change: PipelineStatusChange, messages: Notificatio
         if (change.status == "success") "notification.pipeline.success" else "notification.pipeline.failed"
     return NotificationText(
         title = messages.format(titleKey, emptyList()),
-        content = messages.format("notification.mr.line", listOf(change.mr.iid, escapeMrTitle(change.mr.title))),
+        content = messages.format("notification.mr.line", listOf(change.mr.iid, escapeHtml(change.mr.title))),
+    )
+}
+
+/**
+ * Builds an approval event's balloon text (GLC-55). Unified hierarchy like the other events: the title
+ * lists the new approvers ("Approved by Alice, Bob") and the body is the MR line — the same line every
+ * other event uses as its body — so an approval balloon reads like the rest. Pure; escapes BOTH the
+ * approver names and the MR title before interpolating them, since a display name is just as
+ * user-controlled as a title (a name like `Q&A Bot` would otherwise corrupt the balloon HTML).
+ */
+fun approvalNotificationText(change: ApprovalChange, messages: NotificationMessages): NotificationText {
+    val names = change.newApprovers.joinToString(", ") { escapeHtml(it.name) }
+    return NotificationText(
+        title = messages.format("notification.approval.title", listOf(names)),
+        content = messages.format("notification.mr.line", listOf(change.mr.iid, escapeHtml(change.mr.title))),
     )
 }
 
@@ -96,7 +137,7 @@ fun pipelineNotificationText(change: PipelineStatusChange, messages: Notificatio
  */
 fun mrEventNotificationText(event: MrEvent, messages: NotificationMessages): NotificationText {
     val mr = event.mr
-    val safeTitle = escapeMrTitle(mr.title)
+    val safeTitle = escapeHtml(mr.title)
     val line = messages.format("notification.mr.line", listOf(mr.iid, safeTitle))
     return when (event) {
         is MrEvent.NewMr ->
@@ -138,6 +179,10 @@ class MrNotificationsWatcher(
             for (change in service.detectPipelineStatusChanges(ready)) notifyPipeline(change)
         }
 
+        if (settings.notifyApprovals) {
+            for (change in service.detectApprovalChanges(ready)) notifyApproval(change)
+        }
+
         // Always advance the MR snapshot (even when every event flag is off) so toggling a flag on
         // later never replays historical changes; then post only the enabled ones.
         for (event in service.detectScopeMrEvents(ready)) {
@@ -163,6 +208,11 @@ class MrNotificationsWatcher(
         val text = pipelineNotificationText(change, messages)
         val type = if (success) NotificationType.INFORMATION else NotificationType.ERROR
         post(text, type, CockpitIcons.status(if (success) "success" else "failed"), change.mr)
+    }
+
+    private fun notifyApproval(change: ApprovalChange) {
+        val text = approvalNotificationText(change, messages)
+        post(text, NotificationType.INFORMATION, CockpitIcons.approval, change.mr)
     }
 
     private fun notifyMrEvent(event: MrEvent) {

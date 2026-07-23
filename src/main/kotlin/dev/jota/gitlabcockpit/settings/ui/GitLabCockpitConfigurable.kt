@@ -49,6 +49,7 @@ class GitLabCockpitConfigurable : Configurable {
     private val notifyMrStateCheck = JBCheckBox(CockpitBundle.message("settings.notifications.mrState"))
     private val notifyPushCheck = JBCheckBox(CockpitBundle.message("settings.notifications.push"))
     private val notifyCommentsCheck = JBCheckBox(CockpitBundle.message("settings.notifications.comments"))
+    private val notifyApprovalsCheck = JBCheckBox(CockpitBundle.message("settings.notifications.approvals"))
     private val notifyScopeAllFilteredCheck =
         JBCheckBox(CockpitBundle.message("settings.notifications.scopeAllFiltered"))
     private val backgroundIntervalCombo = ComboBox(PollInterval.values())
@@ -64,6 +65,7 @@ class GitLabCockpitConfigurable : Configurable {
         notifyMrStateCheck,
         notifyPushCheck,
         notifyCommentsCheck,
+        notifyApprovalsCheck,
         notifyScopeAllFilteredCheck,
     )
 
@@ -109,6 +111,8 @@ class GitLabCockpitConfigurable : Configurable {
                     .rowComment(CockpitBundle.message("settings.notifications.push.help"))
                 row { cell(notifyCommentsCheck) }
                     .rowComment(CockpitBundle.message("settings.notifications.comments.help"))
+                row { cell(notifyApprovalsCheck) }
+                    .rowComment(CockpitBundle.message("settings.notifications.approvals.help"))
                 row { cell(notifyScopeAllFilteredCheck) }
                     .rowComment(CockpitBundle.message("settings.notifications.scopeAllFiltered.help"))
                 row(CockpitBundle.message("settings.notifications.backgroundInterval")) {
@@ -145,6 +149,7 @@ class GitLabCockpitConfigurable : Configurable {
                 notifyMrStateCheck.isSelected != settings.notifyMrState ||
                 notifyPushCheck.isSelected != settings.notifyPush ||
                 notifyCommentsCheck.isSelected != settings.notifyComments ||
+                notifyApprovalsCheck.isSelected != settings.notifyApprovals ||
                 notifyScopeAllFilteredCheck.isSelected != settings.notifyScopeAllFiltered ||
                 selectedInterval().minutes != settings.backgroundPollMinutes
         return nameChanged || urlChanged || tokenChanged || squashChanged || deleteChanged ||
@@ -181,6 +186,7 @@ class GitLabCockpitConfigurable : Configurable {
         settings.notifyMrState = notifyMrStateCheck.isSelected
         settings.notifyPush = notifyPushCheck.isSelected
         settings.notifyComments = notifyCommentsCheck.isSelected
+        settings.notifyApprovals = notifyApprovalsCheck.isSelected
         settings.notifyScopeAllFiltered = notifyScopeAllFilteredCheck.isSelected
         settings.backgroundPollMinutes = selectedInterval().minutes
 
@@ -203,6 +209,7 @@ class GitLabCockpitConfigurable : Configurable {
         notifyMrStateCheck.isSelected = settings.notifyMrState
         notifyPushCheck.isSelected = settings.notifyPush
         notifyCommentsCheck.isSelected = settings.notifyComments
+        notifyApprovalsCheck.isSelected = settings.notifyApprovals
         notifyScopeAllFilteredCheck.isSelected = settings.notifyScopeAllFiltered
         backgroundIntervalCombo.selectedItem = PollInterval.of(settings.backgroundPollMinutes)
         syncNotificationChecks()

@@ -37,6 +37,8 @@ class NotificationTextTest {
 
     private fun user(id: Long) = GitLabUser(id = id, username = "u$id", name = "U$id")
 
+    private fun namedUser(id: Long, name: String) = GitLabUser(id = id, username = "u$id", name = name)
+
     private fun mr(iid: Long, title: String, state: String = "opened"): GitLabMergeRequest =
         GitLabMergeRequest(
             iid = iid,
@@ -105,6 +107,61 @@ class NotificationTextTest {
 
         assertEquals("New comments", text.title)
         assertEquals("!7  Add cache — 3 new", text.content)
+    }
+
+    // --- approval balloon (GLC-55): "Approved by ..." title over the MR line ------------------
+
+    @Test
+    fun `an approval by one user titles with the name over the MR line`() {
+        val text = approvalNotificationText(ApprovalChange(mr(11, "Add cache"), listOf(user(3))), messages)
+
+        assertEquals("Approved by U3", text.title)
+        assertEquals("!11  Add cache", text.content)
+    }
+
+    @Test
+    fun `an approval by two users joins the names in the title`() {
+        val text = approvalNotificationText(
+            ApprovalChange(mr(11, "Add cache"), listOf(user(3), user(4))),
+            messages,
+        )
+
+        assertEquals("Approved by U3, U4", text.title)
+        assertEquals("!11  Add cache", text.content)
+    }
+
+    @Test
+    fun `an approver name with an ampersand is escaped in the title`() {
+        val text = approvalNotificationText(
+            ApprovalChange(mr(11, "Add cache"), listOf(namedUser(3, "Q&A Bot"))),
+            messages,
+        )
+
+        assertEquals("Approved by Q&amp;A Bot", text.title)
+        assertTrue(text.title.contains("&amp;"))
+        assertFalse("raw ampersand leaked into the balloon: ${text.title}", text.title.contains("Q&A Bot"))
+    }
+
+    @Test
+    fun `an approver name with angle brackets is escaped in the title`() {
+        val text = approvalNotificationText(
+            ApprovalChange(mr(11, "Add cache"), listOf(namedUser(3, "<script>"))),
+            messages,
+        )
+
+        assertEquals("Approved by &lt;script&gt;", text.title)
+        assertFalse(text.title.contains("<script>"))
+    }
+
+    @Test
+    fun `an approval body is the MR line with an escaped title`() {
+        val text = approvalNotificationText(
+            ApprovalChange(mr(11, "Fix <T> handling"), listOf(user(3))),
+            messages,
+        )
+
+        assertEquals("!11  Fix &lt;T&gt; handling", text.content)
+        assertFalse(text.content.contains("<T>"))
     }
 
     // --- the GLC-54 bug: dynamic MR title must be HTML-escaped in the final text ---------------

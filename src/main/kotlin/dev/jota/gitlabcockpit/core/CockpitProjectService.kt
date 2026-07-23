@@ -528,6 +528,14 @@ class CockpitProjectService(
     private val lastPipelineStatus = ConcurrentHashMap<MrRef, String>()
 
     /**
+     * Last known set of approver ids of each watched MR, keyed by [MrRef]; the approval watcher (GLC-55)
+     * diffs against it. Deliberately its own snapshot, separate from the detail/list [approvalsCache]:
+     * that cache is `updated_at`-keyed for the "reviewer, not approved" filter and answers a different
+     * question (it would even go stale here, since approvals can change without `updated_at` moving).
+     */
+    private val lastApproverIds = ConcurrentHashMap<MrRef, Set<Long>>()
+
+    /**
      * Last known [MrSnapshot] of every MR in the current user's notification scope, keyed by [MrRef].
      * `null` until the first watcher pass has run — the null vs. empty-map distinction is what makes
      * the first pass memorize silently (see [detectMrEvents]). Deliberately **not** reset by [refresh]
@@ -568,6 +576,40 @@ class CockpitProjectService(
                     } ?: return@async null
                     val prev = lastPipelineStatus.put(ref, status)
                     if (shouldNotify(prev, status)) PipelineStatusChange(mr, status) else null
+                }
+            }.awaitAll().filterNotNull()
+        }
+    }
+
+    /**
+     * One approval-watcher pass (GLC-55): for the (at most [MAX_WATCHED_MRS] most recent) MRs the
+     * current user authored or is assigned to — the same candidate set as [detectPipelineStatusChanges]
+     * — fetches each MR's approvals in parallel and diffs the approver ids against the last known set
+     * ([lastApproverIds]), returning the MRs that gained a NEW approver (with the new users, for the
+     * balloon text; see [newApprovers]). The id snapshot is updated on every pass via an atomic
+     * [ConcurrentHashMap.put] (so overlapping passes never notify twice); the first observation of an MR
+     * only memorizes. An unapprove (ids that disappear) just updates the snapshot and never notifies.
+     * Approvals are fetched fresh via [getApprovalsFor] (bypassing the `updated_at`-keyed detail cache).
+     * Never throws — MRs whose approvals cannot be fetched are skipped (and left un-memorized, so the
+     * next pass retries). [ready.mrs] arrives newest-first, so `take` keeps the recents.
+     */
+    suspend fun detectApprovalChanges(ready: CockpitState.Ready): List<ApprovalChange> {
+        val meId = ready.currentUser.id
+        val candidates = ready.mrs
+            .filter { mr -> mr.author.id == meId || mr.assignees.any { it.id == meId } }
+            .take(MAX_WATCHED_MRS)
+        if (candidates.isEmpty()) return emptyList()
+        return coroutineScope {
+            candidates.map { mr ->
+                async {
+                    val ref = MrRef(mr.projectId, mr.iid)
+                    val current = when (val r = getApprovalsFor(ref)) {
+                        is GitLabResult.Success -> r.data.approvedBy
+                        else -> return@async null
+                    }
+                    val prev = lastApproverIds.put(ref, current.mapTo(HashSet()) { it.user.id })
+                    val gained = newApprovers(prev, current)
+                    if (gained.isEmpty()) null else ApprovalChange(mr, gained)
                 }
             }.awaitAll().filterNotNull()
         }

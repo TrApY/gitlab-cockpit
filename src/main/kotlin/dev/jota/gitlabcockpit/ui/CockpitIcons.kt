@@ -41,6 +41,15 @@ object CockpitIcons {
     /** Tool window icon: a monochrome cockpit dial, loaded with its light/dark SVG pair. */
     val toolWindow: Icon = IconLoader.getIcon("/icons/toolwindow.svg", CockpitIcons::class.java)
 
+    /**
+     * "Approved by X" balloon icon (GLC-55): the platform's bare checkmark [AllIcons.Actions.Checked].
+     * Deliberately NOT the circled [AllIcons.Status.Success] that pipeline-success balloons (and the
+     * timeline's `approve` event) use, so an approval balloon is not mistaken for a green pipeline at a
+     * glance — the vendored collab icon set under `resources/icons/collab` has no approval/accepted
+     * glyph to reuse, so a distinct `AllIcons` check is used instead.
+     */
+    val approval: Icon = AllIcons.Actions.Checked
+
     // --- Collaboration-tools icons (GLC-38 / iter3 A1-A3) -------------------------------------
     // Copied from the IntelliJ Platform's intellij.platform.collaborationTools module (© JetBrains,
     // Apache 2.0; see resources/icons/collab/README.md) and loaded from our own resources so the plugin

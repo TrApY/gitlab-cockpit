@@ -60,6 +60,9 @@ class GitLabCockpitSettings : PersistentStateComponent<GitLabCockpitSettings.Sta
         /** Raise a balloon when new comments are added to a watched MR (its note count grows). */
         var notifyComments: Boolean = false
 
+        /** Raise a balloon when a watched MR gains a new approver (someone approves it). GLC-55. */
+        var notifyApprovals: Boolean = false
+
         /**
          * When `true`, event balloons use the STICKY_BALLOON group so they stay on screen until the
          * user dismisses them instead of auto-hiding (GLC-30). Defaults to `false` — the status-quo
@@ -135,6 +138,11 @@ class GitLabCockpitSettings : PersistentStateComponent<GitLabCockpitSettings.Sta
     var notifyComments: Boolean
         get() = state.notifyComments
         set(value) { state.notifyComments = value }
+
+    /** Notify on a new approver of a watched MR; see [State.notifyApprovals]. */
+    var notifyApprovals: Boolean
+        get() = state.notifyApprovals
+        set(value) { state.notifyApprovals = value }
 
     /** Keep event balloons on screen until dismissed (STICKY_BALLOON); see [State.stickyNotifications]. */
     var stickyNotifications: Boolean

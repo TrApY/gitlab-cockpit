@@ -4,6 +4,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Merge-request notifications now include an "Approved by X" balloon when a merge request you authored or are assigned to gains a new approver (GLC-55)
+
 ## [0.14.0] - 2026-07-22
 
 ### Added
