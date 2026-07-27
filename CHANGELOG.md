@@ -4,6 +4,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- The Marketplace verifier's "deprecated constructor usage" warning against 2026.2 EAP is gone: markdown rendering now uses the primary `MarkdownParser` constructor (with `CancellationToken.NonCancellable`), which exists in every supported IDE's bundled library. The remaining `buildMarkdownTreeFromString(String)` warning is structural — its `CharSequence` replacement does not exist in the `org.intellij.markdown` 0.7.2 bundled by 2025.2–2026.1, so migrating would break those IDEs at runtime; it stays until the plugin's minimum platform moves past 2026.1 (GLC-63)
+
 ## [0.17.0] - 2026-07-23
 
 ### Added

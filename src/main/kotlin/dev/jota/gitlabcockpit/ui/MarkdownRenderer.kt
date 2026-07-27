@@ -1,7 +1,9 @@
 package dev.jota.gitlabcockpit.ui
 
+import org.intellij.markdown.ExperimentalApi
 import org.intellij.markdown.flavours.gfm.GFMFlavourDescriptor
 import org.intellij.markdown.html.HtmlGenerator
+import org.intellij.markdown.parser.CancellationToken
 import org.intellij.markdown.parser.MarkdownParser
 
 /**
@@ -20,7 +22,14 @@ object MarkdownRenderer {
      */
     fun toHtml(markdown: String): String {
         if (markdown.isBlank()) return ""
-        val tree = MarkdownParser(flavour).buildMarkdownTreeFromString(markdown)
+        // The 3-arg constructor is the non-deprecated primary in the 0.7.7 library bundled by
+        // 2026.2+ and exists (behind @ExperimentalApi, stable since 0.7.7) in the 0.7.2 bundled
+        // by 2025.2–2026.1. buildMarkdownTreeFromString(String) is deprecated in 0.7.7 too, but
+        // its CharSequence replacement does not exist in 0.7.2 — migrate it when the minimum
+        // platform moves past 2026.1.
+        @OptIn(ExperimentalApi::class)
+        val parser = MarkdownParser(flavour, assertionsEnabled = true, cancellationToken = CancellationToken.NonCancellable)
+        val tree = parser.buildMarkdownTreeFromString(markdown)
         return HtmlGenerator(markdown, tree, flavour).generateHtml()
     }
 }
