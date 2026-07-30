@@ -211,6 +211,27 @@ fun mrEventNotificationText(event: MrEvent, messages: NotificationMessages): Not
 }
 
 /**
+ * A section of a merge request's tab a notification can land on (GLC-64): the Info overview, the
+ * Events & Discussions timeline, or the Pipelines drill-in card. It lives here, next to the other
+ * notification types, and is a plain JVM enum with no Swing in it on purpose — the dependency
+ * direction is `ui/ → core/`, so the watcher can name where a balloon should land without knowing
+ * anything about the panels that implement it.
+ */
+enum class MrSection { OVERVIEW, TIMELINE, PIPELINES }
+
+/**
+ * Pure mapping from an [MrEvent] to the [MrSection] its "Open in Cockpit" action should land on
+ * (GLC-64): new comments open the timeline, where the comments the balloon announced actually are;
+ * a new MR, a state change and a new push all open the overview, which is where their datum (state,
+ * head branch, description) is shown. Pipeline and downstream balloons are not [MrEvent]s — they are
+ * routed to [MrSection.PIPELINES] at their own call sites.
+ */
+fun mrEventSection(event: MrEvent): MrSection = when (event) {
+    is MrEvent.NewComments -> MrSection.TIMELINE
+    is MrEvent.NewMr, is MrEvent.StateChanged, is MrEvent.NewPush -> MrSection.OVERVIEW
+}
+
+/**
  * Configurable IDE notifier for merge-request events (GLC-27). After each merge-request list load
  * ([onReady]) it raises one IDE balloon per enabled event type: pipeline finished, a new MR in the
  * user's scope, an MR state change, a new push and new comments. Which events fire is driven by the
@@ -265,19 +286,19 @@ class MrNotificationsWatcher(
         val success = change.status == "success"
         val text = pipelineNotificationText(change, messages)
         val type = if (success) NotificationType.INFORMATION else NotificationType.ERROR
-        post(text, type, CockpitIcons.status(if (success) "success" else "failed"), change.mr)
+        post(text, type, CockpitIcons.status(if (success) "success" else "failed"), change.mr, MrSection.PIPELINES)
     }
 
     private fun notifyDownstream(change: DownstreamStatusChange) {
         val success = change.status == "success"
         val text = downstreamNotificationText(change, messages)
         val type = if (success) NotificationType.INFORMATION else NotificationType.ERROR
-        post(text, type, CockpitIcons.status(change.status), change.mr)
+        post(text, type, CockpitIcons.status(change.status), change.mr, MrSection.PIPELINES)
     }
 
     private fun notifyApproval(change: ApprovalChange) {
         val text = approvalNotificationText(change, messages)
-        post(text, NotificationType.INFORMATION, CockpitIcons.approval, change.mr)
+        post(text, NotificationType.INFORMATION, CockpitIcons.approval, change.mr, MrSection.OVERVIEW)
     }
 
     private fun notifyMrEvent(event: MrEvent) {
@@ -287,7 +308,7 @@ class MrNotificationsWatcher(
             is MrEvent.NewPush -> CockpitIcons.branchChip
             is MrEvent.NewMr, is MrEvent.StateChanged -> CockpitIcons.toolWindow
         }
-        post(text, NotificationType.INFORMATION, icon, event.mr)
+        post(text, NotificationType.INFORMATION, icon, event.mr, mrEventSection(event))
     }
 
     /**
@@ -295,8 +316,19 @@ class MrNotificationsWatcher(
      * "Open in Cockpit" (activates the tool window and opens the MR's tab, even from the closed-window
      * poller — see [CockpitNavigation.openMr]) and "Open in GitLab" (the MR's web page). Both expire the
      * balloon when triggered.
+     *
+     * [section] is the part of the MR tab "Open in Cockpit" lands on (GLC-64), so the click leads to the
+     * very thing the balloon announced — a pipeline balloon opens the Pipelines card, a comments balloon
+     * the timeline — instead of always dropping the user on the tab's default view. Only the Cockpit
+     * action is affected; "Open in GitLab" still opens the MR's web page as before.
      */
-    private fun post(text: NotificationText, type: NotificationType, icon: Icon, mr: GitLabMergeRequest) {
+    private fun post(
+        text: NotificationText,
+        type: NotificationType,
+        icon: Icon,
+        mr: GitLabMergeRequest,
+        section: MrSection,
+    ) {
         // Resolve the group per post (never cache): reading the setting on each event makes a
         // sticky-toggle change take effect on the next notification without restarting anything.
         val group = notificationGroupFor(GitLabCockpitSettings.getInstance().stickyNotifications)
@@ -307,7 +339,7 @@ class MrNotificationsWatcher(
             .addAction(
                 NotificationAction.createSimpleExpiring(
                     CockpitBundle.message("notification.action.openCockpit"),
-                ) { CockpitNavigation.openMr(project, mr) },
+                ) { CockpitNavigation.openMr(project, mr, section) },
             )
             .addAction(
                 NotificationAction.createSimpleExpiring(

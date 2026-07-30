@@ -35,6 +35,7 @@ import dev.jota.gitlabcockpit.core.MergeRequestState
 import dev.jota.gitlabcockpit.core.MrFilterSelection
 import dev.jota.gitlabcockpit.core.MrNotificationsWatcher
 import dev.jota.gitlabcockpit.core.MrRef
+import dev.jota.gitlabcockpit.core.MrSection
 import dev.jota.gitlabcockpit.core.RoleFilter
 import dev.jota.gitlabcockpit.core.filterByTitle
 import dev.jota.gitlabcockpit.core.mrTabLabel
@@ -354,18 +355,26 @@ class CockpitToolWindowPanel(
     }
 
     /**
-     * Opens (or re-selects) [mr]'s own closeable tab. Tabs are keyed by [MrRef] so a second open of the
-     * same MR just re-selects its existing tab instead of duplicating it; a fresh tab loads that MR into
-     * its own [MrDetailPanel] and takes focus. Public so a notification's "Open in Cockpit" action can
-     * reach it through [CockpitNavigation] once the tool window has been activated (GLC-54).
+     * Opens (or re-selects) [mr]'s own closeable tab, landing on [section]. Tabs are keyed by [MrRef] so
+     * a second open of the same MR just re-selects its existing tab instead of duplicating it; a fresh
+     * tab loads that MR into its own [MrDetailPanel] and takes focus. Public so a notification's "Open in
+     * Cockpit" action can reach it through [CockpitNavigation] once the tool window has been activated
+     * (GLC-54).
+     *
+     * [section] is what an event balloon uses to land on the matching part of the tab (GLC-64) and is
+     * honored in both paths: an already-open tab gets its section applied right after it is re-selected,
+     * a fresh one right after its detail load is kicked off (the panel defers it until the MR renders).
+     * It defaults to [MrSection.OVERVIEW], a no-op that leaves the tab exactly where it was — which is
+     * what the list's own double-click/Enter open wants.
      */
-    fun openMrTab(mr: GitLabMergeRequest) {
+    fun openMrTab(mr: GitLabMergeRequest, section: MrSection = MrSection.OVERVIEW) {
         val ref = MrRef(mr.projectId, mr.iid)
         val contentManager = toolWindow.contentManager
 
         val existing = contentManager.contents.firstOrNull { it.getUserData(MR_TAB_REF_KEY) == ref }
         if (existing != null) {
             contentManager.setSelectedContent(existing, true)
+            (existing.component as? MrDetailPanel)?.showSection(section)
             return
         }
 
@@ -379,6 +388,7 @@ class CockpitToolWindowPanel(
         contentManager.addContent(content)
         contentManager.setSelectedContent(content, true)
         detail.loadDetail(ref)
+        detail.showSection(section)
     }
 
     /** Opens the selected MR's GitLab page in the external browser. */

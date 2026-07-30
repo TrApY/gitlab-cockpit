@@ -81,6 +81,7 @@ import dev.jota.gitlabcockpit.core.MrHeaderPresentation
 import dev.jota.gitlabcockpit.core.MrParticipant
 import dev.jota.gitlabcockpit.core.MrRef
 import dev.jota.gitlabcockpit.core.MrRole
+import dev.jota.gitlabcockpit.core.MrSection
 import dev.jota.gitlabcockpit.core.TimelineFilter
 import dev.jota.gitlabcockpit.core.TimelineItem
 import dev.jota.gitlabcockpit.core.applyDraftState
@@ -195,6 +196,14 @@ class MrDetailPanel(
 
     /** The MR currently displayed; kept so the async upload load knows its project's base web URL. */
     private var currentMr: GitLabMergeRequest? = null
+
+    /**
+     * The section [showSection] was asked for before this panel had anything rendered (GLC-64), applied
+     * by [showMr] once the MR is on screen and cleared right after. Needed because a notification opens a
+     * brand-new tab and asks for its section while the detail load is still in flight, so applying it
+     * then would be a no-op (in particular [PipelinesPanel.onTabSelected] bails out until its MR is set).
+     */
+    private var pendingSection: MrSection? = null
 
     private var detailJob: Job? = null
     private var notesJob: Job? = null
@@ -445,6 +454,35 @@ class MrDetailPanel(
         contentPanel.add(splitter, BorderLayout.CENTER)
 
         showPlaceholder()
+    }
+
+    /**
+     * EDT. Brings [section] to the front of this MR tab, so a notification's "Open in Cockpit" lands on
+     * the very thing its balloon announced instead of the tab's default view (GLC-64).
+     *
+     * When the MR is not rendered yet (a fresh tab whose detail load is still in flight) the request is
+     * only remembered in [pendingSection]; [showMr] applies it at the very end of its own rendering and
+     * clears it, so a later refresh of the same tab never re-applies a section the user has since left.
+     *
+     * [MrSection.OVERVIEW] is deliberately a total no-op — neither the card nor the tab index is forced:
+     * that is the pre-GLC-64 behavior, and the events mapped to it (a new MR, a state change, a push)
+     * have no reason to yank the user away from wherever they were inside an already-open tab.
+     */
+    fun showSection(section: MrSection) {
+        if (currentMr == null) {
+            pendingSection = section
+            return
+        }
+        when (section) {
+            MrSection.OVERVIEW -> Unit
+            MrSection.TIMELINE -> {
+                showMainCard()
+                // The tabbed pane's ChangeListener performs the lazy notes load on selection; do not
+                // duplicate it here.
+                mainTabbedPane.selectedIndex = TIMELINE_TAB_INDEX
+            }
+            MrSection.PIPELINES -> showPipelinesCard()
+        }
     }
 
     /** Shows the "main" card (Info | Events & Discussions), stopping the pipelines card's live poll. */
@@ -831,6 +869,16 @@ class MrDetailPanel(
         changesPanel.onTabSelected()
         mrToolbar?.updateActionsAsync()
         if (mainTabbedPane.selectedIndex == TIMELINE_TAB_INDEX) loadNotes(ref)
+
+        // GLC-64: apply the section a notification asked for while this tab was still loading. It runs
+        // last on purpose — after `pipelinesPanel.setMr` above, since PipelinesPanel.onTabSelected()
+        // returns early until its ref is set, and after `showMainCard()`, which would otherwise undo it.
+        // Cleared as it is consumed so a later refresh of this MR never drags the user back to it.
+        val pending = pendingSection
+        if (pending != null) {
+            pendingSection = null
+            showSection(pending)
+        }
     }
 
     private fun setDescription(mr: GitLabMergeRequest) {

@@ -21,6 +21,9 @@ import java.util.Properties
  * [BundleBase.replaceMnemonicAmpersand] and then [MessageFormat], the same order the platform uses — so
  * an escaped `&lt;` sitting in a *substituted* argument is inserted after mnemonic processing and kept
  * intact. The file is loaded as UTF-8, the encoding the platform reads bundles in.
+ *
+ * Also covers [mrEventSection] (GLC-64): which section of the MR tab each event's "Open in Cockpit"
+ * action lands on — pure, and it lives in the same file as the builders above.
  */
 class NotificationTextTest {
 
@@ -220,6 +223,31 @@ class NotificationTextTest {
 
         assertEquals("!11  Fix &lt;T&gt; handling", text.content)
         assertFalse(text.content.contains("<T>"))
+    }
+
+    // --- GLC-64: which MR-tab section an event's "Open in Cockpit" lands on -------------------
+
+    @Test
+    fun `a NewComments event opens the timeline, where the comments are`() {
+        assertEquals(MrSection.TIMELINE, mrEventSection(MrEvent.NewComments(mr(7, "Add cache"), 3)))
+    }
+
+    @Test
+    fun `a NewMr event opens the overview`() {
+        assertEquals(MrSection.OVERVIEW, mrEventSection(MrEvent.NewMr(mr(7, "Add cache"))))
+    }
+
+    @Test
+    fun `a StateChanged event opens the overview`() {
+        assertEquals(
+            MrSection.OVERVIEW,
+            mrEventSection(MrEvent.StateChanged(mr(7, "Add cache", state = "merged"), "opened", "merged")),
+        )
+    }
+
+    @Test
+    fun `a NewPush event opens the overview`() {
+        assertEquals(MrSection.OVERVIEW, mrEventSection(MrEvent.NewPush(mr(7, "Add cache"))))
     }
 
     // --- the GLC-54 bug: dynamic MR title must be HTML-escaped in the final text ---------------
