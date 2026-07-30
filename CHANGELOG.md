@@ -4,6 +4,8 @@
 
 ## [Unreleased]
 
+## [0.18.0] - 2026-07-30
+
 ### Changed
 
 - A notification's "Open in Cockpit" action now lands on the section that matches the event instead of always opening the merge request's default view: a pipeline (or downstream pipeline) balloon opens the Pipelines view, a new-comments balloon opens Events & Discussions, and the remaining events (new merge request, state change, new push, approval) open the Info view as before — including when the merge request's tab is already open (GLC-64)
